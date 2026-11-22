@@ -1,16 +1,19 @@
-
 from fastapi import FastAPI
 
-app = FastAPI(
-    title="News API",
-    description="Enterprise News Platform API",
-    version="0.1.0",
-)
+from app.api.router import api_router
+from app.core.config import get_settings
 
 
-@app.get("/health", tags=["Health"])
-async def health_check() -> dict[str, str]:
-    return {
-        "status": "healthy",
-        "application": "news-backend",
-    }
+def create_app() -> FastAPI:
+    settings = get_settings()
+    app = FastAPI(
+        title=settings.app_name,
+        description="Enterprise News Platform API",
+        version=settings.app_version,
+        debug=settings.debug,
+    )
+    app.include_router(api_router)
+    return app
+
+
+app = create_app()
