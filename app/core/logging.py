@@ -15,7 +15,9 @@ class JsonFormatter(logging.Formatter):
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
-            "request_id": request_id_var.get(),
+            # An explicit `extra={"request_id": ...}` wins: the error handler runs after the
+            # request-ID middleware has already reset the context variable.
+            "request_id": getattr(record, "request_id", None) or request_id_var.get(),
         }
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)

@@ -1,8 +1,30 @@
+import json
+import logging
+
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
+from app.core.logging import JsonFormatter
 from app.main import create_app
+
+
+def test_unhandled_exception_log_carries_request_id(
+    app: FastAPI, caplog: pytest.LogCaptureFixture
+) -> None:
+    @app.get("/boom")
+    async def boom() -> None:
+        raise RuntimeError("boom")
+
+    with (
+        caplog.at_level(logging.ERROR, logger="app.core.errors"),
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        client.get("/boom", headers={"X-Request-ID": "req-42"})
+
+    record = next(r for r in caplog.records if r.name == "app.core.errors")
+    assert json.loads(JsonFormatter().format(record))["request_id"] == "req-42"
 
 
 def test_request_id_is_generated(client: TestClient) -> None:
