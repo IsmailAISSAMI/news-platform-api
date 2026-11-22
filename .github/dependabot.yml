@@ -12,3 +12,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The runtime Python (3.13) is chosen deliberately and matches .python-version / CI.
+      # Bump it by hand, together with those files, not through an automatic image PR.
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
