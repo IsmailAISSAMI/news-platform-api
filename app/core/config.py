@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
-    database_url: str = "postgresql+psycopg://news:news@localhost:5432/news"
+    database_url: str = "postgresql+psycopg://news:news@localhost:5433/news"
 
 
 @lru_cache
