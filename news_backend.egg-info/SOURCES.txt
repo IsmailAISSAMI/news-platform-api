@@ -1,7 +1,0 @@
-README.md
-pyproject.toml
-news_backend.egg-info/PKG-INFO
-news_backend.egg-info/SOURCES.txt
-news_backend.egg-info/dependency_links.txt
-news_backend.egg-info/requires.txt
-news_backend.egg-info/top_level.txt
