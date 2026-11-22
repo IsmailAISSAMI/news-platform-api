@@ -1,19 +1,45 @@
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 from typing import Literal
 
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _package_version() -> str:
+    try:
+        return version("news-backend")
+    except PackageNotFoundError:
+        return "0.0.0"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "News API"
-    app_version: str = "0.1.0"
+    app_version: str = _package_version()
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = False
-    database_url: str = "postgresql+psycopg://news:news@localhost:5433/news"
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    cors_origins: list[str] = []
+
+    # Required: no default so a misconfigured deployment fails fast instead of
+    # silently connecting with development credentials.
+    database_url: SecretStr
+
+    @field_validator("database_url")
+    @classmethod
+    def _require_async_capable_driver(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().startswith("postgresql+psycopg://"):
+            msg = "DATABASE_URL must start with 'postgresql+psycopg://'"
+            raise ValueError(msg)
+        return value
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
 
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    return Settings()  # type: ignore[call-arg]  # values come from the environment

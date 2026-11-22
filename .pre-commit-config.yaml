@@ -6,9 +6,19 @@ repos:
         args: [--fix]
       - id: ruff-format
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: check-toml
       - id: check-yaml
+      - id: check-added-large-files
+      - id: detect-private-key
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy app tests alembic
+        language: system
+        types: [python]
+        pass_filenames: false
