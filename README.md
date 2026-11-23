@@ -36,6 +36,38 @@ Endpoints:
 
 Docs (`/docs`, `/redoc`, `/openapi.json`) are disabled when `ENVIRONMENT=production`.
 
+## Ingest articles
+
+Run this whenever you like (there is no scheduler). It collects everything published
+since the last *completed* run, however long ago that was:
+
+```bash
+docker compose up -d db
+uv run news ingest                  # first run: the last 30 days (--since-days to change)
+uv run news ingest -v               # with progress logs
+uv run news ingest --help
+```
+
+- **Safe to interrupt** (Ctrl-C, a network drop, closing the laptop): finished pages are
+  kept and the next run resumes the gap.
+- **One run at a time:** a second concurrent run is refused.
+- **Polite:** about 5 s between requests to a publisher, per its robots.txt. One week of
+  articles takes about 2 minutes; months take longer (capped by `--max-pages`, and the
+  next run continues).
+- **Exit codes:**
+
+  | Code | Meaning |
+  | --- | --- |
+  | 0 | ok |
+  | 1 | some feeds failed (others still ran) |
+  | 2 | not ready (database down or not migrated) |
+  | 3 | already running |
+  | 130 | interrupted |
+
+- **Feed health:** each run is recorded in `ingestion_runs`. After 5 consecutive failures
+  a feed is marked `degraded`; after 20 it is `disabled` and skipped. To re-enable it:
+  `UPDATE feeds SET state = 'active', consecutive_failures = 0 WHERE id = …;`
+
 ## Quality checks
 
 CI runs the same commands.

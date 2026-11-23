@@ -41,3 +41,15 @@ def configure_logging(level: str) -> None:
         uvicorn_logger = logging.getLogger(name)
         uvicorn_logger.handlers.clear()
         uvicorn_logger.propagate = True
+
+
+def configure_cli_logging(*, verbose: bool) -> None:
+    """Human-readable logs on stderr for the CLI; stdout is reserved for the run report."""
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+    # httpx logs every request at INFO; our fetcher already logs what matters.
+    logging.getLogger("httpx").setLevel(logging.WARNING)

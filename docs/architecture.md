@@ -70,7 +70,7 @@ The first source is Hespress English. More publishers will follow.
 | --- | --- |
 | Volume | 467 posts from Nov 1 to Nov 23, about **20 per day** |
 | RSS `/feed` | RSS 2.0, `en-US`, **10 items** per page. Each item has the full body (`content:encoded`), `<category>` entries, a `dc:creator` (often a desk such as "Hespress EN" or "With MAP") and `pubDate`. |
-| RSS paging | `/feed?paged=N` works. `paged=50` reached Oct 30 (about 25 days back). **The maximum depth is not measured yet.** |
+| RSS paging | `/feed?paged=N` works. **Measured 2026-11-23: page 1,600 still returns 10 items, reaching 2025-02-24 (~21 months).** The probe stopped there (5 requests); the true limit is deeper. 16,000 items over 21 months is about 25 per day. |
 | Conditional GET | Weak `ETag` and `Last-Modified`. A repeat request returns **304**. |
 | Stable ID | `<guid>` is `https://en.hespress.com/?p=149695`, and the URL starts with `/149695-`. The WordPress post ID is our `external_id`. **IDs are assigned when a draft is created, so they are not in publish order.** |
 | News sitemap | `sitemap-news.xml`: the last ~48 h (39 entries), with title, publish date, language and keywords |
@@ -143,13 +143,17 @@ Re-verify this table when the publisher's behavior looks different, and update t
 
 | Time offline | Cost (5 s delay) | Guarantee |
 | --- | --- | --- |
-| Up to ~3 weeks | about 14 RSS pages a week, a few minutes | Complete metadata |
-| Beyond RSS depth | 1 article page per missing article, about 1,200 for 2 months, roughly 1 h 40 over several bounded runs | Complete only if the publisher still lists the URL and serves the page |
+| Up to ~21 months (measured RSS depth) | 1 RSS page per 10 missed articles: 1 week ≈ 18 pages ≈ 1.5 min, 2 months ≈ 150 pages ≈ 13 min | Complete metadata |
+| Beyond the RSS depth | archive backlog (milestone 6, deferred): 1 article page per missing article | Complete only if the publisher still lists the URL and serves the page |
 | Unpublished or deleted by the publisher | none | Not recoverable |
 
-**Run ingest at least every ~3 weeks** to stay inside the cheap, complete path.
-**Do not claim zero loss until the long-downtime tests and a real-world measurement of
-RSS depth pass** (milestone 4).
+**Within the measured RSS depth, a manual run recovers everything** still published since
+the last completed run. This is verified by the long-downtime and interruption tests
+(milestone 4) and the real depth probe.
+
+**Run length:** a long absence means a long first run, at 5 s per page. The `--max-pages`
+cap (default 500, about 42 minutes, about 5,000 articles or 6+ months) bounds it. A
+capped run doesn't advance the checkpoint, so the next run simply continues.
 
 ### 4.4 Polite and safe fetching
 
@@ -322,8 +326,8 @@ before it starts.**
 | 2 ✅ | Rights gate | `app/ingestion/policy.py`, `normalize.py` | `apply_policy` is the only path from a fetched item to a storable record; fail-safe license downgrades | Every policy; expired or missing license; record type and `articles` table cannot hold a body (the bodies-audit query moves to when `article_bodies` exists) |
 | 3 ✅ | Polite fetcher | `app/ingestion/fetch.py`, `robots.py` | Conditional GET, robots, delay, limits, retries | `httpx.MockTransport`: 304, 429 with Retry-After, 5xx backoff, timeout, size cap, disallowed path |
 | 4 ✅ (depth probe pending) | Hespress adapter and RSS walk | `app/ingestion/parsers.py`, `sources/wordpress.py`, `store.py`, `walk.py` | Parse, normalize to UTC, guid → ID, checkpoint walk | Malformed XML, repeated runs (idempotent), interrupted run resumes to checkpoint, deleted checkpoint, duplicates across feed and sitemap; **measure real RSS depth with a few probes** |
-| 5 | `news ingest` command | `app/ingestion/cli.py`, `pyproject.toml` script | Readiness, lock, run report, migration-head check | DB down → clean failure; concurrent run refused; `ingestion_runs` recorded |
-| 6 | Archive backlog | `app/ingestion/backlog.py`, `page_metadata.py` | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |
+| 5 ✅ | `news ingest` command | `app/cli.py`, `app/ingestion/runner.py`, `readiness.py`, `pyproject.toml` script | Readiness, lock, run report, migration-head check | DB down → clean failure; concurrent run refused; `ingestion_runs` recorded |
+| 6 ⏸ deferred | Archive backlog | `app/ingestion/backlog.py`, `page_metadata.py` | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |
 | 7 | Read API | `app/api/v1/*`, `app/schemas/*` | Sources, feeds, articles, search | Pagination stable under inserts; filters; ETag; role is SELECT-only |
 | 8 | Backups | `app/ops/backup.py`, CLI commands | Backup, retention, restore test | Restore into a scratch DB matches counts; retention prunes |
 | 9 | Analysis framework | `app/analysis/*` | Local analyzers on permitted text, versioned | Idempotent per analyzer version; policy respected |
@@ -335,7 +339,7 @@ before it starts.**
 | --- | --- |
 | Jurisdiction of the operator (decides the text-and-data-mining rules) | **Open: owner to answer** |
 | Written permission from Hespress for full text | **Open: none yet.** Design stays `metadata_only`. |
-| Real RSS paging depth | Unmeasured. Measured in milestone 4. |
+| Real RSS paging depth | **Measured:** at least 1,600 pages (~21 months) on 2026-11-23. The archive backlog is deferred until a source needs it. |
 | Publisher changes (feed format, sitemap plugin, paging) | Detected through run reports and feed states |
 | Fetching article pages for metadata | Approved for metadata only. Re-check robots.txt and terms before milestone 6. |
 | The Mac is a single point of failure | Backups with restore tests, plus Time Machine |

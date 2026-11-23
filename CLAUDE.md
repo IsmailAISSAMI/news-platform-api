@@ -31,6 +31,8 @@ uv run pytest -m "not integration"        # fast, no DB
 uv run pytest                             # full suite, needs the db container
 uv run alembic revision --autogenerate -m "..." && uv run alembic upgrade head
 uv run alembic check                      # models and migrations must be in sync
+uv run news ingest [-v] [--since-days N] [--max-pages N] [--no-sitemap]
+                                          # hits real publishers: only when asked
 ```
 
 **Definition of done:** ruff, mypy and the full pytest suite pass, `alembic check` is clean,
