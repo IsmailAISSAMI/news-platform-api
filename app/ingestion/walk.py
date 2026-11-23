@@ -131,6 +131,12 @@ async def walk_rss(
         floor_reason=StopReason.DATE_FLOOR if checkpoint_at else StopReason.BOOTSTRAP_FLOOR,
     )
     result = state.result
+    logger.info(
+        "%s: collecting back to %s (%s), one page of ~10 articles per request",
+        ctx.source.slug,
+        state.floor.date().isoformat(),
+        "last completed run" if checkpoint_at else "first run",
+    )
 
     for page in range(1, max_pages + 1):
         etag, last_modified = (feed.etag, feed.last_modified) if page == 1 else (None, None)
@@ -138,8 +144,17 @@ async def walk_rss(
             ctx.adapter.page_url(feed.url, page), etag=etag, last_modified=last_modified
         )
         result.pages_fetched += 1
+        new_before = result.items_new
         result.stop_reason = await _process_page(ctx, state, page, fetched)
         await ctx.session.commit()  # keep finished pages even if a later one fails
+        logger.info(
+            "%s page %d: +%d new (%d so far), reached %s",
+            ctx.source.slug,
+            page,
+            result.items_new - new_before,
+            result.items_new,
+            state.oldest_seen.date().isoformat() if state.oldest_seen else "-",
+        )
         if result.stop_reason is not None:
             break
     else:
