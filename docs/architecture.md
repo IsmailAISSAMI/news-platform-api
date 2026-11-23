@@ -209,17 +209,24 @@ quotes where the law allows.
 | --- | --- | --- | --- | --- |
 | `disabled` | no | nothing new | none | existing metadata |
 | `metadata_only` | yes | title, URL, dates, author, categories; excerpt up to `excerpt_max_chars` (0 = none) | stored metadata only | metadata and link-out |
-| `restricted` | yes | as `metadata_only` | only under a **documented legal basis**; derived results only | derived results and link-out |
+| `restricted` | yes | metadata as `metadata_only`, plus full text **privately** in `article_bodies`; requires a recorded `rights_basis` (database-enforced) | internal analysis, including AI | metadata, derived results and link-out; **never the text** |
 | `licensed_full_text` | yes | full text in `article_bodies`, within license scope and retention | as the license allows | as the license allows |
 
-**Hespress:** `metadata_only` with `excerpt_max_chars = 0`.
+**Hespress:** `restricted` with `excerpt_max_chars = 0` since 2026-11-23 (section 5.4). It was
+`metadata_only` before.
 
 **Enforcement:**
-1. Source adapters return `content:encoded` only when the policy is
-   `licensed_full_text`. Otherwise the field never leaves the adapter.
-2. Only that policy writes `article_bodies`.
-3. Tests run every policy against fixtures.
-4. An audit query (bodies for non-licensed sources must be zero) runs in the test suite.
+1. The rights gate (`app/ingestion/policy.py`) releases a body only under `restricted`
+   with a non-empty `rights_basis`, or `licensed_full_text` with a valid license.
+   Anything doubtful falls back to `metadata_only`.
+2. The database refuses `restricted` without a `rights_basis`, and `licensed_full_text`
+   without a `license_ref`.
+3. Bodies are stored as plain text with paragraph breaks (for AI context) in
+   `article_bodies`, never in `articles`.
+4. The API never selects bodies, and the `news_api` role has no access to
+   `article_bodies`. Tests check both.
+5. `news ingest --rewalk-days N` re-reads a window to fill in bodies for articles stored
+   earlier.
 
 **What enabling full text for Hespress requires:** written permission from Hespress
 covering:
@@ -232,6 +239,25 @@ covering:
 
 Record `license_ref` and `license_expires_at` on the source. A legal review is needed
 before any public or commercial use. *This document is not legal advice.*
+
+### 5.4 Owner decision: private full text for Hespress (2026-11-23)
+
+- **Decision:** the owner chose to store Hespress full text privately, for
+  non-commercial educational AI analysis, without asking Hespress for permission.
+- **Recorded:** in `sources.rights_basis` by migration `bb03517b5d1e`.
+- **Advice given and declined:** obtaining a license; relying on a text-and-data-mining
+  exception confirmed by a lawyer for the owner's jurisdiction.
+- **Known tension:** Hespress's terms (section 5.1) reserve copying. Educational and
+  private-use exceptions differ by country. This is the owner's decision, not a legal
+  clearance.
+- **Safeguards:**
+  - text is stored locally only;
+  - the API and the `news_api` role cannot read it;
+  - it is never committed (test fixtures are synthetic), exported or published;
+  - backups contain it and stay private (mode 600, outside the repo and iCloud);
+  - publishable AI output must be original, with no reproduced passages.
+- **To reverse:** set the source back to `metadata_only` (collection stops), then
+  `DELETE FROM article_bodies` for that source's articles.
 
 ## 6. Data model (target, built in milestone 1)
 

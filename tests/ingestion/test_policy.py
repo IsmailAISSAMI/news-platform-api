@@ -79,9 +79,11 @@ def test_storable_record_has_no_field_that_could_hold_a_body() -> None:
 
 
 @pytest.mark.parametrize(
-    "policy", [RightsPolicy.METADATA_ONLY, RightsPolicy.RESTRICTED], ids=lambda p: p.value
+    "policy",
+    [RightsPolicy.METADATA_ONLY, RightsPolicy.RESTRICTED],  # restricted here has no basis
+    ids=lambda p: p.value,
 )
-def test_body_is_dropped_for_every_non_licensed_policy(policy: RightsPolicy) -> None:
+def test_body_is_dropped_without_a_license_or_basis(policy: RightsPolicy) -> None:
     decision = apply_policy(item(), rights(policy, excerpt_max_chars=500), NOW)
 
     assert decision.body_text is None
@@ -129,19 +131,32 @@ def test_inactive_source_is_treated_as_disabled() -> None:
         apply_policy(item(), inactive, NOW)
 
 
-def test_restricted_stores_like_metadata_only() -> None:
-    restricted = apply_policy(item(), rights(RightsPolicy.RESTRICTED), NOW)
+BASIS = "Owner decision: private educational analysis"
+
+
+def test_restricted_with_a_basis_keeps_the_body_privately() -> None:
+    restricted = apply_policy(item(), rights(RightsPolicy.RESTRICTED, rights_basis=BASIS), NOW)
     metadata = apply_policy(item(), rights(), NOW)
 
-    assert restricted.record == metadata.record
     assert restricted.effective_policy is RightsPolicy.RESTRICTED
+    assert restricted.body_text == "Synthetic full body paragraph one.\n\nParagraph two."
+    assert restricted.record == metadata.record  # the public record is unchanged
+
+
+@pytest.mark.parametrize("basis", [None, "", "   "])
+def test_restricted_without_a_basis_falls_back_to_metadata_only(basis: str | None) -> None:
+    decision = apply_policy(item(), rights(RightsPolicy.RESTRICTED, rights_basis=basis), NOW)
+
+    assert decision.effective_policy is RightsPolicy.METADATA_ONLY
+    assert decision.body_text is None
+    assert decision.downgrade_reason == "restricted without a recorded rights_basis"
 
 
 def test_licensed_full_text_keeps_the_body_as_plain_text() -> None:
     decision = apply_policy(item(), LICENSED, NOW)
 
     assert decision.effective_policy is RightsPolicy.LICENSED_FULL_TEXT
-    assert decision.body_text == "Synthetic full body paragraph one. Paragraph two."
+    assert decision.body_text == "Synthetic full body paragraph one.\n\nParagraph two."
     assert decision.downgrade_reason is None
 
 

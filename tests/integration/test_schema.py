@@ -38,10 +38,12 @@ def make_article(source_id: int, external_id: str, **overrides: object) -> Artic
     return Article(**fields)
 
 
-async def test_hespress_is_seeded_as_metadata_only(db_session: AsyncSession) -> None:
+async def test_hespress_is_restricted_with_a_recorded_basis(db_session: AsyncSession) -> None:
     source = await hespress(db_session)
 
-    assert source.rights_policy == RightsPolicy.METADATA_ONLY
+    assert source.rights_policy == RightsPolicy.RESTRICTED
+    assert source.rights_basis is not None
+    assert "educational" in source.rights_basis
     assert source.excerpt_max_chars == 0
     assert source.license_ref is None
 
@@ -87,6 +89,10 @@ async def test_canonical_url_is_unique(db_session: AsyncSession) -> None:
         (
             {"rights_policy": RightsPolicy.LICENSED_FULL_TEXT, "license_ref": None},
             "ck_sources_license_required_for_full_text",
+        ),
+        (
+            {"rights_policy": RightsPolicy.RESTRICTED, "rights_basis": None},
+            "ck_sources_basis_required_for_restricted",
         ),
     ],
 )
@@ -189,6 +195,16 @@ async def test_api_role_is_read_only(db_session: AsyncSession) -> None:
                     text("UPDATE sources SET rights_policy = 'licensed_full_text' WHERE id = :id"),
                     {"id": source.id},
                 )
+
+
+async def test_api_role_cannot_read_article_bodies(db_session: AsyncSession) -> None:
+    await apply_roles(db_session)
+
+    async with db_session.begin_nested():
+        await db_session.execute(text("SET LOCAL ROLE news_api"))
+        with pytest.raises(DBAPIError, match="permission denied"):
+            async with db_session.begin_nested():
+                await db_session.execute(text("SELECT body_text FROM article_bodies"))
 
 
 async def test_ingest_role_can_write_but_not_change_schema(db_session: AsyncSession) -> None:

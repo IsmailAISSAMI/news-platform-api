@@ -40,6 +40,7 @@ class IngestOptions:
     bootstrap_days: int = 30
     max_pages: int = 500
     include_news_sitemap: bool = True
+    rewalk_days: int | None = None  # re-read this window, e.g. to fill in article text
 
 
 @dataclass
@@ -157,6 +158,9 @@ async def _ingest_feed(ctx: IngestContext, feed: Feed, options: IngestOptions) -
                 feed,
                 bootstrap_since=ctx.now - timedelta(days=options.bootstrap_days),
                 max_pages=options.max_pages,
+                rewalk_since=(
+                    ctx.now - timedelta(days=options.rewalk_days) if options.rewalk_days else None
+                ),
             )
         else:
             report.result = await ingest_news_sitemap(ctx, feed)

@@ -5,9 +5,10 @@ through a simple web API. Everything runs on your own computer, for free.
 
 The first supported publisher is **[Hespress English](https://en.hespress.com)**.
 
-> **What it stores:** article *information* only (title, link, date, author, categories).
-> It never copies article text, and every article links back to the original. See
-> [Respecting publishers](#respecting-publishers).
+> **What it stores:** article information (title, link, date, author, categories), plus,
+> for sources configured for it, the article text **kept privately on your computer** for
+> analysis. The API never shows article text: every article links back to the original.
+> See [Respecting publishers](#respecting-publishers).
 
 ---
 
@@ -106,6 +107,13 @@ Good to know:
   Total: +18 new, 0 updated, 3 page(s)
   ```
 
+**Fetch article text for articles you collected earlier** (once, if you collected articles
+before text storage was enabled):
+
+```bash
+uv run news ingest --rewalk-days 90 -v   # re-reads the last 90 days, about 15 minutes
+```
+
 ---
 
 ## Browse and search articles
@@ -192,9 +200,12 @@ docker compose exec -T db pg_restore -U news -d news --clean --if-exists < ~/Bac
 
 This project is designed to be a good citizen:
 
-- **Information only.** For Hespress it stores titles, links, dates, authors and categories.
-  It never stores or shows article text, because the publisher's terms reserve copying and
-  republication of its texts.
+- **Article text stays private.** For Hespress, article text is stored only on your
+  computer for non-commercial educational analysis: the owner's decision, recorded in the
+  database. It is never shown by the API, exported or published. Hespress's terms reserve
+  copying of its texts, and no permission was obtained, so **if you reuse this project,
+  that decision is yours to make again**. To store information only, set the source's
+  `rights_policy` to `metadata_only`.
 - **Always links back.** Every article in the API points to the original page and names
   its publisher.
 - **Polite collection.** It follows each site's `robots.txt`, waits 5 seconds between

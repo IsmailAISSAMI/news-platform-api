@@ -64,10 +64,18 @@ of them requires an explicit decision by the owner, recorded in the architecture
 
 - Every source has a `rights_policy`: `disabled` | `metadata_only` | `restricted` |
   `licensed_full_text` (meanings in architecture doc section 5.3).
-- **Hespress is `metadata_only` with `excerpt_max_chars = 0`.** Store only title,
-  canonical URL, publish and modified dates, author, categories and language.
-- `content:encoded` and article bodies never leave the source adapter unless the policy is
-  `licensed_full_text`. There is no Hespress license.
+- **Hespress is `restricted` (owner decision, 2026-11-23; see architecture section 5.4).**
+  - Full text is stored **privately** in `article_bodies` for non-commercial educational
+    AI analysis, with the basis recorded in `sources.rights_basis`. No permission from
+    Hespress was obtained, and that is recorded too.
+  - Article text is **never served** by the API, exported, published or committed. The
+    `news_api` role cannot read `article_bodies`.
+  - AI outputs meant for publication must be original work: no reproduced or
+    closely paraphrased passages.
+- Bodies leave the rights gate only under `restricted` (with a non-empty
+  `rights_basis`) or `licensed_full_text` (valid license). Anything doubtful falls back
+  to `metadata_only`. Don't change a source's policy without the owner's explicit
+  decision.
 - Never store raw feed payloads: they contain full text.
 - Never assume that processing in memory, private use or paraphrasing makes full-text use
   lawful.

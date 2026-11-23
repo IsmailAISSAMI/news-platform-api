@@ -71,6 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument(
         "--no-sitemap", action="store_true", help="Skip the news sitemap (last ~48 h)."
     )
+    ingest.add_argument(
+        "--rewalk-days",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Re-read the last N days, even articles already stored (e.g. to fetch "
+        "article text for older articles). Slower; never skips anything.",
+    )
     commands.add_parser(
         "backup", parents=[common], help="Dump the database to the backup directory."
     )
@@ -102,6 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrap_days=args.since_days,
             max_pages=args.max_pages,
             include_news_sitemap=not args.no_sitemap,
+            rewalk_days=args.rewalk_days,
         )
         return asyncio.run(ingest(options))
     except KeyboardInterrupt:

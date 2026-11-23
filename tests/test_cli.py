@@ -143,7 +143,11 @@ def test_main_passes_options(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "ingest", capture)
 
     assert cli.main(["ingest", "--since-days", "7", "--max-pages", "20", "--no-sitemap"]) == 0
-    assert seen == [IngestOptions(bootstrap_days=7, max_pages=20, include_news_sitemap=False)]
+    assert cli.main(["ingest", "--rewalk-days", "90"]) == 0
+    assert seen == [
+        IngestOptions(bootstrap_days=7, max_pages=20, include_news_sitemap=False),
+        IngestOptions(rewalk_days=90),
+    ]
 
 
 # --- backup / restore-test ---------------------------------------------------------------

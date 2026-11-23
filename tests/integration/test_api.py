@@ -14,7 +14,7 @@ from app.api.deps import get_db
 from app.api.v1.catalog import _decode_cursor, _encode_cursor
 from app.core.config import Settings
 from app.db.session import create_engine
-from app.models import Article, Source
+from app.models import Article, ArticleBody, Source
 
 pytestmark = pytest.mark.integration
 
@@ -190,6 +190,23 @@ async def test_no_response_ever_carries_a_body(client: httpx.AsyncClient) -> Non
         assert not set(item) & {"body", "body_html", "body_text", "content", "content_hash"}
 
 
+async def test_stored_bodies_are_never_served(
+    client: httpx.AsyncClient, db_session: AsyncSession, seeded: list[Article]
+) -> None:
+    private_text = "PRIVATE-BODY-TEXT-MUST-NOT-LEAK"
+    db_session.add(ArticleBody(article_id=seeded[0].id, body_text=private_text, body_hash="h"))
+    await db_session.flush()
+
+    responses = [
+        await client.get("/api/v1/articles", params={"limit": 100}),
+        await client.get(f"/api/v1/articles/{seeded[0].id}"),
+        await client.get("/api/v1/articles", params={"q": "private body text"}),
+    ]
+
+    for response in responses:
+        assert private_text not in response.text
+
+
 @pytest.mark.parametrize(("article_id", "status"), [(999_999_999, 404), (0, 422)])
 async def test_missing_or_invalid_article(
     client: httpx.AsyncClient, article_id: int, status: int
@@ -204,8 +221,9 @@ async def test_sources(client: httpx.AsyncClient) -> None:
     body = (await client.get("/api/v1/sources")).json()
 
     hespress = next(s for s in body if s["slug"] == "hespress-en")
-    assert hespress["rights_policy"] == "metadata_only"
+    assert hespress["rights_policy"] == "restricted"
     assert "license_ref" not in hespress  # internal, never exposed
+    assert "rights_basis" not in hespress
 
 
 async def test_feeds(client: httpx.AsyncClient) -> None:

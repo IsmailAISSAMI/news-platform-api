@@ -13,6 +13,8 @@ _BLOCK_TAGS = frozenset(
     {"p", "br", "div", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "tr"}
 )
 ELLIPSIS = "…"
+# Marks a block boundary (<p>, <li>, ...). Raw newlines in HTML source are just whitespace.
+_BREAK = "\x1e"
 
 
 class _TextExtractor(HTMLParser):
@@ -25,13 +27,13 @@ class _TextExtractor(HTMLParser):
         if tag in _SKIPPED_TAGS:
             self._skip_depth += 1
         elif tag in _BLOCK_TAGS:
-            self.parts.append(" ")
+            self.parts.append(_BREAK)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _SKIPPED_TAGS and self._skip_depth:
             self._skip_depth -= 1
         elif tag in _BLOCK_TAGS:
-            self.parts.append(" ")
+            self.parts.append(_BREAK)
 
     def handle_data(self, data: str) -> None:
         if not self._skip_depth:
@@ -50,7 +52,23 @@ def html_to_text(value: str | None) -> str:
     parser.feed(value)
     parser.close()
     # Feeds often double-encode entities (e.g. "&amp;#8217;"), so decode once more.
-    return collapse_whitespace(unescape("".join(parser.parts)))
+    return collapse_whitespace(unescape("".join(parser.parts)).replace(_BREAK, " "))
+
+
+def html_to_paragraphs(value: str | None) -> str:
+    """Plain text that keeps the paragraph structure (blank line between blocks).
+
+    For article bodies: an AI reading the text benefits from knowing where paragraphs,
+    list items and headings start. Tags, scripts and styles are removed as in
+    `html_to_text`.
+    """
+    if not value:
+        return ""
+    parser = _TextExtractor()
+    parser.feed(value)
+    parser.close()
+    blocks = (collapse_whitespace(block) for block in unescape("".join(parser.parts)).split(_BREAK))
+    return "\n\n".join(block for block in blocks if block)
 
 
 def truncate(value: str, max_chars: int) -> str | None:

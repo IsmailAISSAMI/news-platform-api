@@ -34,6 +34,11 @@ REVOKE CREATE ON SCHEMA public FROM news_ingest, news_api;
 -- The migration bookkeeping table is the owner's business only.
 REVOKE ALL ON alembic_version FROM news_ingest, news_api;
 
+-- Full article text is stored privately for analysis and must never be served: the API
+-- role cannot read it at all. (Default privileges below would otherwise grant SELECT on
+-- every new table, so this explicit REVOKE must stay after the grants.)
+REVOKE ALL ON article_bodies FROM news_api;
+
 -- Tables created by future migrations get the same privileges automatically.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO news_api;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public

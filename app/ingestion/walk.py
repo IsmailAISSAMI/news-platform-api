@@ -48,6 +48,7 @@ class StopReason(StrEnum):
     CHECKPOINT = "checkpoint"  # saw the checkpoint article
     DATE_FLOOR = "date_floor"  # passed checkpoint date minus margin (checkpoint deleted?)
     BOOTSTRAP_FLOOR = "bootstrap_floor"  # first run: reached the bootstrap window start
+    REWALK_FLOOR = "rewalk_floor"  # --rewalk-days: re-read the requested window
     FEED_END = "feed_end"  # 404 or empty page before the checkpoint: gap beyond the feed
     PAGE_LIMIT = "page_limit"  # safety cap hit: walk incomplete
 
@@ -121,25 +122,44 @@ class _WalkState:
 
 
 async def walk_rss(
-    ctx: IngestContext, feed: Feed, *, bootstrap_since: datetime, max_pages: int
+    ctx: IngestContext,
+    feed: Feed,
+    *,
+    bootstrap_since: datetime,
+    max_pages: int,
+    rewalk_since: datetime | None = None,
 ) -> WalkResult:
+    """Walk back to the checkpoint, or with `rewalk_since`, re-read a whole window.
+
+    A re-walk ignores the checkpoint and page-1 validators (it must read pages that have
+    not changed), so already-stored articles are revisited: used to fill in article text
+    after a source's rights policy started allowing it. It never moves the checkpoint
+    backwards.
+    """
     ctx.ensure_allowed()
     checkpoint_at = feed.checkpoint_published_at
-    state = _WalkState(
-        checkpoint_id=feed.checkpoint_external_id,
-        floor=checkpoint_at - CHECKPOINT_MARGIN if checkpoint_at else bootstrap_since,
-        floor_reason=StopReason.DATE_FLOOR if checkpoint_at else StopReason.BOOTSTRAP_FLOOR,
-    )
+    if rewalk_since is not None:
+        state = _WalkState(None, rewalk_since, StopReason.REWALK_FLOOR)
+        purpose = "re-walk"
+    elif checkpoint_at is not None:
+        state = _WalkState(
+            feed.checkpoint_external_id, checkpoint_at - CHECKPOINT_MARGIN, StopReason.DATE_FLOOR
+        )
+        purpose = "since the last completed run"
+    else:
+        state = _WalkState(None, bootstrap_since, StopReason.BOOTSTRAP_FLOOR)
+        purpose = "first run"
     result = state.result
     logger.info(
         "%s: collecting back to %s (%s), one page of ~10 articles per request",
         ctx.source.slug,
         state.floor.date().isoformat(),
-        "last completed run" if checkpoint_at else "first run",
+        purpose,
     )
 
     for page in range(1, max_pages + 1):
-        etag, last_modified = (feed.etag, feed.last_modified) if page == 1 else (None, None)
+        conditional = page == 1 and rewalk_since is None
+        etag, last_modified = (feed.etag, feed.last_modified) if conditional else (None, None)
         fetched = await ctx.fetcher.get(
             ctx.adapter.page_url(feed.url, page), etag=etag, last_modified=last_modified
         )

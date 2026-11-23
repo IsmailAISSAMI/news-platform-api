@@ -1,6 +1,6 @@
 import pytest
 
-from app.ingestion.normalize import ELLIPSIS, html_to_text, truncate
+from app.ingestion.normalize import ELLIPSIS, html_to_paragraphs, html_to_text, truncate
 
 
 @pytest.mark.parametrize(
@@ -51,3 +51,15 @@ def test_truncate_never_exceeds_the_limit(limit: int) -> None:
 def test_truncate_rejects_negative_limits() -> None:
     with pytest.raises(ValueError, match="max_chars"):
         truncate("x", -1)
+
+
+def test_html_to_paragraphs_keeps_structure_for_ai_context() -> None:
+    html = (
+        "<h2>Heading</h2><p>First   paragraph,\n wrapped.</p><ul><li>One</li><li>Two</li></ul>"
+        "<script>x()</script><p>Caf&eacute; &amp;#8217;s end</p><p> </p>"
+    )
+
+    assert html_to_paragraphs(html) == (
+        "Heading\n\nFirst paragraph, wrapped.\n\nOne\n\nTwo\n\nCaf\u00e9 \u2019s end"
+    )
+    assert html_to_paragraphs(None) == ""

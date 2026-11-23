@@ -16,7 +16,7 @@ from app.ingestion.fetch import FetchFailedError, PoliteFetcher
 from app.ingestion.parsers import FeedParseError
 from app.ingestion.policy import FetchedItem, PolicyError, SourceRights, apply_policy
 from app.ingestion.sources.wordpress import WordPressAdapter
-from app.ingestion.store import save_article
+from app.ingestion.store import SaveOutcome, save_article
 from app.ingestion.walk import (
     IngestContext,
     StopReason,
@@ -25,7 +25,7 @@ from app.ingestion.walk import (
     ingest_news_sitemap,
     walk_rss,
 )
-from app.models import Article, Feed, Source
+from app.models import Article, ArticleBody, Feed, Source
 from app.models.enums import DiscoveryChannel, FeedKind, RightsPolicy
 from tests.ingestion.feeds import Post
 from tests.ingestion.publisher import Publisher, posts
@@ -420,16 +420,62 @@ async def test_news_sitemap_refuses_disabled_sources(
     assert publisher.page_requests() == []
 
 
-async def test_licensed_bodies_are_refused_loudly_until_article_bodies_exists(
+async def test_bodies_are_stored_privately_and_edits_update_them(
     db_session: AsyncSession, source: Source
 ) -> None:
     licensed = SourceRights(RightsPolicy.LICENSED_FULL_TEXT, 0, "LIC-1", None, active=True)
-    item = FetchedItem("9", "https://x.test/9-a.html", "Title", NOW, "en", body_html="<p>b</p>")
 
-    with pytest.raises(NotImplementedError, match="article_bodies"):
-        await save_article(
+    async def save(body: str) -> SaveOutcome:
+        item = FetchedItem("9", "https://x.test/9-a.html", "Title", NOW, "en", body_html=body)
+        return await save_article(
             db_session,
             source_id=source.id,
             decision=apply_policy(item, licensed, NOW),
             channel=DiscoveryChannel.RSS,
         )
+
+    assert await save("<p>first</p>") is SaveOutcome.NEW
+    assert await save("<p>first</p>") is SaveOutcome.UNCHANGED
+    assert await save("<p>corrected</p>") is SaveOutcome.UPDATED
+
+    article = await db_session.scalar(select(Article).where(Article.external_id == "9"))
+    assert article is not None
+    body = await db_session.get(ArticleBody, article.id, populate_existing=True)
+    assert body is not None
+    assert body.body_text == "corrected"
+
+
+async def test_hespress_walk_stores_bodies_only_in_the_private_table(
+    publisher: Publisher, run: Runner
+) -> None:
+    publisher.publish(*posts(1000, 5, NOW, step=timedelta(hours=1)))
+
+    await run.rss()
+
+    bodies = (await run.session.execute(select(ArticleBody.body_text))).scalars().all()
+    assert len(bodies) == 5
+    assert all(b.startswith("SYNTHETIC-FULL-BODY") for b in bodies)
+
+
+async def test_rewalk_fills_in_bodies_for_articles_stored_without_them(
+    publisher: Publisher, run: Runner, source: Source
+) -> None:
+    publisher.publish(*posts(1000, 25, NOW, step=timedelta(hours=1)))
+    source.rights_policy = "metadata_only"  # as before the owner's decision
+    await run.rss()
+    assert (await run.session.scalar(select(func.count()).select_from(ArticleBody))) == 0
+    checkpoint = (await run.feed()).checkpoint_published_at
+
+    source.rights_policy = "restricted"
+    normal = await run.rss()  # an ordinary run sees a 304 and does nothing
+    assert normal.stop_reason is StopReason.NOT_MODIFIED
+
+    feed = await run.feed()
+    result = await walk_rss(
+        run.ctx(), feed, bootstrap_since=NOW, max_pages=50, rewalk_since=NOW - timedelta(days=2)
+    )
+
+    assert result.stop_reason is StopReason.FEED_END  # read the whole (short) feed
+    assert result.items_updated == 25  # bodies added to existing articles
+    assert (await run.session.scalar(select(func.count()).select_from(ArticleBody))) == 25
+    assert (await run.feed()).checkpoint_published_at == checkpoint  # not moved backwards

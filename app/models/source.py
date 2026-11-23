@@ -19,6 +19,11 @@ class Source(Base):
             "rights_policy <> 'licensed_full_text' OR license_ref IS NOT NULL",
             name="license_required_for_full_text",
         ),
+        # Private full-text storage requires a written basis (who decided, and why).
+        CheckConstraint(
+            "rights_policy <> 'restricted' OR rights_basis IS NOT NULL",
+            name="basis_required_for_restricted",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
@@ -30,5 +35,7 @@ class Source(Base):
     excerpt_max_chars: Mapped[int] = mapped_column(server_default=text("0"))
     license_ref: Mapped[str | None] = mapped_column(Text)
     license_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Why full text may be stored privately under `restricted` (e.g. an owner decision).
+    rights_basis: Mapped[str | None] = mapped_column(Text)
     active: Mapped[bool] = mapped_column(server_default=text("true"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
