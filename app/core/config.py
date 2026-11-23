@@ -1,5 +1,6 @@
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Literal
 
 from pydantic import SecretStr, field_validator
@@ -41,6 +42,14 @@ class Settings(BaseSettings):
     http_min_delay_s: float = 1.0
     http_max_attempts: int = 3
 
+    # Backups (`news backup` / `news restore-test`). Outside the repo and outside iCloud.
+    backup_dir: Path = Path.home() / "Backups" / "news"
+    backup_keep: int = 14
+    backup_max_age_days: int = 7
+    # How to run pg_dump/pg_restore/createdb/dropdb: inside the compose db container by
+    # default, so tool and server versions always match. Use "" for host-installed tools.
+    pg_tools_command: str = "docker compose exec -T db"
+
     @field_validator("database_url", "api_database_url")
     @classmethod
     def _require_async_capable_driver(cls, value: SecretStr | None) -> SecretStr | None:
@@ -48,6 +57,12 @@ class Settings(BaseSettings):
             msg = "database URLs must start with 'postgresql+psycopg://'"
             raise ValueError(msg)
         return value
+
+    @field_validator("backup_dir")
+    @classmethod
+    def _expand_home(cls, value: Path) -> Path:
+        # "~/Backups/news" from .env must not become a literal "~" folder in the repo.
+        return value.expanduser()
 
     @property
     def is_production(self) -> bool:

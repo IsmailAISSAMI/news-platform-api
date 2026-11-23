@@ -33,6 +33,7 @@ uv run alembic revision --autogenerate -m "..." && uv run alembic upgrade head
 uv run alembic check                      # models and migrations must be in sync
 uv run news ingest [-v] [--since-days N] [--max-pages N] [--no-sitemap]
                                           # hits real publishers: only when asked
+uv run news backup && uv run news restore-test   # dump to ~/Backups/news, then prove it
 ```
 
 **Definition of done:** ruff, mypy and the full pytest suite pass, `alembic check` is clean,

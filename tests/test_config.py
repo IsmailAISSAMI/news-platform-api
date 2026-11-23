@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -38,3 +40,9 @@ def test_defaults() -> None:
     assert settings.environment == "development"
     assert not settings.is_production
     assert settings.cors_origins == []
+
+
+def test_backup_dir_expands_the_home_directory() -> None:
+    settings = make(database_url="postgresql+psycopg://u:p@h/d", backup_dir="~/Backups/news")
+
+    assert settings.backup_dir == Path.home() / "Backups" / "news"

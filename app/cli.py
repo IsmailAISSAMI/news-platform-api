@@ -2,9 +2,11 @@
 
     uv run news ingest                 # collect everything published since the last run
     uv run news ingest --since-days 7  # first run only: how far back to bootstrap
+    uv run news backup                 # pg_dump into ~/Backups/news (keeps 14)
+    uv run news restore-test           # prove the newest backup restores
 
-Exit codes: 0 ok · 1 some feeds failed · 2 environment not ready · 3 already running ·
-130 interrupted (progress is kept; the next run resumes).
+Exit codes: 0 ok · 1 failed (feeds, backup or restore check) · 2 environment not ready ·
+3 already running · 130 interrupted (progress is kept; the next run resumes).
 """
 
 import argparse
@@ -12,7 +14,7 @@ import asyncio
 import sys
 import time
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.core.config import get_settings
@@ -27,6 +29,14 @@ from app.ingestion.readiness import (
 )
 from app.ingestion.runner import AlreadyRunningError, IngestOptions, RunReport, run_ingest
 from app.models.enums import RunStatus
+from app.ops.backup import (
+    BackupError,
+    PgTools,
+    create_backup,
+    freshness_warning,
+    list_backups,
+    verify_backup,
+)
 
 EXIT_OK = 0
 EXIT_FEED_FAILURES = 1
@@ -38,9 +48,13 @@ EXIT_INTERRUPTED = 130
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="news", description="News platform operations.")
     commands = parser.add_subparsers(dest="command", required=True)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-v", "--verbose", action="store_true", help="Show progress logs.")
 
     ingest = commands.add_parser(
-        "ingest", help="Collect articles published since the last completed run."
+        "ingest",
+        parents=[common],
+        help="Collect articles published since the last completed run.",
     )
     ingest.add_argument(
         "--since-days",
@@ -57,7 +71,14 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument(
         "--no-sitemap", action="store_true", help="Skip the news sitemap (last ~48 h)."
     )
-    ingest.add_argument("-v", "--verbose", action="store_true", help="Show progress logs.")
+    commands.add_parser(
+        "backup", parents=[common], help="Dump the database to the backup directory."
+    )
+    commands.add_parser(
+        "restore-test",
+        parents=[common],
+        help="Restore the newest backup into a scratch database and verify row counts.",
+    )
     return parser
 
 
@@ -72,12 +93,16 @@ def _positive_int(value: str) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_cli_logging(verbose=args.verbose)
-    options = IngestOptions(
-        bootstrap_days=args.since_days,
-        max_pages=args.max_pages,
-        include_news_sitemap=not args.no_sitemap,
-    )
     try:
+        if args.command == "backup":
+            return asyncio.run(backup())
+        if args.command == "restore-test":
+            return asyncio.run(restore_test())
+        options = IngestOptions(
+            bootstrap_days=args.since_days,
+            max_pages=args.max_pages,
+            include_news_sitemap=not args.no_sitemap,
+        )
         return asyncio.run(ingest(options))
     except KeyboardInterrupt:
         _err("Interrupted. Work done so far is saved; the next run resumes the gap.")
@@ -107,7 +132,74 @@ async def ingest(options: IngestOptions) -> int:
         await engine.dispose()
 
     sys.stdout.write(format_report(report, elapsed_s=time.monotonic() - started))
+    reminder = freshness_warning(
+        settings.backup_dir,
+        max_age=timedelta(days=settings.backup_max_age_days),
+        now=datetime.now(UTC),
+    )
+    if reminder:
+        _err(f"Reminder: {reminder}")
     return EXIT_OK if report.status is RunStatus.SUCCEEDED else EXIT_FEED_FAILURES
+
+
+async def backup() -> int:
+    settings = get_settings()
+    engine = create_engine(settings)
+    try:
+        await wait_for_database(engine)
+        created = await create_backup(
+            engine,
+            PgTools.from_settings(settings),
+            settings.backup_dir,
+            keep=settings.backup_keep,
+            now=datetime.now(UTC),
+        )
+    except NotReadyError as exc:
+        _err(f"Not ready: {exc}")
+        return EXIT_NOT_READY
+    except AlreadyRunningError as exc:
+        _err(f"Not started: {exc}.")
+        return EXIT_ALREADY_RUNNING
+    except BackupError as exc:
+        _err(f"Backup failed: {exc}")
+        return EXIT_FEED_FAILURES
+    finally:
+        await engine.dispose()
+
+    rows = sum(created.manifest.row_counts.values())
+    sys.stdout.write(
+        f"Backup written: {created.dump} ({created.manifest.size_bytes / 1024:.0f} KiB, "
+        f"{rows} rows in {len(created.manifest.row_counts)} tables)\n"
+        "Not verified yet: run `uv run news restore-test`.\n"
+    )
+    return EXIT_OK
+
+
+async def restore_test() -> int:
+    settings = get_settings()
+    backups = list_backups(settings.backup_dir)
+    if not backups:
+        _err(f"No backup in {settings.backup_dir}. Run `uv run news backup` first.")
+        return EXIT_NOT_READY
+    newest = backups[0]
+    try:
+        result = await verify_backup(
+            newest, PgTools.from_settings(settings), settings, now=datetime.now(UTC)
+        )
+    except BackupError as exc:
+        _err(f"Restore check failed: {exc}")
+        return EXIT_FEED_FAILURES
+
+    if not result.ok:
+        for table, (expected, actual) in sorted(result.mismatches.items()):
+            _err(f"  {table}: expected {expected} rows, restored {actual}")
+        _err(f"Restore check FAILED for {newest.dump.name}: do not rely on this backup.")
+        return EXIT_FEED_FAILURES
+    sys.stdout.write(
+        f"Verified: {newest.dump.name} restores completely "
+        f"({len(newest.manifest.row_counts)} tables, row counts match).\n"
+    )
+    return EXIT_OK
 
 
 def format_report(report: RunReport, *, elapsed_s: float) -> str:

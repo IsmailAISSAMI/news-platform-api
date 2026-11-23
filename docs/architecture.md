@@ -295,12 +295,28 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 
 ## 8. Backups
 
-- **`uv run news backup`:** `pg_dump -Fc` from the db container to `~/Backups/news/`,
-  outside the repo, kept 14 copies. Time Machine provides a second copy.
-- **Reminder:** `news ingest` warns when the newest backup is older than 7 days.
-- **`uv run news restore-test`:** restores the newest dump into a scratch database and
-  compares row counts per table. **A backup only counts once a restore test has passed.**
-  Run it monthly.
+- **`uv run news backup`** (`app/ops/backup.py`):
+  - It takes the ingest advisory lock, so a dump never captures half a run; it is refused
+    while an ingest runs.
+  - It records exact per-table row counts and the Alembic revision, then streams
+    `pg_dump -Fc` **inside the db container**. The tool version always matches the server,
+    and no password ever appears on a command line.
+  - It writes `news-<UTC stamp>.dump.partial` and renames it atomically. A JSON manifest
+    holds the size, sha256, revision, counts and `verified_at`.
+  - Files are mode 600 in a 700 directory, `~/Backups/news/`: outside the repo and outside
+    iCloud. The newest 14 are kept. Time Machine provides a second copy.
+- **`uv run news restore-test`:**
+  - It verifies the newest dump's sha256, restores it into a scratch database
+    `<db>_restore_check` (`--no-owner --no-privileges --exit-on-error`), and compares every
+    table's row count with the manifest.
+  - On success it sets `verified_at`. The scratch database is always dropped; the live
+    database is only read.
+  - **A backup only counts once a restore test has passed.**
+- **Reminder:** `news ingest` warns when there is no *verified* backup newer than
+  `BACKUP_MAX_AGE_DAYS` (7).
+- **Restoring for real** (disaster recovery) is deliberately manual:
+  `docker compose exec -T db pg_restore -U news -d news --clean --if-exists < <dump>`,
+  then re-run `scripts/db_roles.sql`.
 
 ## 9. CI and GitHub
 
@@ -329,7 +345,7 @@ before it starts.**
 | 5 ✅ | `news ingest` command | `app/cli.py`, `app/ingestion/runner.py`, `readiness.py`, `pyproject.toml` script | Readiness, lock, run report, migration-head check | DB down → clean failure; concurrent run refused; `ingestion_runs` recorded |
 | 6 ⏸ deferred | Archive backlog | `app/ingestion/backlog.py`, `page_metadata.py` | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |
 | 7 ✅ | Read API | `app/api/v1/catalog.py`, `app/api/caching.py`, `app/schemas/catalog.py`, `app/db/session.py` | Sources, feeds, articles (keyset, filters, FTS), detail; weak ETag + 304; read-only connections (`default_transaction_read_only`), optional `API_DATABASE_URL` in `news_api` | Every article exactly once across pages; stable under inserts; filters and search; 400/422 validation; no body ever served; 304 revalidation; API engine cannot write |
-| 8 | Backups | `app/ops/backup.py`, CLI commands | Backup, retention, restore test | Restore into a scratch DB matches counts; retention prunes |
+| 8 ✅ | Backups | `app/ops/backup.py`, `news backup`, `news restore-test` | Locked, atomic, checksummed dumps; retention; restore into a scratch DB; ingest reminder | Real round trip (local Docker); corrupted dump; row-count mismatch not marked verified; refused during ingest; pruning, partials, freshness, private files |
 | 9 | Analysis framework | `app/analysis/*` | Local analyzers on permitted text, versioned | Idempotent per analyzer version; policy respected |
 | 10 | Frontend | separate | Discovery UI with link-out and attribution | n/a |
 

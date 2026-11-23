@@ -1,6 +1,7 @@
 """The `news` CLI: arguments, exit codes and the printed report (no DB, no network)."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ from app.ingestion.readiness import NotReadyError
 from app.ingestion.runner import AlreadyRunningError, FeedReport, IngestOptions, RunReport
 from app.ingestion.walk import StopReason, WalkResult
 from app.models.enums import RunStatus
+from app.ops.backup import Backup, BackupError, Manifest, VerifyResult
 
 
 def test_defaults() -> None:
@@ -142,3 +144,126 @@ def test_main_passes_options(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert cli.main(["ingest", "--since-days", "7", "--max-pages", "20", "--no-sitemap"]) == 0
     assert seen == [IngestOptions(bootstrap_days=7, max_pages=20, include_news_sitemap=False)]
+
+
+# --- backup / restore-test ---------------------------------------------------------------
+
+
+def test_backup_and_restore_test_dispatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    async def fake_backup() -> int:
+        calls.append("backup")
+        return cli.EXIT_OK
+
+    async def fake_restore() -> int:
+        calls.append("restore-test")
+        return cli.EXIT_FEED_FAILURES
+
+    monkeypatch.setattr(cli, "backup", fake_backup)
+    monkeypatch.setattr(cli, "restore_test", fake_restore)
+
+    assert cli.main(["backup"]) == cli.EXIT_OK
+    assert cli.main(["restore-test", "-v"]) == cli.EXIT_FEED_FAILURES
+    assert calls == ["backup", "restore-test"]
+
+
+async def test_restore_test_without_backups_exits_2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "list_backups", lambda _dir: [])
+
+    assert await cli.restore_test() == cli.EXIT_NOT_READY
+    assert "Run `uv run news backup` first" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (NotReadyError("db down"), cli.EXIT_NOT_READY),
+        (AlreadyRunningError("ingest running"), cli.EXIT_ALREADY_RUNNING),
+        (BackupError("pg_dump failed: disk full"), cli.EXIT_FEED_FAILURES),
+    ],
+)
+async def test_backup_errors_map_to_exit_codes(
+    monkeypatch: pytest.MonkeyPatch, error: Exception, code: int
+) -> None:
+    async def ok(*_: Any, **__: Any) -> None:
+        return None
+
+    async def fail(*_: Any, **__: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(cli, "wait_for_database", ok)
+    monkeypatch.setattr(cli, "create_backup", fail)
+
+    assert await cli.backup() == code
+
+
+async def test_backup_success_reports_and_asks_for_verification(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dump = tmp_path / "news-x.dump"
+    manifest = Manifest(dump.name, datetime.now(UTC), 2048, "h", "rev", {"articles": 5})
+
+    async def ok(*_: Any, **__: Any) -> None:
+        return None
+
+    async def created(*_: Any, **__: Any) -> Backup:
+        return Backup(dump, manifest)
+
+    monkeypatch.setattr(cli, "wait_for_database", ok)
+    monkeypatch.setattr(cli, "create_backup", created)
+
+    assert await cli.backup() == cli.EXIT_OK
+    out = capsys.readouterr().out
+    assert "Backup written" in out
+    assert "Not verified yet" in out
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code", "message"),
+    [
+        ("ok", cli.EXIT_OK, "Verified"),
+        ("mismatch", cli.EXIT_FEED_FAILURES, "do not rely on this backup"),
+        ("error", cli.EXIT_FEED_FAILURES, "Restore check failed"),
+    ],
+)
+async def test_restore_test_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    outcome: str,
+    code: int,
+    message: str,
+) -> None:
+    backup = Backup(
+        tmp_path / "news-x.dump", Manifest("news-x.dump", datetime.now(UTC), 1, "h", "r", {"a": 1})
+    )
+
+    async def verify(*_: Any, **__: Any) -> VerifyResult:
+        if outcome == "error":
+            raise BackupError("pg_restore failed")
+        result = VerifyResult(backup)
+        if outcome == "mismatch":
+            result.mismatches["a"] = (1, 0)
+        return result
+
+    monkeypatch.setattr(cli, "list_backups", lambda _dir: [backup])
+    monkeypatch.setattr(cli, "verify_backup", verify)
+
+    assert await cli.restore_test() == code
+    captured = capsys.readouterr()
+    assert message in captured.out + captured.err
+
+
+@pytest.mark.usefixtures("ready")
+async def test_ingest_reminds_about_stale_backups(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(cli, "run_ingest", fake_run(sample_report()))
+    monkeypatch.setattr(cli, "freshness_warning", lambda *_a, **_k: "No backup yet.")
+
+    await cli.ingest(IngestOptions())
+
+    assert "Reminder: No backup yet." in capsys.readouterr().err
