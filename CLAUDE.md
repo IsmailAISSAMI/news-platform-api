@@ -104,7 +104,7 @@ of them requires an explicit decision by the owner, recorded in the architecture
 ## Engineering conventions
 
 - **Async all the way.** No blocking I/O in `async def` (ruff `ASYNC` rules enforce it).
-  CPU-bound or sync-only libraries (e.g. `feedparser`) run via `asyncio.to_thread`.
+  CPU-bound or sync-only work runs via `asyncio.to_thread`.
 - **Database.**
   - Schema changes only through Alembic migrations. Never edit a migration that is
     already on `main`; add a new one.
@@ -131,8 +131,11 @@ of them requires an explicit decision by the owner, recorded in the architecture
     `integration`.
 - **Typing.** mypy strict must pass. A `# type: ignore` needs an error code and a reason.
 - **Dependencies.** Prefer the standard library and existing deps. Justify every new one.
-  No Celery, Redis, Kafka, Kubernetes or Elasticsearch. Parse XML with `defusedxml`
-  (feeds via `feedparser` in a thread).
+  No Celery, Redis, Kafka, Kubernetes or Elasticsearch. Parse all XML (RSS, sitemaps)
+  with `defusedxml` through `app/ingestion/parsers.py`: strict, so malformed input fails
+  loudly. No `feedparser`.
+- **Ingestion tests** use the simulated publisher in `tests/integration/test_walk.py` and
+  the synthetic builders in `tests/ingestion/feeds.py`. Never use real feed content.
 - **Infrastructure.** Nothing may require a paid service or a free-tier account.
   PostgreSQL is never exposed to the internet. GitHub Actions is CI only, and never
   touches real data.

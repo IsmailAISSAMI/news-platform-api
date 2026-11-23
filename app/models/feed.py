@@ -39,6 +39,11 @@ class Feed(Base):
     checkpoint_external_id: Mapped[str | None] = mapped_column(Text)
     checkpoint_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # Publication window the RSS walk could not cover because the feed ran out of pages
+    # before reaching the checkpoint. The archive backlog (milestone 6) fills and clears it.
+    uncovered_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    uncovered_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     consecutive_failures: Mapped[int] = mapped_column(server_default=text("0"))
     state: Mapped[str] = mapped_column(Text, server_default=text(f"'{FeedState.ACTIVE}'"))
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

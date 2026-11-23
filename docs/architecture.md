@@ -107,6 +107,20 @@ Re-verify this table when the publisher's behavior looks different, and update t
 - **First run:** a bounded bootstrap, the last 30 days by default (`--since`), not the
   whole archive.
 - **Page 1 uses conditional GET.** A 304 means nothing new, and the walk ends at once.
+- **Page-1 validators (ETag, Last-Modified) are saved only when the walk completes,**
+  like the checkpoint. Saved early, an interrupted run would make the next run see a 304
+  and skip the rest of the gap.
+- **Feed ran out before the checkpoint** (a 404 or empty page, so the gap is deeper than
+  the feed reaches):
+  - the window is recorded in `feeds.uncovered_since` / `uncovered_until`, merged with any
+    earlier gap. A merged window can over-cover; the backlog only queues URLs not already
+    stored, so that is safe;
+  - the checkpoint still advances.
+- **Page limit** (`max_pages`, a safety cap): the walk is incomplete, nothing advances,
+  and the next run walks again.
+- **News sitemap** (last ~48 h) is **insert-only**: it adds articles the walk missed but
+  never overwrites the richer RSS fields. When RSS later sees such an article, it enriches
+  the row (author, categories).
 
 ### 4.3 Archive backlog (gaps deeper than the RSS feed)
 
@@ -151,8 +165,11 @@ RSS depth pass** (milestone 4).
 - **Limits:** timeouts of 5 s to connect and 20 s total; responses capped at 5 MB.
 - **Retries:** for 429, 5xx and network errors only, with exponential backoff and jitter
   (3 attempts). `Retry-After` is honored.
-- **XML parsing** uses `defusedxml` (against entity-expansion attacks). Feeds are parsed
-  with `feedparser` in `asyncio.to_thread`.
+- **XML parsing** uses `defusedxml` for RSS and sitemaps (`app/ingestion/parsers.py`). It
+  refuses entity-expansion, external-entity and DTD attacks.
+  - It is strict: a malformed page raises and is recorded instead of being half-ingested.
+  - `feedparser` was considered and dropped: it is lenient, untyped and redundant for
+    standard WordPress RSS.
 - **Feed health:** `consecutive_failures` drives the state: `active` → `degraded` after
   5 failures → `disabled` after 20 (manual re-enable).
 - **Never bypass** authentication, paywalls, anti-bot measures or access restrictions.
@@ -304,7 +321,7 @@ before it starts.**
 | 1 ✅ | Schema, roles, seed | `app/models/*`, `alembic/versions/*`, `scripts/db_roles.sql` | Tables, constraints, indexes; Hespress source and feeds seeded | Constraints and dedup uniqueness; each role can't exceed its permissions |
 | 2 ✅ | Rights gate | `app/ingestion/policy.py`, `normalize.py` | `apply_policy` is the only path from a fetched item to a storable record; fail-safe license downgrades | Every policy; expired or missing license; record type and `articles` table cannot hold a body (the bodies-audit query moves to when `article_bodies` exists) |
 | 3 ✅ | Polite fetcher | `app/ingestion/fetch.py`, `robots.py` | Conditional GET, robots, delay, limits, retries | `httpx.MockTransport`: 304, 429 with Retry-After, 5xx backoff, timeout, size cap, disallowed path |
-| 4 | Hespress adapter and RSS walk | `app/ingestion/sources/hespress.py`, `walk.py` | Parse, normalize to UTC, guid → ID, checkpoint walk | Malformed XML, repeated runs (idempotent), interrupted run resumes to checkpoint, deleted checkpoint, duplicates across feed and sitemap; **measure real RSS depth with a few probes** |
+| 4 ✅ (depth probe pending) | Hespress adapter and RSS walk | `app/ingestion/parsers.py`, `sources/wordpress.py`, `store.py`, `walk.py` | Parse, normalize to UTC, guid → ID, checkpoint walk | Malformed XML, repeated runs (idempotent), interrupted run resumes to checkpoint, deleted checkpoint, duplicates across feed and sitemap; **measure real RSS depth with a few probes** |
 | 5 | `news ingest` command | `app/ingestion/cli.py`, `pyproject.toml` script | Readiness, lock, run report, migration-head check | DB down → clean failure; concurrent run refused; `ingestion_runs` recorded |
 | 6 | Archive backlog | `app/ingestion/backlog.py`, `page_metadata.py` | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |
 | 7 | Read API | `app/api/v1/*`, `app/schemas/*` | Sources, feeds, articles, search | Pagination stable under inserts; filters; ETag; role is SELECT-only |

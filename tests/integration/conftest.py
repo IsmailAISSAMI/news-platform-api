@@ -19,7 +19,11 @@ async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     """Session wrapped in a transaction that is rolled back after each test."""
     async with engine.connect() as connection:
         transaction = await connection.begin()
-        session = AsyncSession(bind=connection, join_transaction_mode="create_savepoint")
+        # expire_on_commit=False matches app.db.session (code that commits mid-way, like the
+        # RSS walk, keeps using its loaded objects).
+        session = AsyncSession(
+            bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+        )
         try:
             yield session
         finally:
