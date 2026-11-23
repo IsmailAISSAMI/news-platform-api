@@ -11,8 +11,12 @@ uv sync                      # creates .venv with the locked dependencies (Pytho
 cp .env.example .env         # then set real passwords
 uv run pre-commit install
 docker compose up -d db      # PostgreSQL on localhost:5433
-uv run alembic upgrade head
+uv run alembic upgrade head  # schema + Hespress seed
+docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 < scripts/db_roles.sql
 ```
+
+`scripts/db_roles.sql` creates the least-privilege roles `news_ingest` (read/write) and
+`news_api` (read-only). It is idempotent: re-run it after every migration.
 
 ## Run
 
@@ -47,7 +51,7 @@ uv run pytest -m "not integration" # unit tests only
 
 ```bash
 uv run alembic revision --autogenerate -m "describe change"
-uv run alembic upgrade head
+uv run alembic upgrade head       # then re-run scripts/db_roles.sql (see Setup)
 uv run alembic check               # fails if models and migrations are out of sync
 ```
 

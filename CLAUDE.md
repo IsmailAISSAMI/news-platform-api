@@ -112,8 +112,11 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - All timestamps are `timestamptz` and stored in UTC.
   - Dedup key per article: `UNIQUE(source_id, external_id)`. For Hespress, `external_id`
     is the WordPress post ID from `<guid>` (`?p=149695`).
-  - Roles: `news_owner` (migrations), `news_ingest` (read/write), `news_api` (SELECT
-    only). The API must connect as `news_api`.
+  - Roles (`scripts/db_roles.sql`, re-run after each migration): the `POSTGRES_USER`
+    owns the schema and runs migrations; `news_ingest` reads and writes; `news_api` is
+    SELECT-only. The API must connect as a login user in `news_api`.
+  - Seed or reference data goes in migrations, written idempotently
+    (`ON CONFLICT DO NOTHING`).
 - **API.**
   - Business routes live under `/api/v1` and are read-only (`GET` only).
   - Use keyset pagination on `(published_at, id)` with a bounded `limit`. Never `OFFSET`.

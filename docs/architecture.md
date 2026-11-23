@@ -240,8 +240,14 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   - later, `pg_trgm` on `title` for cross-publisher duplicates.
 - **Content hash:** `content_hash` over the stored fields detects publisher edits, which
   update the row and `modified_at`.
-- **Database roles:** `news_owner` (migrations), `news_ingest` (read and write),
-  `news_api` (SELECT only).
+- **Database roles** (`scripts/db_roles.sql`, idempotent, re-run after each migration):
+  - the schema owner is the `POSTGRES_USER` (`news`), which runs migrations;
+  - `news_ingest` reads and writes data, cannot change the schema, and has no access to
+    `alembic_version`;
+  - `news_api` has SELECT only.
+
+  Both are NOLOGIN group roles. Login users with their own passwords are added when a
+  process needs them (the API in milestone 7).
 - **Retention:** articles are kept indefinitely (metadata). `ingestion_runs` for 180 days.
   Resolved `discovered_urls` for 30 days. Bodies only as their license allows.
 - **Deliberately not stored:** raw feed payloads, because they contain full text.
@@ -288,8 +294,8 @@ before it starts.**
 | # | Milestone | Files | Behaviour | Tests |
 | --- | --- | --- | --- | --- |
 | 0 ✅ | Docs and config | `docs/architecture.md`, `CLAUDE.md`, `.env.example`, `.gitignore` | Docs match verified facts; `.env.example` works copied as-is | n/a (doc review) |
-| 1 | Schema, roles, seed | `app/models/*`, `alembic/versions/*`, `scripts/db_roles.sql` | Tables, constraints, indexes; Hespress source and feeds seeded | Constraints and dedup uniqueness; each role can't exceed its permissions |
-| 2 | Rights gate | `app/ingestion/policy.py` | One function decides what may be stored per policy | Every policy against fixtures; the bodies-audit query |
+| 1 ✅ | Schema, roles, seed | `app/models/*`, `alembic/versions/*`, `scripts/db_roles.sql` | Tables, constraints, indexes; Hespress source and feeds seeded | Constraints and dedup uniqueness; each role can't exceed its permissions |
+| 2 ✅ | Rights gate | `app/ingestion/policy.py`, `normalize.py` | `apply_policy` is the only path from a fetched item to a storable record; fail-safe license downgrades | Every policy; expired or missing license; record type and `articles` table cannot hold a body (the bodies-audit query moves to when `article_bodies` exists) |
 | 3 | Polite fetcher | `app/ingestion/fetch.py`, `robots.py` | Conditional GET, robots, delay, limits, retries | `httpx.MockTransport`: 304, 429 with Retry-After, 5xx backoff, timeout, size cap, disallowed path |
 | 4 | Hespress adapter and RSS walk | `app/ingestion/sources/hespress.py`, `walk.py` | Parse, normalize to UTC, guid → ID, checkpoint walk | Malformed XML, repeated runs (idempotent), interrupted run resumes to checkpoint, deleted checkpoint, duplicates across feed and sitemap; **measure real RSS depth with a few probes** |
 | 5 | `news ingest` command | `app/ingestion/cli.py`, `pyproject.toml` script | Readiness, lock, run report, migration-head check | DB down → clean failure; concurrent run refused; `ingestion_runs` recorded |
