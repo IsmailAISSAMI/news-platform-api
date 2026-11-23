@@ -14,7 +14,7 @@ from app.db.session import create_engine, create_session_factory
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    engine = create_engine(app.state.settings)
+    engine = create_engine(app.state.settings, read_only=True)  # the API never writes
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
     try:

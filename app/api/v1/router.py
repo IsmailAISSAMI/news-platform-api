@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-router = APIRouter()
+from app.api.v1 import catalog
 
-# Feature routers are included here, e.g.:
-# router.include_router(articles.router, prefix="/articles", tags=["Articles"])
+router = APIRouter()
+router.include_router(catalog.router)

@@ -79,6 +79,10 @@ filterwarnings = [
     "ignore:Using `httpx` with `starlette.testclient`",
 ]
 
+[tool.coverage.run]
+# SQLAlchemy's asyncio layer runs code in greenlets, which coverage only traces when told to.
+concurrency = ["greenlet", "thread"]
+
 [tool.coverage.report]
 fail_under = 80
 exclude_also = ["if TYPE_CHECKING:"]

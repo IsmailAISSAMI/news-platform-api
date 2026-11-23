@@ -116,7 +116,10 @@ of them requires an explicit decision by the owner, recorded in the architecture
     is the WordPress post ID from `<guid>` (`?p=149695`).
   - Roles (`scripts/db_roles.sql`, re-run after each migration): the `POSTGRES_USER`
     owns the schema and runs migrations; `news_ingest` reads and writes; `news_api` is
-    SELECT-only. The API must connect as a login user in `news_api`.
+    SELECT-only.
+  - The API's engine is `create_engine(settings, read_only=True)`: its connections set
+    `default_transaction_read_only=on`, and it uses `API_DATABASE_URL` (a `news_api`
+    login) when set. Never give the API a read-write engine.
   - Seed or reference data goes in migrations, written idempotently
     (`ON CONFLICT DO NOTHING`).
 - **API.**

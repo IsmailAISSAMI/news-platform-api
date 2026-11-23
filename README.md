@@ -32,7 +32,18 @@ Endpoints:
 | -------------------- | -------------------------------------------- |
 | `GET /health/live`   | Liveness: the process is up                  |
 | `GET /health/ready`  | Readiness: the database is reachable (or 503) |
-| `/api/v1/...`        | Versioned business API                       |
+| `GET /api/v1/articles` | Newest first. Filters: `source`, `category`, `language`, `published_after`, `published_before`, `q` (full-text). Paginate with `cursor` (from `next_cursor`) and `limit` (max 100). |
+| `GET /api/v1/articles/{id}` | One article: metadata, link to the original, source attribution |
+| `GET /api/v1/sources` | Publishers and their rights policy |
+| `GET /api/v1/feeds` | Feed health, checkpoints, uncovered windows |
+
+- **Read-only:** the API never writes. Its database connections are opened read-only, so
+  PostgreSQL itself rejects writes. Optionally set `API_DATABASE_URL` to a login user in
+  the `news_api` role (see `scripts/db_roles.sql`) for a second, privilege-level layer.
+- **Caching:** responses carry an `ETag` with `Cache-Control: no-cache`. Send
+  `If-None-Match` to get a cheap `304` when nothing changed.
+- **Rights:** article bodies are never served. Every article links to the original and
+  names its source.
 
 Docs (`/docs`, `/redoc`, `/openapi.json`) are disabled when `ENVIRONMENT=production`.
 

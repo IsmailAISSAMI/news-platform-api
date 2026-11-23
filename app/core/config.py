@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # Required: no default so a misconfigured deployment fails fast instead of
     # silently connecting with development credentials.
     database_url: SecretStr
+    # Optional: a login user in the SELECT-only `news_api` role, used by the API.
+    api_database_url: SecretStr | None = None
 
     # Outbound HTTP (ingestion). The User-Agent identifies us and gives publishers a contact.
     user_agent: str = (
@@ -39,11 +41,11 @@ class Settings(BaseSettings):
     http_min_delay_s: float = 1.0
     http_max_attempts: int = 3
 
-    @field_validator("database_url")
+    @field_validator("database_url", "api_database_url")
     @classmethod
-    def _require_async_capable_driver(cls, value: SecretStr) -> SecretStr:
-        if not value.get_secret_value().startswith("postgresql+psycopg://"):
-            msg = "DATABASE_URL must start with 'postgresql+psycopg://'"
+    def _require_async_capable_driver(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().startswith("postgresql+psycopg://"):
+            msg = "database URLs must start with 'postgresql+psycopg://'"
             raise ValueError(msg)
         return value
 
