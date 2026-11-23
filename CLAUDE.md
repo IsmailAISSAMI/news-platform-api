@@ -135,6 +135,10 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - No live network calls. Mock HTTP with `httpx.MockTransport` and use fixture files.
   - Use the `db_session` fixture (rolled back per test) for DB tests, and mark them
     `integration`.
+  - Tests run against a separate `<db>_test` database (`news_test`), never the real one:
+    `tests/conftest.py` rewrites `DATABASE_URL` before the app is imported, and
+    `tests/integration/conftest.py` creates and migrates it. Never weaken that guard.
+    It is safe to run tests while a real `news ingest` runs (advisory locks are per DB).
 - **Typing.** mypy strict must pass. A `# type: ignore` needs an error code and a reason.
 - **Dependencies.** Prefer the standard library and existing deps. Justify every new one.
   No Celery, Redis, Kafka, Kubernetes or Elasticsearch. Parse all XML (RSS, sitemaps)

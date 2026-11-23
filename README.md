@@ -238,7 +238,8 @@ docs/             architecture and design decisions
 uv run pre-commit install          # once: run checks automatically before each commit
 uv run ruff check . && uv run ruff format --check .
 uv run mypy app tests alembic
-uv run pytest                      # needs the database running
+uv run pytest                      # needs the database running; uses a separate
+                                   # news_test database, never your real data
 uv run pytest -m "not integration" # quick tests, no database needed
 ```
 
