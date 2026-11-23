@@ -11,12 +11,20 @@ Exit codes: 0 ok · 1 failed (feeds, backup or restore check) · 2 environment n
 
 import argparse
 import asyncio
+import json
 import sys
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import httpx
+from sqlalchemy import select
+
+from app.analysis.compare import render as render_comparison
+from app.analysis.compare import score_run
+from app.analysis.lab import run_lab
+from app.analysis.llm import LLMUnavailableError, LocalLLM
 from app.core.config import get_settings
 from app.core.logging import configure_cli_logging
 from app.db.session import create_engine, create_session_factory
@@ -28,6 +36,7 @@ from app.ingestion.readiness import (
     wait_for_database,
 )
 from app.ingestion.runner import AlreadyRunningError, IngestOptions, RunReport, run_ingest
+from app.models import ArticleBody
 from app.models.enums import RunStatus
 from app.ops.backup import (
     BackupError,
@@ -79,6 +88,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-read the last N days, even articles already stored (e.g. to fetch "
         "article text for older articles). Slower; never skips anything.",
     )
+    lab = commands.add_parser(
+        "lab",
+        parents=[common],
+        help="Try the AI analysis on a few articles (results go to ~/news-eval/lab).",
+    )
+    lab.add_argument("ids", nargs="+", type=_positive_int, help="Article ids.")
+    lab.add_argument("--model", default=None, help="LM Studio model id (default: LLM_MODEL).")
+    lab.add_argument("--label", default="", help="Suffix for the output folder name.")
+    lab.add_argument(
+        "--think",
+        action="store_true",
+        help="Let the model 'think' before answering (off by default; for comparison).",
+    )
+    compare = commands.add_parser(
+        "lab-compare",
+        parents=[common],
+        help="Score lab runs side by side with the current code checks.",
+    )
+    compare.add_argument("runs", nargs="+", type=Path, help="Lab run directories.")
     commands.add_parser(
         "backup", parents=[common], help="Dump the database to the backup directory."
     )
@@ -102,6 +130,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_cli_logging(verbose=args.verbose)
     try:
+        if args.command == "lab":
+            return asyncio.run(lab(args.ids, args.model, args.label, think=args.think))
+        if args.command == "lab-compare":
+            return asyncio.run(lab_compare(args.runs))
         if args.command == "backup":
             return asyncio.run(backup())
         if args.command == "restore-test":
@@ -149,6 +181,62 @@ async def ingest(options: IngestOptions) -> int:
     if reminder:
         _err(f"Reminder: {reminder}")
     return EXIT_OK if report.status is RunStatus.SUCCEEDED else EXIT_FEED_FAILURES
+
+
+async def lab(ids: list[int], model: str | None, label: str, *, think: bool) -> int:
+    settings = get_settings()
+    engine = create_engine(settings, read_only=True)
+    extra = {"reasoning_effort": "medium"} if think else None
+    try:
+        async with httpx.AsyncClient() as client:
+            llm = LocalLLM(
+                client, base_url=settings.llm_base_url, model=model or settings.llm_model
+            )
+            await llm.ensure_ready()
+            async with create_session_factory(engine)() as session:
+                out, results = await run_lab(
+                    session,
+                    llm,
+                    ids,
+                    extra_body=extra,
+                    label=label or ("think" if think else ""),
+                )
+    except LLMUnavailableError as exc:
+        _err(f"Not ready: {exc}")
+        return EXIT_NOT_READY
+    finally:
+        await engine.dispose()
+    sys.stdout.write((out / "summary.md").read_text() + f"\nFull results: {out}\n")
+    return EXIT_OK if all(r.ok for r in results) else EXIT_FEED_FAILURES
+
+
+async def lab_compare(runs: list[Path]) -> int:
+    missing = [str(run) for run in runs if not run.is_dir()]
+    if missing:
+        _err(f"Not a lab run directory: {', '.join(missing)}")
+        return EXIT_NOT_READY
+    settings = get_settings()
+    engine = create_engine(settings, read_only=True)
+    ids = {
+        json.loads(path.read_text())["article_id"]
+        for run in runs
+        for path in run.glob("article-*.json")
+    }
+    try:
+        async with create_session_factory(engine)() as session:
+            rows = await session.execute(
+                select(ArticleBody.article_id, ArticleBody.body_text).where(
+                    ArticleBody.article_id.in_(ids)
+                )
+            )
+            paragraphs = {
+                article_id: [p for p in text.split("\n\n") if p.strip()]
+                for article_id, text in rows.all()
+            }
+    finally:
+        await engine.dispose()
+    sys.stdout.write(render_comparison([score_run(run, paragraphs) for run in runs]))
+    return EXIT_OK
 
 
 async def backup() -> int:

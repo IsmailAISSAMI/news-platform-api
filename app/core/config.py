@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     http_min_delay_s: float = 1.0
     http_max_attempts: int = 3
 
+    # Local AI analysis (LM Studio's OpenAI-compatible server). Must stay on localhost.
+    llm_base_url: str = "http://localhost:1234/v1"
+    llm_model: str = "qwen/qwen3.5-9b"
+
     # Backups (`news backup` / `news restore-test`). Outside the repo and outside iCloud.
     backup_dir: Path = Path.home() / "Backups" / "news"
     backup_keep: int = 14
