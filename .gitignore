@@ -7,6 +7,10 @@ dist/
 
 # Environments
 .venv/
+# The project lives in an iCloud-synced folder: the real venv is .venv.nosync (iCloud skips
+# *.nosync) and .venv is a symlink to it.
+.venv
+*.nosync
 .env
 .env.*
 !.env.example

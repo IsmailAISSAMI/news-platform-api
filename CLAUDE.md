@@ -155,6 +155,13 @@ of them requires an explicit decision by the owner, recorded in the architecture
 
 ## Local environment gotchas
 
+- **The project is in an iCloud-synced folder (`~/Desktop`).** iCloud corrupts virtualenvs
+  by creating "`file 2.py`" conflict copies.
+  - The real venv is `.venv.nosync` (iCloud ignores `*.nosync`), and `.venv` is a symlink
+    to it.
+  - Never recreate `.venv` as a plain directory.
+  - If imports break mysteriously, look for `* 2*` files.
+
 - Port 5432 belongs to another project's Postgres. This project uses **5433**.
 - Port 8000 may be taken by a local uvicorn. Use `API_PORT=8001 docker compose up -d`.
 - The VS Code GitHub Actions extension shows false "unable to resolve action" errors.

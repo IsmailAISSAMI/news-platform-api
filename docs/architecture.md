@@ -139,8 +139,15 @@ RSS depth pass** (milestone 4).
 
 ### 4.4 Polite and safe fetching
 
-- **Identity and robots:** a User-Agent with the repo URL as contact. robots.txt is
-  cached for 24 h. Per-host `Crawl-delay` is respected (Hespress: 5 s).
+- **Identity and robots:** a User-Agent with the repo URL as contact.
+  - robots.txt is fetched once per host per run.
+  - It is parsed by our own RFC 9309 parser (`app/ingestion/robots.py`).
+    `urllib.robotparser` doesn't handle `*`/`$` wildcards (so it would miss
+    `/*?print`) and it drops rules outside a group.
+  - If robots.txt returns 4xx, there are no restrictions; if it returns 5xx or is
+    unreachable, nothing on that host is fetched (RFC 9309 §2.3.1).
+  - Requests to a host are spaced by max(`HTTP_MIN_DELAY_S`, `Crawl-delay`)
+    (Hespress: 5 s).
 - **Limits:** timeouts of 5 s to connect and 20 s total; responses capped at 5 MB.
 - **Retries:** for 429, 5xx and network errors only, with exponential backoff and jitter
   (3 attempts). `Retry-After` is honored.
@@ -296,7 +303,7 @@ before it starts.**
 | 0 ✅ | Docs and config | `docs/architecture.md`, `CLAUDE.md`, `.env.example`, `.gitignore` | Docs match verified facts; `.env.example` works copied as-is | n/a (doc review) |
 | 1 ✅ | Schema, roles, seed | `app/models/*`, `alembic/versions/*`, `scripts/db_roles.sql` | Tables, constraints, indexes; Hespress source and feeds seeded | Constraints and dedup uniqueness; each role can't exceed its permissions |
 | 2 ✅ | Rights gate | `app/ingestion/policy.py`, `normalize.py` | `apply_policy` is the only path from a fetched item to a storable record; fail-safe license downgrades | Every policy; expired or missing license; record type and `articles` table cannot hold a body (the bodies-audit query moves to when `article_bodies` exists) |
-| 3 | Polite fetcher | `app/ingestion/fetch.py`, `robots.py` | Conditional GET, robots, delay, limits, retries | `httpx.MockTransport`: 304, 429 with Retry-After, 5xx backoff, timeout, size cap, disallowed path |
+| 3 ✅ | Polite fetcher | `app/ingestion/fetch.py`, `robots.py` | Conditional GET, robots, delay, limits, retries | `httpx.MockTransport`: 304, 429 with Retry-After, 5xx backoff, timeout, size cap, disallowed path |
 | 4 | Hespress adapter and RSS walk | `app/ingestion/sources/hespress.py`, `walk.py` | Parse, normalize to UTC, guid → ID, checkpoint walk | Malformed XML, repeated runs (idempotent), interrupted run resumes to checkpoint, deleted checkpoint, duplicates across feed and sitemap; **measure real RSS depth with a few probes** |
 | 5 | `news ingest` command | `app/ingestion/cli.py`, `pyproject.toml` script | Readiness, lock, run report, migration-head check | DB down → clean failure; concurrent run refused; `ingestion_runs` recorded |
 | 6 | Archive backlog | `app/ingestion/backlog.py`, `page_metadata.py` | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |

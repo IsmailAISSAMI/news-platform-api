@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     # silently connecting with development credentials.
     database_url: SecretStr
 
+    # Outbound HTTP (ingestion). The User-Agent identifies us and gives publishers a contact.
+    user_agent: str = (
+        f"news-platform-api/{_package_version()} "
+        "(+https://github.com/IsmailAISSAMI/news-platform-api)"
+    )
+    http_connect_timeout_s: float = 5.0
+    http_total_timeout_s: float = 20.0
+    http_max_response_bytes: int = 5 * 1024 * 1024
+    # Minimum gap between requests to one host; a robots.txt Crawl-delay can only raise it.
+    http_min_delay_s: float = 1.0
+    http_max_attempts: int = 3
+
     @field_validator("database_url")
     @classmethod
     def _require_async_capable_driver(cls, value: SecretStr) -> SecretStr:
