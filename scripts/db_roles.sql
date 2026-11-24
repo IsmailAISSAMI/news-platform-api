@@ -38,6 +38,7 @@ REVOKE ALL ON alembic_version FROM news_ingest, news_api;
 -- role cannot read it at all. (Default privileges below would otherwise grant SELECT on
 -- every new table, so this explicit REVOKE must stay after the grants.)
 REVOKE ALL ON article_bodies FROM news_api;
+REVOKE ALL ON article_analyses FROM news_api;  -- evidence quotes are article text
 
 -- Tables created by future migrations get the same privileges automatically.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO news_api;

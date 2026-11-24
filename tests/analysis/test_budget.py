@@ -29,10 +29,13 @@ def budget(path: Path, clock: Clock, per_run: int = 3) -> RequestBudget:
 NOON_UTC = datetime(2026, 11, 24, 12, tzinfo=UTC)
 
 
-def test_a_run_never_sends_more_than_its_limit(tmp_path: Path) -> None:
-    b = budget(tmp_path / "usage.json", Clock(NOON_UTC))
-    for _ in range(3):
+def test_a_run_gets_at_most_its_limit_of_answers(tmp_path: Path) -> None:
+    b = budget(tmp_path / "usage.json", Clock(NOON_UTC), per_run=2)
+    b.reserve(10)
+    b.record_result(ok=False, input_tokens=None, output_tokens=None, busy=True)  # 503
+    for _ in range(2):
         b.reserve(10)
+        b.record_result(ok=True, input_tokens=10, output_tokens=10)
 
     with pytest.raises(BudgetExceededError, match="per-run"):
         b.reserve(10)
@@ -100,12 +103,12 @@ def test_settings_can_lower_the_limits_but_never_raise_them(tmp_path: Path) -> N
             per_minute=10,
             input_tokens_per_minute=8000,
         )
-    with pytest.raises(ValueError, match="per_minute=11"):
+    with pytest.raises(ValueError, match="per_minute=21"):
         RequestBudget(
             usage_file=tmp_path / "u.json",
             per_run=3,
             per_day=10,
-            per_minute=11,
+            per_minute=21,
             input_tokens_per_minute=8000,
         )
 

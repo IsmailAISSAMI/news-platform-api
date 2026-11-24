@@ -11,7 +11,7 @@ decoding, and the same model validates the response. Design rules (docs/analysis
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 SCHEMA_VERSION = "7"
 
@@ -104,6 +104,13 @@ class When(_Strict):
         max_length=12,
         description="Every dated event the article mentions, including background, oldest first.",
     )
+
+    @field_validator("event_date", mode="before")
+    @classmethod
+    def _null_means_no_date(cls, value: object) -> object:
+        # Gemma sometimes writes `"event_date": null` for "no date" (seen 2026-11-24).
+        # It means exactly {"value": null, "evidence": null}: accepted, nothing is lost.
+        return {"value": None, "evidence": None} if value is None else value
 
 
 class Place(_Strict):

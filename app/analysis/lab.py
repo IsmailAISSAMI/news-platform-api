@@ -19,7 +19,6 @@ from app.analysis.evidence import EvidenceReport, EvidenceStatus, semantic_issue
 from app.analysis.llm import (
     GeminiClient,
     LLMOutputError,
-    LLMOverloadedError,
     LLMRequestTooLargeError,
     LLMUnavailableError,
 )
@@ -69,7 +68,10 @@ async def run_lab(
             continue
         article, body, source = row
         prepared = prepare(article.title, article.published_at.date(), source.name, body.body_text)
-        logger.info("Analysing #%d (%d paragraphs)", article_id, len(prepared.paragraphs))
+        logger.info(
+            "[%d/%d] Sending #%d (%d paragraphs) to %s",
+            len(results) + 1, len(article_ids), article_id, len(prepared.paragraphs), llm.model,
+        )  # fmt: skip
 
         result = LabResult(article_id, article.title, ok=False)
         record: dict[str, Any] = {
@@ -84,8 +86,8 @@ async def run_lab(
             completion = await llm.structured(
                 ArticleAnalysis, system=SYSTEM_PROMPT, user=prepared.render()
             )
-        except (LLMRequestTooLargeError, LLMOverloadedError) as exc:
-            # This article is skipped (too long, or Google stayed busy); the run goes on.
+        except LLMRequestTooLargeError as exc:
+            # This article is skipped (too long for the free tier); the run goes on.
             result.error = str(exc)
             record["error"] = str(exc)
         except LLMUnavailableError as exc:
@@ -132,6 +134,12 @@ async def run_lab(
                 "review_flags": [asdict(f) for f in cleanup.flags],
                 "upcoming": upcoming(cleaned, article.published_at.date()),
             }
+        outcome = (
+            f"✓ #{article_id} analysed in {result.duration_s:.0f}s"
+            if result.ok
+            else f"✗ #{article_id}: {result.error}"
+        )
+        logger.info("%s · %s", outcome, await llm.usage_line())
         _write_private(
             out / f"article-{article_id}.json",
             json.dumps(record, indent=2, ensure_ascii=False, default=str),

@@ -48,12 +48,14 @@ class Settings(BaseSettings):
     gemini_api_key: SecretStr | None = None
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
     gemini_model: str = "gemma-4-31b-it"
-    # Our limits, far below Google's free tier. These can only be LOWERED: the code
-    # refuses values above the ceilings in app/analysis/budget.py.
+    # Our limits keep 1/3 of every Google limit unused. They can only be LOWERED:
+    # the code refuses values above the ceilings in app/analysis/budget.py.
     gemini_max_requests_per_run: int = 3
     gemini_max_requests_per_day: int = 1000
-    gemini_max_requests_per_minute: int = 10
-    gemini_max_input_tokens_per_minute: int = 8000
+    gemini_max_requests_per_minute: int = 20
+    gemini_max_input_tokens_per_minute: int = 10_000
+    # Articles in flight at once in `news analyze` (each answer takes about 3 minutes).
+    gemini_concurrency: int = 8
     gemini_usage_file: Path = Path.home() / "news-eval" / "gemini-usage.json"
 
     # Backups (`news backup` / `news restore-test`). Outside the repo and outside iCloud.

@@ -1,4 +1,4 @@
-"""The lab never breaks on Google's errors: it skips, stops cleanly and always reports.
+"""The lab never breaks on Google's errors: it waits, stops cleanly and always reports.
 
 Synthetic articles and a simulated Gemini API; nothing is sent anywhere.
 """
@@ -80,7 +80,7 @@ def client(tmp_path: Path, chat: Callable[[httpx.Request], httpx.Response]) -> G
     )
 
 
-async def test_a_busy_article_is_skipped_and_the_run_continues(
+async def test_busy_errors_are_waited_out_and_every_article_is_analysed(
     db_session: AsyncSession, source: Source, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(lab, "LAB_ROOT", tmp_path / "lab")
@@ -89,14 +89,14 @@ async def test_a_busy_article_is_skipped_and_the_run_continues(
 
     def chat(_: httpx.Request) -> httpx.Response:
         calls["n"] += 1
-        if calls["n"] <= 4:  # the first article: busy through all 4 attempts
+        if calls["n"] <= 4:  # Google busy for the first 4 attempts
             return BUSY
         return httpx.Response(200, json={"choices": [{"message": {"content": VALID}}]})
 
     out, results = await lab.run_lab(db_session, client(tmp_path, chat), [first, second])
 
-    assert [r.ok for r in results] == [False, True]
-    assert "still overloaded" in (results[0].error or "")
+    assert [r.ok for r in results] == [True, True]
+    assert calls["n"] == 6
     assert (out / "summary.md").exists()
 
 

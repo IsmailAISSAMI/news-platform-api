@@ -12,6 +12,7 @@ Exit codes: 0 ok · 1 failed (feeds, backup or restore check) · 2 environment n
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import time
 from collections.abc import Sequence
@@ -26,6 +27,13 @@ from app.analysis.compare import render as render_comparison
 from app.analysis.compare import score_run
 from app.analysis.lab import run_lab
 from app.analysis.llm import GeminiClient, LLMUnavailableError
+from app.analysis.pipeline import (
+    MAX_ATTEMPTS,
+    AlreadyAnalyzingError,
+    AnalyzeOptions,
+    AnalyzeReport,
+    run_analyze,
+)
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_cli_logging
 from app.db.session import create_engine, create_session_factory
@@ -96,6 +104,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lab.add_argument("ids", nargs="+", type=_positive_int, help="Article ids.")
     lab.add_argument("--label", default="", help="Suffix for the output folder name.")
+    analyze = commands.add_parser(
+        "analyze",
+        parents=[common],
+        help="Analyse stored articles with Gemma 4 31B (parallel, resumable, within limits).",
+    )
+    analyze.add_argument(
+        "--limit", type=_positive_int, default=None, metavar="N", help="At most N articles."
+    )
+    analyze.add_argument(
+        "--concurrency",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help="Articles in flight at once (default: GEMINI_CONCURRENCY).",
+    )
+    analyze.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=f"Also retry articles whose answers were unusable {MAX_ATTEMPTS} times.",
+    )
     commands.add_parser(
         "gemini-usage",
         parents=[common],
@@ -132,7 +160,14 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0911  # one retu
     try:
         if args.command == "gemini-usage":
             return gemini_usage()
+        if args.command == "analyze":
+            logging.getLogger("app.analysis").setLevel(logging.INFO)  # live progress
+            return asyncio.run(
+                analyze(args.limit, args.concurrency, retry_failed=args.retry_failed)
+            )
         if args.command == "lab":
+            # Always show live progress: attempts, waits, and passed/failed counts.
+            logging.getLogger("app.analysis").setLevel(logging.INFO)
             return asyncio.run(lab(args.ids, args.label))
         if args.command == "lab-compare":
             return asyncio.run(lab_compare(args.runs))
@@ -225,17 +260,20 @@ def format_usage(budget: RequestBudget) -> str:
     lines = [
         f"Gemini API usage (quota days, Pacific time; log: {budget.usage_file})",
         "",
-        f"{'day':<12}{'requests':>10}{'failed':>8}{'tokens in':>12}{'tokens out':>12}",
+        f"{'day':<12}{'sent':>6}{'passed':>8}{'failed':>8}{'busy':>6}"
+        f"{'tokens in':>12}{'tokens out':>12}",
     ]
     lines += [
-        f"{d.day:<12}{d.requests:>10}{d.failed:>8}{d.input_tokens:>12}{d.output_tokens:>12}"
+        f"{d.day:<12}{d.requests:>6}{d.requests - d.failed:>8}{d.failed:>8}{d.busy:>6}"
+        f"{d.input_tokens:>12}{d.output_tokens:>12}"
         for d in budget.history(7)
     ]
     used = budget.used_today()
     lines += [
         "",
         f"Today: {used}/{budget.per_day} requests ({budget.per_day - used} left).",
-        f"Our limits:  {budget.per_run}/run, {budget.per_day}/day, {budget.per_minute}/min, "
+        f"Our limits:  {budget.per_run} answered/run, {budget.per_day}/day, "
+        f"{budget.per_minute}/min, "
         f"{budget.input_tokens_per_minute} input tokens/min (hard ceilings: "
         f"{CEILINGS['per_day']}/day, {CEILINGS['per_minute']}/min, "
         f"{CEILINGS['input_tokens_per_minute']} tokens/min).",
@@ -247,10 +285,68 @@ def format_usage(budget: RequestBudget) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _budget(settings: Settings) -> RequestBudget:
+async def analyze(limit: int | None, concurrency: int | None, *, retry_failed: bool) -> int:
+    settings = get_settings()
+    if settings.gemini_api_key is None:
+        _err("Not ready: GEMINI_API_KEY is not set in .env")
+        return EXIT_NOT_READY
+    engine = create_engine(settings)
+    try:
+        await wait_for_database(engine)
+        async with engine.connect() as connection:
+            await ensure_migrated(connection, alembic_head(Path.cwd() / "alembic.ini"))
+        # A bulk run: the per-run cap is the daily cap (tests keep their 3 via `news lab`).
+        budget = _budget(settings, per_run=settings.gemini_max_requests_per_day)
+        async with httpx.AsyncClient() as client:
+            llm = GeminiClient(
+                client,
+                base_url=settings.gemini_base_url,
+                model=settings.gemini_model,
+                api_key=settings.gemini_api_key,
+                budget=budget,
+            )
+            options = AnalyzeOptions(
+                concurrency=concurrency or settings.gemini_concurrency,
+                limit=limit,
+                retry_failed=retry_failed,
+            )
+            report = await run_analyze(create_session_factory(engine), llm, options)
+    except NotReadyError as exc:
+        _err(f"Not ready: {exc}")
+        return EXIT_NOT_READY
+    except AlreadyAnalyzingError as exc:
+        _err(f"Not started: {exc}.")
+        return EXIT_ALREADY_RUNNING
+    finally:
+        await engine.dispose()
+    sys.stdout.write(format_analyze_report(report, budget))
+    return EXIT_OK if report.stop_reason is None else EXIT_FEED_FAILURES
+
+
+def format_analyze_report(report: AnalyzeReport, budget: RequestBudget) -> str:
+    hours, rest = divmod(int(report.elapsed_s), 3600)
+    average = (
+        f"{sum(report.durations) / len(report.durations):.0f}s per answer"
+        if report.durations
+        else "no answers"
+    )
+    lines = [
+        f"Analysis run: {report.queued} queued, {hours}h{rest // 60:02d}m, {average}.",
+        f"  succeeded {report.succeeded}, failed {report.failed}, "
+        f"retried {report.retried}, skipped (too long) {report.skipped}, "
+        f"not sent {report.not_sent}",
+        f"  still pending: {report.pending_after} (the next run continues from there)",
+    ]
+    if report.stop_reason:
+        lines.append(f"  stopped: {report.stop_reason}")
+    lines.append(f"  Gemini {format_usage(budget).splitlines()[-4]}")
+    return "\n".join(lines) + "\n"
+
+
+def _budget(settings: Settings, *, per_run: int | None = None) -> RequestBudget:
     return RequestBudget(
         usage_file=settings.gemini_usage_file,
-        per_run=settings.gemini_max_requests_per_run,
+        per_run=per_run or settings.gemini_max_requests_per_run,
         per_day=settings.gemini_max_requests_per_day,
         per_minute=settings.gemini_max_requests_per_minute,
         input_tokens_per_minute=settings.gemini_max_input_tokens_per_minute,

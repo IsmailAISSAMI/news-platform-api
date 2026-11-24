@@ -281,21 +281,32 @@ before any public or commercial use. *This document is not legal advice.*
   - only `https://generativelanguage.googleapis.com` and only models on the free
     allowlist (`gemma-4-31b-it`). The request body is fixed in code: no tools,
     grounding, caching or other options;
-  - our limits, far below Google's (30/min, 16K input tokens/min, 14.4K/day): 3
-    requests per run, **1,000 per day (7%)**, **10 per minute (a third)**, **8,000
-    estimated input tokens per minute (half)**. Settings can lower them; values above
-    these ceilings are refused;
+  - our limits always leave **at least one third of every Google limit unused**
+    (owner rule): **20 requests/min** (Google 30), **10,000 input tokens/min** (Google
+    16,000), and **1,000 requests/day** (Google 14,400; the owner's own, stricter rule).
+    `news lab` stops at 3 answered requests per test. Settings can lower these limits;
+    values above the ceilings are refused;
+  - parallel and resumable (`news analyze`, `app/analysis/pipeline.py`): several
+    articles in flight (`GEMINI_CONCURRENCY`, default 8), admitted one at a time under
+    one lock, so parallelism never passes a limit. A "busy" answer pauses all workers
+    together. Each result is committed at once in `article_analyses` (private: the
+    `news_api` role cannot read it), so a stop loses only the requests in flight, and
+    the next run resumes. Unusable answers (cut off, invalid) are retried up to 3 times
+    per article, each attempt stored with its raw answer;
   - each request is counted **before** it is sent, so a failure still counts; the day
     follows Google's reset (midnight Pacific time);
   - a usage log outside the repo (`~/news-eval/gemini-usage.json`, mode 600, 90 days)
     keeps requests, failures and the real tokens used, per day. `news gemini-usage`
     shows it against our limits and Google's;
-  - "high demand" errors (HTTP 503, also 500/502/504 and timeouts) are **expected** on
-    the free tier and never break a run: the request is retried after 1, 2 and 4
-    minutes, each attempt counted in the budget. If Google stays busy, that article is
-    skipped and the run goes on. HTTP 429 (quota), any other error, or one of our limits
-    stops sending, with no retry, and the run still writes its report. An article too
-    long for the token limit (about 0.5% of articles) is skipped without being sent;
+  - "high demand" errors (HTTP 503, also 500/502/504, timeouts, no network) are
+    **expected** on the free tier and never break a run (owner decision): the same
+    request, same model, is tried again after 10, 20, 30, then every 60 seconds until
+    Google answers. Every attempt is counted toward the daily limit, which stays the
+    absolute stop; busy refusals do not use the per-run limit (3 **answered** requests
+    per test), since Google does not count them either. Each attempt is shown live in
+    the terminal with today's passed/failed/busy counts. HTTP 429 (quota) or any other
+    error stops sending, and the run still writes its report. An article too long for
+    the token limit (about 0.5% of articles) is skipped without being sent;
   - the key lives only in `.env`. Nothing else in 5.4 changes: article text is never
     served, exported, published or committed.
 

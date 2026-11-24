@@ -4,11 +4,14 @@ Goal: stay FAR below Google's free-tier limits, so the project never depends on 
 close to them. Google's limits for Gemma 4 31B on the owner's project (2026-11-24):
 30 requests/minute, 16K input tokens/minute, 14.4K requests/day.
 
-Our ceilings (settings may LOWER them, never raise them; see `CEILINGS`):
-- 3 requests per run (a test never sends more);
-- 1,000 requests per day (7% of Google's daily limit);
-- 10 requests per minute (a third of Google's);
-- 8,000 estimated input tokens per minute (half of Google's).
+Our ceilings keep at least ONE THIRD of every Google limit unused, as a safety margin
+(owner rule, 2026-11-24). Settings may LOWER them, never raise them; see `CEILINGS`:
+- 3 ANSWERED requests per run (a test analyses at most 3 articles). Attempts that Google
+  refused as busy (503) do not use this limit: Google does not count them either. They
+  still count toward the daily limit, which stays the absolute stop;
+- 1,000 requests per day (7% of Google's daily limit; owner rule, stricter than 2/3);
+- 20 requests per minute (2/3 of Google's 30);
+- 10,000 input tokens per minute (under 2/3 of Google's 16,000).
 
 Counting rules:
 - a request is counted BEFORE it is sent, so a failed or timed-out request still uses a
@@ -41,7 +44,7 @@ KEEP_DAYS = 90
 # Google's free-tier limits for Gemma 4 31B, read on the owner's AI Studio page.
 GOOGLE_LIMITS = {"per_day": 14_400, "per_minute": 30, "input_tokens_per_minute": 16_000}
 # Our hard ceilings, far below Google's. Code refuses any setting above them.
-CEILINGS = {"per_run": 1000, "per_day": 1000, "per_minute": 10, "input_tokens_per_minute": 8000}
+CEILINGS = {"per_run": 1000, "per_day": 1000, "per_minute": 20, "input_tokens_per_minute": 10_000}
 
 
 class BudgetExceededError(Exception):
@@ -53,8 +56,13 @@ class RequestTooLargeError(BudgetExceededError):
 
 
 def estimate_tokens(text: str) -> int:
-    """Conservative estimate (about 3 characters per token; real English is nearer 4)."""
-    return len(text) // 3 + 1
+    """Estimate made before sending, a little above the real count.
+
+    Measured on Gemma 4 31B (2026-11-24): about 4.4 characters per input token, so
+    dividing by 4 over-estimates by about 10%. After each answer the per-minute window
+    is corrected to Google's real count (`record_result`), so pacing stays exact.
+    """
+    return len(text) // 4 + 1
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,7 @@ class DayUsage:
     day: str
     requests: int = 0
     failed: int = 0
+    busy: int = 0  # refused by Google as overloaded (part of failed)
     input_tokens: int = 0
     output_tokens: int = 0
 
@@ -75,7 +84,7 @@ class RequestBudget:
     input_tokens_per_minute: int
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
     monotonic: Callable[[], float] = time.monotonic
-    used_this_run: int = 0
+    used_this_run: int = 0  # requests Google answered (busy refusals excluded)
     _window: deque[tuple[float, int]] = field(default_factory=deque, init=False)
 
     def __post_init__(self) -> None:
@@ -135,7 +144,7 @@ class RequestBudget:
             )
             raise RequestTooLargeError(msg)
         if self.used_this_run >= self.per_run:
-            msg = f"per-run limit reached ({self.per_run} requests)"
+            msg = f"per-run limit reached ({self.per_run} answered requests)"
             raise BudgetExceededError(msg)
         with self._locked() as (_, day):
             if day["requests"] >= self.per_day:
@@ -145,15 +154,25 @@ class RequestBudget:
                 )
                 raise BudgetExceededError(msg)
             day["requests"] += 1
-        self.used_this_run += 1
         self._window.append((self.monotonic(), tokens))
 
     def record_result(
-        self, *, ok: bool, input_tokens: int | None, output_tokens: int | None
+        self,
+        *,
+        ok: bool,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        busy: bool = False,
     ) -> None:
-        """Add what the request really used (blocking: async callers use a thread)."""
+        """Add how the request ended (blocking: async callers use a thread).
+
+        `busy`: Google refused it as overloaded; it does not use the per-run limit.
+        """
+        if not busy:
+            self.used_this_run += 1
         with self._locked() as (_, day):
             day["failed"] += 0 if ok else 1
+            day["busy"] += 1 if busy else 0
             day["input_tokens"] += input_tokens or 0
             day["output_tokens"] += output_tokens or 0
         if input_tokens and self._window:
@@ -177,7 +196,7 @@ class RequestBudget:
             data = _parse(handle.read())
             key = self.quota_day().isoformat()
             day = data["days"].setdefault(key, {})
-            for counter in ("requests", "failed", "input_tokens", "output_tokens"):
+            for counter in ("requests", "failed", "busy", "input_tokens", "output_tokens"):
                 day.setdefault(counter, 0)
             yield data, day
             _write(handle, data, keep_from=(self.quota_day() - timedelta(days=KEEP_DAYS)))

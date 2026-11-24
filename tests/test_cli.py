@@ -292,3 +292,29 @@ def test_gemini_usage_shows_our_limits_and_googles(tmp_path: Path) -> None:
     assert "4300" in text
     assert "Google's free tier: 14400/day, 30/min, 16000 input tokens/min." in text
     assert "NO billing account" in text
+
+
+def test_format_analyze_report(tmp_path: Path) -> None:
+    from app.analysis.budget import RequestBudget  # noqa: PLC0415  # local to this test
+    from app.analysis.pipeline import AnalyzeReport  # noqa: PLC0415
+
+    budget = RequestBudget(
+        usage_file=tmp_path / "usage.json",
+        per_run=1000,
+        per_day=1000,
+        per_minute=20,
+        input_tokens_per_minute=10_000,
+    )
+    report = AnalyzeReport(
+        queued=10, succeeded=6, failed=1, retried=2, skipped=1, not_sent=2,
+        stop_reason="daily limit reached", elapsed_s=3720, pending_after=3,
+        durations=[100.0, 200.0],
+    )  # fmt: skip
+
+    text = cli.format_analyze_report(report, budget)
+
+    assert "10 queued, 1h02m, 150s per answer" in text
+    assert "succeeded 6, failed 1, retried 2, skipped (too long) 1, not sent 2" in text
+    assert "still pending: 3" in text
+    assert "stopped: daily limit reached" in text
+    assert "Today: 0/1000 requests" in text
