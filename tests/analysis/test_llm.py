@@ -14,6 +14,7 @@ from app.analysis.evidence import EvidenceStatus, verify
 from app.analysis.llm import (
     GeminiClient,
     LLMOutputError,
+    LLMOverloadedError,
     LLMRequestTooLargeError,
     LLMUnavailableError,
 )
@@ -49,14 +50,22 @@ def budget(tmp_path: Path, per_run: int = 3) -> RequestBudget:
 
 
 def gemini(
-    tmp_path: Path, chat: Callable[[httpx.Request], httpx.Response], per_run: int = 3
+    tmp_path: Path,
+    chat: Callable[[httpx.Request], httpx.Response],
+    per_run: int = 3,
+    slept: list[float] | None = None,
 ) -> GeminiClient:
+    async def no_sleep(seconds: float) -> None:
+        if slept is not None:
+            slept.append(seconds)
+
     return GeminiClient(
         httpx.AsyncClient(transport=httpx.MockTransport(chat)),
         base_url=GEMINI,
         model=MODEL,
         api_key=SecretStr("test-key"),
         budget=budget(tmp_path, per_run),
+        sleep=no_sleep,
     )
 
 
@@ -134,7 +143,7 @@ async def test_the_budget_stops_requests_before_they_are_sent(tmp_path: Path) ->
     assert len(sent) == 2
 
 
-@pytest.mark.parametrize(("status", "error"), [(429, "quota reached"), (500, "HTTP 500")])
+@pytest.mark.parametrize(("status", "error"), [(429, "quota reached"), (400, "HTTP 400")])
 async def test_errors_stop_without_retrying_and_are_counted(
     tmp_path: Path, status: int, error: str
 ) -> None:
@@ -248,3 +257,55 @@ async def test_an_article_too_long_for_the_free_tier_is_skipped_unsent(tmp_path:
     with pytest.raises(LLMRequestTooLargeError, match="too large"):
         await llm.structured(Tiny, system="s", user="x" * 30_000)
     assert llm.budget.used_today() == 0
+
+
+BUSY = {"error": {"code": 503, "message": "This model is currently experiencing high demand."}}
+
+
+async def test_high_demand_is_waited_out_and_retried(tmp_path: Path) -> None:
+    answers = [httpx.Response(503, json=BUSY), httpx.Response(503, json=BUSY)]
+    slept: list[float] = []
+
+    def chat(_: httpx.Request) -> httpx.Response:
+        return answers.pop(0) if answers else reply('{"answer": "ok"}')
+
+    llm = gemini(tmp_path, chat, slept=slept)
+    completion = await llm.structured(Tiny, system="s", user="u")
+
+    assert completion.parsed == Tiny(answer="ok")
+    assert slept == [60.0, 120.0]  # growing pauses
+    [today] = llm.budget.history(1)
+    assert (today.requests, today.failed) == (3, 2)  # every attempt is counted
+
+
+@pytest.mark.parametrize("busy", [503, 500, 502, 504, "timeout"])
+async def test_an_article_is_skipped_when_google_stays_busy(
+    tmp_path: Path, busy: int | str
+) -> None:
+    slept: list[float] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        if busy == "timeout":
+            raise httpx.ReadTimeout("slow", request=request)
+        return httpx.Response(int(busy), json=BUSY)
+
+    llm = gemini(tmp_path, chat, per_run=10, slept=slept)
+    with pytest.raises(LLMOverloadedError, match="4 attempts"):
+        await llm.structured(Tiny, system="s", user="u")
+    assert slept == [60.0, 120.0, 240.0]
+    assert llm.budget.used_today() == 4
+
+
+async def test_retries_never_pass_the_budget(tmp_path: Path) -> None:
+    sent: list[httpx.Request] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(503, json=BUSY)
+
+    slept: list[float] = []
+    llm = gemini(tmp_path, chat, per_run=2, slept=slept)
+    with pytest.raises(LLMUnavailableError, match="per-run limit is used up"):
+        await llm.structured(Tiny, system="s", user="u")
+    assert len(sent) == 2
+    assert slept == [60.0]  # no pointless wait after the last allowed attempt

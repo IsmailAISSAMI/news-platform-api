@@ -11,12 +11,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Row, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analysis.cleanup import clean, upcoming
 from app.analysis.evidence import EvidenceReport, EvidenceStatus, semantic_issues, verify
-from app.analysis.llm import GeminiClient, LLMOutputError, LLMRequestTooLargeError
+from app.analysis.llm import (
+    GeminiClient,
+    LLMOutputError,
+    LLMOverloadedError,
+    LLMRequestTooLargeError,
+    LLMUnavailableError,
+)
 from app.analysis.prompt import PROMPT_VERSION, SYSTEM_PROMPT, prepare
 from app.analysis.schema import SCHEMA_VERSION, ArticleAnalysis
 from app.models import Article, ArticleBody, Source
@@ -51,16 +57,13 @@ async def run_lab(
     out = LAB_ROOT / f"{stamp}-{llm.model.replace('/', '_')}{('-' + label) if label else ''}"
     out.mkdir(parents=True, exist_ok=True, mode=0o700)
     results: list[LabResult] = []
+    stopped: str | None = None  # set when a limit or a hard error ends the run
 
     for article_id in article_ids:
-        row = (
-            await session.execute(
-                select(Article, ArticleBody, Source)
-                .join(ArticleBody, ArticleBody.article_id == Article.id)
-                .join(Source, Source.id == Article.source_id)
-                .where(Article.id == article_id)
-            )
-        ).first()
+        if stopped is not None:
+            results.append(LabResult(article_id, "?", ok=False, error=f"not sent: {stopped}"))
+            continue
+        row = await _load(session, article_id)
         if row is None:
             results.append(LabResult(article_id, "?", ok=False, error="no article with a body"))
             continue
@@ -81,9 +84,15 @@ async def run_lab(
             completion = await llm.structured(
                 ArticleAnalysis, system=SYSTEM_PROMPT, user=prepared.render()
             )
-        except LLMRequestTooLargeError as exc:  # skipped, not sent: the run goes on
+        except (LLMRequestTooLargeError, LLMOverloadedError) as exc:
+            # This article is skipped (too long, or Google stayed busy); the run goes on.
             result.error = str(exc)
             record["error"] = str(exc)
+        except LLMUnavailableError as exc:
+            # A limit, Google's quota or a hard error: stop sending, but finish the report.
+            stopped = str(exc)
+            result.error = stopped
+            record["error"] = stopped
         except LLMOutputError as exc:
             result.error = str(exc)
             record["error"] = str(exc)
@@ -123,15 +132,31 @@ async def run_lab(
                 "review_flags": [asdict(f) for f in cleanup.flags],
                 "upcoming": upcoming(cleaned, article.published_at.date()),
             }
-        path = out / f"article-{article_id}.json"
-        path.write_text(json.dumps(record, indent=2, ensure_ascii=False, default=str))
-        path.chmod(0o600)
+        _write_private(
+            out / f"article-{article_id}.json",
+            json.dumps(record, indent=2, ensure_ascii=False, default=str),
+        )
         results.append(result)
 
-    summary = out / "summary.md"
-    summary.write_text(render_summary(llm.model, results))
-    summary.chmod(0o600)
+    _write_private(out / "summary.md", render_summary(llm.model, results))
     return out, results
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Lab files contain article quotes: readable by the owner only."""
+    path.write_text(text)
+    path.chmod(0o600)
+
+
+async def _load(session: AsyncSession, article_id: int) -> Row[Article, ArticleBody, Source] | None:
+    return (
+        await session.execute(
+            select(Article, ArticleBody, Source)
+            .join(ArticleBody, ArticleBody.article_id == Article.id)
+            .join(Source, Source.id == Article.source_id)
+            .where(Article.id == article_id)
+        )
+    ).first()
 
 
 def render_summary(model: str, results: list[LabResult]) -> str:

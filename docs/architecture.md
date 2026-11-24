@@ -290,8 +290,12 @@ before any public or commercial use. *This document is not legal advice.*
   - a usage log outside the repo (`~/news-eval/gemini-usage.json`, mode 600, 90 days)
     keeps requests, failures and the real tokens used, per day. `news gemini-usage`
     shows it against our limits and Google's;
-  - HTTP 429 or any error stops the run, with no retry. An article too long for the
-    token limit (about 0.5% of articles) is skipped without being sent;
+  - "high demand" errors (HTTP 503, also 500/502/504 and timeouts) are **expected** on
+    the free tier and never break a run: the request is retried after 1, 2 and 4
+    minutes, each attempt counted in the budget. If Google stays busy, that article is
+    skipped and the run goes on. HTTP 429 (quota), any other error, or one of our limits
+    stops sending, with no retry, and the run still writes its report. An article too
+    long for the token limit (about 0.5% of articles) is skipped without being sent;
   - the key lives only in `.env`. Nothing else in 5.4 changes: article text is never
     served, exported, published or committed.
 

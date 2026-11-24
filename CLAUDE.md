@@ -77,7 +77,8 @@ of them requires an explicit decision by the owner, recorded in the architecture
     LM Studio is retired. Billing stays off on the Google project.
   - Every request goes through `RequestBudget` (3 per run, 1,000 per day, 10 per minute,
     8,000 input tokens per minute; settings can only lower them). Never raise the
-    ceilings, widen the model allowlist, add retries after an error, add billable
+    ceilings, widen the model allowlist, retry anything but Google's temporary
+    overloads (503/500/502/504, already handled with budgeted pauses), add billable
     request options, or call the real API from tests, without the owner's explicit
     decision. Check use with `uv run news gemini-usage`.
   - AI outputs meant for publication must be original work: no reproduced or

@@ -6,13 +6,18 @@ Article text is sent to Google. Safeguards, all enforced here:
   it is sent;
 - no tools, grounding, caching or other options that can be billed: the payload is
   built here and nothing can be added to it;
-- HTTP 429 (quota) stops the run, with no retry.
+- HTTP 429 (quota) stops the run, with no retry;
+- "high demand" errors (503, and 500/502/504) are EXPECTED on the free tier: the
+  request is retried after growing pauses (1, 2, then 4 minutes by default). Every
+  attempt goes through the budget, so retries never pass a limit.
 """
 
 import asyncio
 import json
+import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -27,13 +32,22 @@ from app.analysis.budget import (
     estimate_tokens,
 )
 
+logger = logging.getLogger(__name__)
+
 GEMINI_HOST = "generativelanguage.googleapis.com"
+# Google's "high demand" / temporary server errors: worth waiting for, never a bug of ours.
+TRANSIENT_STATUSES = frozenset({500, 502, 503, 504})
+RETRY_PAUSES_S = (60.0, 120.0, 240.0)
 # Models allowed to run: free-tier only, as listed on the owner's AI Studio page.
 FREE_MODELS = frozenset({"gemma-4-31b-it"})
 
 
 class LLMUnavailableError(Exception):
     """The request was refused (by our limits or by Google) or could not be made."""
+
+
+class LLMOverloadedError(Exception):
+    """Google stayed overloaded through every retry: skip this article, try it later."""
 
 
 class LLMRequestTooLargeError(Exception):
@@ -84,7 +98,7 @@ class GeminiClient:
     against the Pydantic schema: invalid output is rejected, never repaired.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913  # endpoint, model, key, budget, retry policy
         self,
         client: httpx.AsyncClient,
         *,
@@ -92,6 +106,8 @@ class GeminiClient:
         model: str,
         api_key: SecretStr,
         budget: RequestBudget,
+        retry_pauses_s: tuple[float, ...] = RETRY_PAUSES_S,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         parts = urlsplit(base_url)
         if parts.scheme != "https" or parts.hostname != GEMINI_HOST:
@@ -105,6 +121,8 @@ class GeminiClient:
         self._api_key = api_key
         self.budget = budget
         self.model = model
+        self._retry_pauses = retry_pauses_s
+        self._sleep = sleep
 
     async def structured[T: BaseModel](
         self,
@@ -125,29 +143,7 @@ class GeminiClient:
             "temperature": 0.1,
             "max_tokens": max_tokens,
         }
-        await self._take_budget(content)
-
-        started = time.monotonic()
-        try:
-            response = await self._client.post(
-                f"{self._base}/chat/completions",
-                json=payload,
-                headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
-                timeout=900,
-            )
-        except httpx.HTTPError as exc:
-            await self._record(ok=False)
-            msg = f"{self.model} request failed: {type(exc).__name__}"
-            raise LLMUnavailableError(msg) from exc
-        duration = time.monotonic() - started
-        if response.status_code != httpx.codes.OK:
-            await self._record(ok=False)
-            if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
-                msg = f"{self.model}: Google's quota reached (HTTP 429); stopping, no retry"
-            else:  # Google's error text never contains the key; it is cut short anyway
-                msg = f"{self.model} returned HTTP {response.status_code}: {response.text[:300]}"
-            raise LLMUnavailableError(msg)
-
+        response, duration = await self._send_with_retries(payload, content)
         body = response.json()
         raw = body["choices"][0]["message"].get("content") or ""
         usage = body.get("usage") or {}
@@ -172,6 +168,55 @@ class GeminiClient:
             completion_tokens=completion_tokens,
         )
 
+    async def _send_with_retries(
+        self, payload: dict[str, Any], content: str
+    ) -> tuple[httpx.Response, float]:
+        """Send, waiting out Google's temporary overloads; each attempt is budgeted."""
+        attempts = len(self._retry_pauses) + 1
+        for attempt in range(1, attempts + 1):
+            await self._take_budget(content)
+            started = time.monotonic()
+            try:
+                response = await self._client.post(
+                    f"{self._base}/chat/completions",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
+                    timeout=900,
+                )
+            except httpx.TimeoutException:
+                response = None  # treated like an overload: Google was too slow to answer
+            except httpx.HTTPError as exc:
+                await self._record(ok=False)
+                msg = f"{self.model} request failed: {type(exc).__name__}"
+                raise LLMUnavailableError(msg) from exc
+            duration = time.monotonic() - started
+            if response is not None and response.status_code == httpx.codes.OK:
+                return response, duration
+            await self._record(ok=False)
+            status = "timeout" if response is None else f"HTTP {response.status_code}"
+            if response is not None and response.status_code == httpx.codes.TOO_MANY_REQUESTS:
+                msg = f"{self.model}: Google's quota reached (HTTP 429); stopping, no retry"
+                raise LLMUnavailableError(msg)
+            if response is not None and response.status_code not in TRANSIENT_STATUSES:
+                # Google's error text never contains the key; it is cut short anyway.
+                msg = f"{self.model} returned {status}: {response.text[:300]}"
+                raise LLMUnavailableError(msg)
+            if attempt == attempts:
+                break
+            if self.budget.used_this_run >= self.budget.per_run:
+                msg = (
+                    f"{self.model} busy ({status}) and the per-run limit is used up "
+                    f"({self.budget.per_run} requests); not waiting for a retry"
+                )
+                raise LLMUnavailableError(msg)
+            pause = self._retry_pauses[attempt - 1]
+            logger.warning(
+                "Gemini busy (%s), attempt %d/%d; waiting %.0fs", status, attempt, attempts, pause
+            )
+            await self._sleep(pause)
+        msg = f"{self.model} still overloaded after {attempts} attempts; article skipped"
+        raise LLMOverloadedError(msg)
+
     async def _take_budget(self, text: str) -> None:
         """Wait for the per-minute limits, then count the request (or refuse it)."""
         tokens = estimate_tokens(text)
@@ -179,7 +224,7 @@ class GeminiClient:
             wait = self.budget.wait_seconds(tokens)
             if wait <= 0:
                 break
-            await asyncio.sleep(wait)
+            await self._sleep(wait)
         try:
             await asyncio.to_thread(self.budget.reserve, tokens)
         except RequestTooLargeError as exc:
