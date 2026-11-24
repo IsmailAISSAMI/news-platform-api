@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analysis.cleanup import clean, upcoming
 from app.analysis.evidence import EvidenceReport, EvidenceStatus, semantic_issues, verify
-from app.analysis.llm import ChatLLM, LLMOutputError
+from app.analysis.llm import GeminiClient, LLMOutputError, LLMRequestTooLargeError
 from app.analysis.prompt import PROMPT_VERSION, SYSTEM_PROMPT, prepare
 from app.analysis.schema import SCHEMA_VERSION, ArticleAnalysis
 from app.models import Article, ArticleBody, Source
@@ -42,10 +42,9 @@ class LabResult:
 
 async def run_lab(
     session: AsyncSession,
-    llm: ChatLLM,
+    llm: GeminiClient,
     article_ids: list[int],
     *,
-    extra_body: dict[str, Any] | None = None,
     label: str = "",
 ) -> tuple[Path, list[LabResult]]:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -77,13 +76,14 @@ async def run_lab(
             "model": llm.model,
             "prompt_version": PROMPT_VERSION,
             "schema_version": SCHEMA_VERSION,
-            "settings": extra_body or {},
         }
         try:
             completion = await llm.structured(
-                ArticleAnalysis, system=SYSTEM_PROMPT, user=prepared.render(),
-                extra_body=extra_body,
-            )  # fmt: skip
+                ArticleAnalysis, system=SYSTEM_PROMPT, user=prepared.render()
+            )
+        except LLMRequestTooLargeError as exc:  # skipped, not sent: the run goes on
+            result.error = str(exc)
+            record["error"] = str(exc)
         except LLMOutputError as exc:
             result.error = str(exc)
             record["error"] = str(exc)
@@ -113,7 +113,6 @@ async def run_lab(
             record |= {
                 "duration_s": round(completion.duration_s, 1),
                 "tokens": {"in": completion.prompt_tokens, "out": completion.completion_tokens},
-                "reasoning_chars": len(completion.reasoning or ""),
                 "evidence": {k: v.value for k, v in report.statuses.items()},
                 "issues": {k: v.value for k, v in issues.items()},
                 # The model's raw answer is kept unchanged; the cleaned version and every
@@ -130,16 +129,16 @@ async def run_lab(
         results.append(result)
 
     summary = out / "summary.md"
-    summary.write_text(render_summary(llm.model, extra_body, results))
+    summary.write_text(render_summary(llm.model, results))
     summary.chmod(0o600)
     return out, results
 
 
-def render_summary(model: str, settings: dict[str, Any] | None, results: list[LabResult]) -> str:
+def render_summary(model: str, results: list[LabResult]) -> str:
     ok = [r for r in results if r.ok]
     lines = [
         f"# Lab run: {model}",
-        f"prompt v{PROMPT_VERSION}, schema v{SCHEMA_VERSION}, settings {settings or {}}",
+        f"prompt v{PROMPT_VERSION}, schema v{SCHEMA_VERSION}",
         "",
         f"Valid output: {len(ok)}/{len(results)}",
     ]

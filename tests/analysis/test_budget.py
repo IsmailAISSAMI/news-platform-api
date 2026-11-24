@@ -89,3 +89,52 @@ def test_per_minute_limits_make_the_caller_wait(tmp_path: Path) -> None:
 
     clock.mono = 61
     assert b.wait_seconds(10) == 0  # the window has moved on
+
+
+def test_settings_can_lower_the_limits_but_never_raise_them(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="per_day=1001"):
+        RequestBudget(
+            usage_file=tmp_path / "u.json",
+            per_run=3,
+            per_day=1001,
+            per_minute=10,
+            input_tokens_per_minute=8000,
+        )
+    with pytest.raises(ValueError, match="per_minute=11"):
+        RequestBudget(
+            usage_file=tmp_path / "u.json",
+            per_run=3,
+            per_day=10,
+            per_minute=11,
+            input_tokens_per_minute=8000,
+        )
+
+
+def test_the_log_keeps_requests_failures_and_real_tokens_per_day(tmp_path: Path) -> None:
+    clock = Clock(NOON_UTC)
+    path = tmp_path / "usage.json"
+    b = budget(path, clock)
+    b.reserve(10)
+    b.record_result(ok=True, input_tokens=4300, output_tokens=2600)
+    b.reserve(10)
+    b.record_result(ok=False, input_tokens=None, output_tokens=None)
+
+    history = budget(path, clock).history(2)  # a later run reads the same log
+
+    assert [d.day for d in history] == ["2026-11-23", "2026-11-24"]
+    assert history[0].requests == 0
+    today = history[1]
+    assert (today.requests, today.failed, today.input_tokens, today.output_tokens) == (
+        2, 1, 4300, 2600,
+    )  # fmt: skip
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_the_first_log_format_is_still_read(tmp_path: Path) -> None:
+    path = tmp_path / "usage.json"
+    path.write_text('{"day": "2026-11-24", "count": 3}')
+    b = budget(path, Clock(NOON_UTC))
+
+    assert b.used_today() == 3
+    b.reserve(10)
+    assert b.used_today() == 4

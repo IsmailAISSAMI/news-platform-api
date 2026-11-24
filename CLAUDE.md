@@ -34,6 +34,8 @@ uv run alembic check                      # models and migrations must be in syn
 uv run news ingest [-v] [--since-days N] [--max-pages N] [--no-sitemap]
                                           # hits real publishers: only when asked
 uv run news backup && uv run news restore-test   # dump to ~/Backups/news, then prove it
+uv run news lab <ids...> [--label X]      # Gemini API: max 3 requests per run
+uv run news gemini-usage                  # API use vs our limits and Google's
 ```
 
 **Definition of done:** ruff, mypy and the full pytest suite pass, `alembic check` is clean,
@@ -70,11 +72,14 @@ of them requires an explicit decision by the owner, recorded in the architecture
     Hespress was obtained, and that is recorded too.
   - Article text is **never served** by the API, exported, published or committed. The
     `news_api` role cannot read `article_bodies`.
-  - **AI analysis runs on the Gemini API free tier (owner decision, 2026-11-24;
-    architecture section 5.5)**: article text is sent to Google. Billing stays off on
-    the Google project. Every request goes through `RequestBudget` (3 per test run,
-    1,000 per day). Never raise these limits, add retries after HTTP 429, or call the
-    API from tests without the owner's explicit approval.
+  - **AI analysis runs on Gemma 4 31B via the Gemini API, free tier only (owner
+    decision, 2026-11-24; architecture section 5.5)**: article text is sent to Google.
+    LM Studio is retired. Billing stays off on the Google project.
+  - Every request goes through `RequestBudget` (3 per run, 1,000 per day, 10 per minute,
+    8,000 input tokens per minute; settings can only lower them). Never raise the
+    ceilings, widen the model allowlist, add retries after an error, add billable
+    request options, or call the real API from tests, without the owner's explicit
+    decision. Check use with `uv run news gemini-usage`.
   - AI outputs meant for publication must be original work: no reproduced or
     closely paraphrased passages.
 - Bodies leave the rights gate only under `restricted` (with a non-empty

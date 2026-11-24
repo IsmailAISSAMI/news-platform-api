@@ -1,4 +1,4 @@
-"""Local LLM client against a simulated LM Studio. Never calls a real model."""
+"""Gemini client against a simulated API. Never calls the real one."""
 
 import json
 from collections.abc import Callable
@@ -11,102 +11,155 @@ from pydantic import BaseModel, SecretStr
 
 from app.analysis.budget import RequestBudget
 from app.analysis.evidence import EvidenceStatus, verify
-from app.analysis.llm import ChatLLM, LLMOutputError, LLMUnavailableError
+from app.analysis.llm import (
+    GeminiClient,
+    LLMOutputError,
+    LLMRequestTooLargeError,
+    LLMUnavailableError,
+)
 from app.analysis.prompt import SYSTEM_PROMPT, prepare
 from app.analysis.schema import ArticleAnalysis, EventDate
 
-BASE = "http://localhost:1234/v1"
+GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai"
+MODEL = "gemma-4-31b-it"
 
 
 class Tiny(BaseModel):
     answer: str
 
 
-def server(chat: Callable[[dict[str, object]], httpx.Response]) -> httpx.MockTransport:
-    def handle(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/models"):
-            return httpx.Response(200, json={"data": [{"id": "qwen/qwen3.5-9b"}]})
-        return chat(json.loads(request.content))
-
-    return httpx.MockTransport(handle)
-
-
-def reply(content: str, **extra: object) -> httpx.Response:
+def reply(content: str) -> httpx.Response:
     return httpx.Response(
         200,
         json={
-            "choices": [{"message": {"content": content, **extra}, "finish_reason": "stop"}],
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 100, "completion_tokens": 50},
         },
     )
 
 
-async def client_for(transport: httpx.MockTransport) -> ChatLLM:
-    return ChatLLM(httpx.AsyncClient(transport=transport), base_url=BASE, model="qwen/qwen3.5-9b")
+def budget(tmp_path: Path, per_run: int = 3) -> RequestBudget:
+    return RequestBudget(
+        usage_file=tmp_path / "usage.json",
+        per_run=per_run,
+        per_day=1000,
+        per_minute=10,
+        input_tokens_per_minute=8000,
+    )
 
 
-def test_non_local_endpoints_are_refused() -> None:
-    with pytest.raises(ValueError, match="without an API key and a budget"):
-        ChatLLM(httpx.AsyncClient(), base_url="https://api.example.com/v1", model="m")
+def gemini(
+    tmp_path: Path, chat: Callable[[httpx.Request], httpx.Response], per_run: int = 3
+) -> GeminiClient:
+    return GeminiClient(
+        httpx.AsyncClient(transport=httpx.MockTransport(chat)),
+        base_url=GEMINI,
+        model=MODEL,
+        api_key=SecretStr("test-key"),
+        budget=budget(tmp_path, per_run),
+    )
 
 
-async def test_request_uses_the_schema_and_disables_thinking() -> None:
-    seen: list[dict[str, object]] = []
+@pytest.mark.parametrize(
+    ("base_url", "model", "error"),
+    [
+        ("http://localhost:1234/v1", MODEL, "only https://generativelanguage"),
+        ("http://generativelanguage.googleapis.com/v1beta/openai", MODEL, "only https"),
+        ("https://api.example.com/v1", MODEL, "only https"),
+        (GEMINI, "gemini-3.1-pro", "free-tier allowlist"),
+    ],
+)
+def test_only_the_free_model_on_google_is_allowed(
+    tmp_path: Path, base_url: str, model: str, error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        GeminiClient(
+            httpx.AsyncClient(),
+            base_url=base_url,
+            model=model,
+            api_key=SecretStr("k"),
+            budget=budget(tmp_path),
+        )
 
-    def chat(payload: dict[str, object]) -> httpx.Response:
-        seen.append(payload)
-        return reply('{"answer": "ok"}')
 
-    llm = await client_for(server(chat))
-    completion = await llm.structured(Tiny, system="s", user="u")
+async def test_request_puts_rules_and_schema_in_one_user_message(tmp_path: Path) -> None:
+    seen: list[httpx.Request] = []
 
-    assert completion.parsed == Tiny(answer="ok")
-    assert completion.tokens_per_second is not None
-    payload = seen[0]
-    assert payload["reasoning_effort"] == "none"
-    response_format = payload["response_format"]
-    assert isinstance(response_format, dict)
-    assert response_format["json_schema"]["strict"] is True
+    def chat(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        thought = "<thought>Plan: {not json} then answer.</thought>\n"
+        return reply(thought + 'Here it is:\n```json\n{"answer": "ok"}\n```')
+
+    llm = gemini(tmp_path, chat)
+    completion = await llm.structured(Tiny, system="RULES", user="ARTICLE")
+
+    assert completion.parsed == Tiny(answer="ok")  # reasoning and fence are stripped
+    request = seen[0]
+    assert request.headers["Authorization"] == "Bearer test-key"
+    payload = json.loads(request.content)
+    assert set(payload) == {"model", "messages", "temperature", "max_tokens"}  # nothing billable
+    [message] = payload["messages"]
+    assert message["role"] == "user"
+    assert "RULES" in message["content"]
+    assert '"answer"' in message["content"]  # the JSON schema
+    [today] = llm.budget.history(1)
+    assert (today.requests, today.failed, today.input_tokens, today.output_tokens) == (
+        1, 0, 100, 50,
+    )  # fmt: skip
 
 
 @pytest.mark.parametrize("content", ["", "not json", '{"wrong": 1}', '{"answer": 1, "x": 2}'])
-async def test_invalid_output_is_rejected_with_the_raw_text(content: str) -> None:
-    llm = await client_for(server(lambda _: reply(content)))
+async def test_invalid_output_is_rejected_with_the_raw_text(tmp_path: Path, content: str) -> None:
+    llm = gemini(tmp_path, lambda _: reply(content))
 
     with pytest.raises(LLMOutputError) as info:
         await llm.structured(Tiny, system="s", user="u")
     assert info.value.raw == content
+    assert llm.budget.history(1)[0].failed == 1
 
 
-async def test_answer_hidden_in_the_reasoning_channel_is_not_accepted() -> None:
-    """LM Studio's thinking template once put the whole JSON into reasoning_content."""
-    llm = await client_for(server(lambda _: reply("", reasoning_content='{"answer": "x"}')))
+async def test_the_budget_stops_requests_before_they_are_sent(tmp_path: Path) -> None:
+    sent: list[httpx.Request] = []
 
-    with pytest.raises(LLMOutputError):
+    def chat(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return reply('{"answer": "ok"}')
+
+    llm = gemini(tmp_path, chat, per_run=2)
+    await llm.structured(Tiny, system="s", user="u")
+    await llm.structured(Tiny, system="s", user="u")
+
+    with pytest.raises(LLMUnavailableError, match="per-run limit"):
         await llm.structured(Tiny, system="s", user="u")
+    assert len(sent) == 2
 
 
-async def test_unavailable_server_and_missing_model() -> None:
+@pytest.mark.parametrize(("status", "error"), [(429, "quota reached"), (500, "HTTP 500")])
+async def test_errors_stop_without_retrying_and_are_counted(
+    tmp_path: Path, status: int, error: str
+) -> None:
+    sent: list[httpx.Request] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(status, json={"error": "x"})
+
+    llm = gemini(tmp_path, chat)
+    with pytest.raises(LLMUnavailableError, match=error):
+        await llm.structured(Tiny, system="s", user="u")
+    assert len(sent) == 1
+    [today] = llm.budget.history(1)
+    assert (today.requests, today.failed) == (1, 1)
+
+
+async def test_a_network_failure_still_counts_as_a_request(tmp_path: Path) -> None:
     def down(_: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused")
 
-    with pytest.raises(LLMUnavailableError, match="Start server"):
-        await ChatLLM(
-            httpx.AsyncClient(transport=httpx.MockTransport(down)), base_url=BASE, model="m"
-        ).ensure_ready()
-
-    other = ChatLLM(
-        httpx.AsyncClient(transport=server(lambda _: reply("{}"))), base_url=BASE, model="nope"
-    )
-    with pytest.raises(LLMUnavailableError, match="not available"):
-        await other.ensure_ready()
-
-
-async def test_http_error_is_reported() -> None:
-    llm = await client_for(server(lambda _: httpx.Response(500, text="boom")))
-
-    with pytest.raises(LLMUnavailableError, match="HTTP 500"):
+    llm = gemini(tmp_path, down)
+    with pytest.raises(LLMUnavailableError, match="ConnectError"):
         await llm.structured(Tiny, system="s", user="u")
+    assert llm.budget.used_today() == 1
 
 
 def test_prepare_numbers_paragraphs_and_fences_the_article() -> None:
@@ -187,91 +240,11 @@ def test_precision_is_derived_from_the_value(value: str | None, precision: str) 
     assert EventDate.model_validate({"value": value, "evidence": evidence}).precision == precision
 
 
-# --- Remote (Gemini API) mode: key, budget and schema-in-prompt -------------------------
-
-GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai"
-
-
-def remote(
-    tmp_path: Path, chat: Callable[[httpx.Request], httpx.Response], per_run: int = 3
-) -> ChatLLM:
-    budget = RequestBudget(
-        usage_file=tmp_path / "usage.json",
-        per_run=per_run,
-        per_day=1000,
-        per_minute=25,
-        input_tokens_per_minute=14000,
-    )
-    return ChatLLM(
-        httpx.AsyncClient(transport=httpx.MockTransport(chat)),
-        base_url=GEMINI,
-        model="gemma-4-31b-it",
-        api_key=SecretStr("test-key"),
-        budget=budget,
-        schema_in_prompt=True,
-    )
-
-
-def test_a_remote_endpoint_needs_a_key_and_a_budget() -> None:
-    with pytest.raises(ValueError, match="without an API key and a budget"):
-        ChatLLM(httpx.AsyncClient(), base_url=GEMINI, model="m", api_key=SecretStr("k"))
-
-
-async def test_remote_request_puts_the_schema_in_the_prompt(tmp_path: Path) -> None:
-    seen: list[httpx.Request] = []
-
-    def chat(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        thought = "<thought>Plan: {not json} then answer.</thought>\n"
-        return reply(thought + 'Here it is:\n```json\n{"answer": "ok"}\n```')
-
-    llm = remote(tmp_path, chat)
-    completion = await llm.structured(Tiny, system="RULES", user="ARTICLE")
-
-    assert completion.parsed == Tiny(answer="ok")  # reasoning and fence are stripped
-    request = seen[0]
-    assert request.headers["Authorization"] == "Bearer test-key"
-    payload = json.loads(request.content)
-    assert "response_format" not in payload
-    assert "reasoning_effort" not in payload  # LM Studio-only option
-    [message] = payload["messages"]
-    assert message["role"] == "user"
-    assert "RULES" in message["content"]
-    assert '"answer"' in message["content"]  # the JSON schema
-    assert llm.budget is not None
-    assert llm.budget.used_today() == 1
-
-
-async def test_the_budget_stops_requests_before_they_are_sent(tmp_path: Path) -> None:
-    sent: list[httpx.Request] = []
-
-    def chat(request: httpx.Request) -> httpx.Response:
-        sent.append(request)
-        return reply('{"answer": "ok"}')
-
-    llm = remote(tmp_path, chat, per_run=2)
-    await llm.structured(Tiny, system="s", user="u")
-    await llm.structured(Tiny, system="s", user="u")
-
-    with pytest.raises(LLMUnavailableError, match="per-run limit"):
-        await llm.structured(Tiny, system="s", user="u")
-    assert len(sent) == 2
-
-
-async def test_a_quota_error_stops_without_retrying(tmp_path: Path) -> None:
-    sent: list[httpx.Request] = []
-
-    def chat(request: httpx.Request) -> httpx.Response:
-        sent.append(request)
-        return httpx.Response(429, json={"error": "quota"})
-
-    with pytest.raises(LLMUnavailableError, match="429"):
-        await remote(tmp_path, chat).structured(Tiny, system="s", user="u")
-    assert len(sent) == 1
-
-
-async def test_a_remote_readiness_check_costs_no_request(tmp_path: Path) -> None:
+async def test_an_article_too_long_for_the_free_tier_is_skipped_unsent(tmp_path: Path) -> None:
     def chat(_: httpx.Request) -> httpx.Response:
-        raise AssertionError("no request expected")
+        raise AssertionError("must not be sent")
 
-    await remote(tmp_path, chat).ensure_ready()
+    llm = gemini(tmp_path, chat)
+    with pytest.raises(LLMRequestTooLargeError, match="too large"):
+        await llm.structured(Tiny, system="s", user="x" * 30_000)
+    assert llm.budget.used_today() == 0

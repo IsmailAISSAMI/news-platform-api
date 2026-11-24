@@ -271,3 +271,24 @@ async def test_ingest_reminds_about_stale_backups(
     await cli.ingest(IngestOptions())
 
     assert "Reminder: No backup yet." in capsys.readouterr().err
+
+
+def test_gemini_usage_shows_our_limits_and_googles(tmp_path: Path) -> None:
+    from app.analysis.budget import RequestBudget  # noqa: PLC0415  # local to this test
+
+    budget = RequestBudget(
+        usage_file=tmp_path / "usage.json",
+        per_run=3,
+        per_day=1000,
+        per_minute=10,
+        input_tokens_per_minute=8000,
+    )
+    budget.reserve(10)
+    budget.record_result(ok=True, input_tokens=4300, output_tokens=2600)
+
+    text = cli.format_usage(budget)
+
+    assert "Today: 1/1000 requests (999 left)." in text
+    assert "4300" in text
+    assert "Google's free tier: 14400/day, 30/min, 16000 input tokens/min." in text
+    assert "NO billing account" in text

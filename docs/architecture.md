@@ -261,30 +261,39 @@ before any public or commercial use. *This document is not legal advice.*
 
 ### 5.5 Owner decision: AI analysis on the Gemini API free tier (2026-11-24)
 
-- **Decision:** the owner chose to run AI analysis on Google's Gemini API (model
-  Gemma 4 31B, free tier) and to retire the local LM Studio models once the comparison
-  on the same articles is done. Article text is therefore **sent to Google**.
+- **Decision:** AI analysis runs on Google's Gemini API, model **Gemma 4 31B, free tier
+  only**. LM Studio and the local models are retired: the owner compared both on the
+  same articles and preferred Gemma 4 31B's answers. Article text is **sent to Google**.
 - **Known consequences, accepted by the owner:**
   - on the free tier, Google may use prompts and outputs to improve its products, and
     humans may review them;
   - this is an exception to "no free tier as a dependency" (section 1): Google can
     lower or remove free limits at any time (it did in December 2025), and analysis
     then stops until the owner decides otherwise.
-- **Advice given and declined:** keep analysis local (LM Studio), or send only
-  synthetic text and metadata.
-- **Safeguards (in code, `app/analysis/budget.py`):**
-  - the Google project has **no billing account**: over a limit, Google refuses
-    (HTTP 429) and nothing is ever charged. A 429 stops the run, with no retry;
-  - hard limits, checked before each request is sent, and counted even when it fails:
-    3 requests per test run, 1,000 per day (Google's limit: 14,400), 25 per minute
-    (Google: 30) and 14,000 estimated input tokens per minute (Google: 16,000). The
-    day follows Google's reset, midnight Pacific time. The counter is a file outside
-    the repo, shared by all runs;
-  - a remote endpoint is refused without both a key and a budget;
-  - the key lives only in `.env`; nothing else in 5.4 changes (no serving, export,
-    publication or commit of article text).
-- **To reverse:** run `news lab --provider local` (LM Studio) and remove
-  `GEMINI_API_KEY` from `.env`.
+- **Advice given and declined:** keep analysis local, or send only synthetic text and
+  metadata.
+- **Never paying, the rule:** the Google project has **no billing account**. Without
+  one, Google cannot charge: over a limit it refuses (HTTP 429). Code cannot check
+  billing, so the owner checks it in the Google Cloud console. Linking a billing
+  account, or using any model or feature outside the free tier, needs a new decision
+  recorded here.
+- **Safeguards in code** (`app/analysis/budget.py`, `app/analysis/llm.py`):
+  - only `https://generativelanguage.googleapis.com` and only models on the free
+    allowlist (`gemma-4-31b-it`). The request body is fixed in code: no tools,
+    grounding, caching or other options;
+  - our limits, far below Google's (30/min, 16K input tokens/min, 14.4K/day): 3
+    requests per run, **1,000 per day (7%)**, **10 per minute (a third)**, **8,000
+    estimated input tokens per minute (half)**. Settings can lower them; values above
+    these ceilings are refused;
+  - each request is counted **before** it is sent, so a failure still counts; the day
+    follows Google's reset (midnight Pacific time);
+  - a usage log outside the repo (`~/news-eval/gemini-usage.json`, mode 600, 90 days)
+    keeps requests, failures and the real tokens used, per day. `news gemini-usage`
+    shows it against our limits and Google's;
+  - HTTP 429 or any error stops the run, with no retry. An article too long for the
+    token limit (about 0.5% of articles) is skipped without being sent;
+  - the key lives only in `.env`. Nothing else in 5.4 changes: article text is never
+    served, exported, published or committed.
 
 ## 6. Data model (target, built in milestone 1)
 

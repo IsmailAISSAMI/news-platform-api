@@ -1,5 +1,9 @@
 # Milestone 9: News intelligence (design for approval)
 
+> **Update 2026-11-24:** analysis now runs on **Gemma 4 31B via the Gemini API free
+> tier**, and LM Studio is retired (architecture section 5.5). Mentions of LM Studio and
+> local models below describe the earlier design and the measurements made with it.
+
 Status: **design, awaiting the owner's approval. No application code changes yet.**
 Supersedes the earlier short proposal. Written 2026-11-23 from the owner's Milestone 9
 specification, audited against the real data and the hardware.
