@@ -46,6 +46,20 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:1234/v1"
     llm_model: str = "qwen/qwen3.5-9b"
 
+    # Remote AI analysis: Google's Gemini API, FREE TIER ONLY (owner decision 2026-11-24,
+    # docs/architecture.md 5.5). The project must have no billing account linked: then
+    # going over a limit is refused (HTTP 429) and nothing can ever be charged.
+    gemini_api_key: SecretStr | None = None
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    gemini_model: str = "gemma-4-31b-it"
+    # Hard limits, enforced in code BELOW the free tier of Gemma 4 31B (30 requests/min,
+    # 16K input tokens/min, 14.4K requests/day on the owner's project, 2026-11-24).
+    gemini_max_requests_per_run: int = 3
+    gemini_max_requests_per_day: int = 1000
+    gemini_max_requests_per_minute: int = 25
+    gemini_max_input_tokens_per_minute: int = 14000
+    gemini_usage_file: Path = Path.home() / "news-eval" / "gemini-usage.json"
+
     # Backups (`news backup` / `news restore-test`). Outside the repo and outside iCloud.
     backup_dir: Path = Path.home() / "Backups" / "news"
     backup_keep: int = 14
@@ -62,7 +76,7 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return value
 
-    @field_validator("backup_dir")
+    @field_validator("backup_dir", "gemini_usage_file")
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
         # "~/Backups/news" from .env must not become a literal "~" folder in the repo.

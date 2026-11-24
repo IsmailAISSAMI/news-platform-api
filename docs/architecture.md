@@ -259,6 +259,33 @@ before any public or commercial use. *This document is not legal advice.*
 - **To reverse:** set the source back to `metadata_only` (collection stops), then
   `DELETE FROM article_bodies` for that source's articles.
 
+### 5.5 Owner decision: AI analysis on the Gemini API free tier (2026-11-24)
+
+- **Decision:** the owner chose to run AI analysis on Google's Gemini API (model
+  Gemma 4 31B, free tier) and to retire the local LM Studio models once the comparison
+  on the same articles is done. Article text is therefore **sent to Google**.
+- **Known consequences, accepted by the owner:**
+  - on the free tier, Google may use prompts and outputs to improve its products, and
+    humans may review them;
+  - this is an exception to "no free tier as a dependency" (section 1): Google can
+    lower or remove free limits at any time (it did in December 2025), and analysis
+    then stops until the owner decides otherwise.
+- **Advice given and declined:** keep analysis local (LM Studio), or send only
+  synthetic text and metadata.
+- **Safeguards (in code, `app/analysis/budget.py`):**
+  - the Google project has **no billing account**: over a limit, Google refuses
+    (HTTP 429) and nothing is ever charged. A 429 stops the run, with no retry;
+  - hard limits, checked before each request is sent, and counted even when it fails:
+    3 requests per test run, 1,000 per day (Google's limit: 14,400), 25 per minute
+    (Google: 30) and 14,000 estimated input tokens per minute (Google: 16,000). The
+    day follows Google's reset, midnight Pacific time. The counter is a file outside
+    the repo, shared by all runs;
+  - a remote endpoint is refused without both a key and a budget;
+  - the key lives only in `.env`; nothing else in 5.4 changes (no serving, export,
+    publication or commit of article text).
+- **To reverse:** run `news lab --provider local` (LM Studio) and remove
+  `GEMINI_API_KEY` from `.env`.
+
 ## 6. Data model (target, built in milestone 1)
 
 ```sql

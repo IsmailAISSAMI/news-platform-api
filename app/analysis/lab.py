@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analysis.cleanup import clean, upcoming
 from app.analysis.evidence import EvidenceReport, EvidenceStatus, semantic_issues, verify
-from app.analysis.llm import LLMOutputError, LocalLLM
+from app.analysis.llm import ChatLLM, LLMOutputError
 from app.analysis.prompt import PROMPT_VERSION, SYSTEM_PROMPT, prepare
 from app.analysis.schema import SCHEMA_VERSION, ArticleAnalysis
 from app.models import Article, ArticleBody, Source
@@ -42,7 +42,7 @@ class LabResult:
 
 async def run_lab(
     session: AsyncSession,
-    llm: LocalLLM,
+    llm: ChatLLM,
     article_ids: list[int],
     *,
     extra_body: dict[str, Any] | None = None,
@@ -87,7 +87,7 @@ async def run_lab(
         except LLMOutputError as exc:
             result.error = str(exc)
             record["error"] = str(exc)
-            record["raw"] = exc.raw[:20000]
+            record["raw"] = exc.raw  # whole answer: it can be re-parsed offline
         else:
             analysis = completion.parsed
             report = verify(analysis, prepared.paragraphs)

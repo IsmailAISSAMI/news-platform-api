@@ -21,11 +21,12 @@ from pathlib import Path
 import httpx
 from sqlalchemy import select
 
+from app.analysis.budget import RequestBudget
 from app.analysis.compare import render as render_comparison
 from app.analysis.compare import score_run
 from app.analysis.lab import run_lab
-from app.analysis.llm import LLMUnavailableError, LocalLLM
-from app.core.config import get_settings
+from app.analysis.llm import ChatLLM, LLMUnavailableError
+from app.core.config import Settings, get_settings
 from app.core.logging import configure_cli_logging
 from app.db.session import create_engine, create_session_factory
 from app.ingestion.fetch import FetcherConfig, PoliteFetcher, create_http_client
@@ -94,7 +95,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Try the AI analysis on a few articles (results go to ~/news-eval/lab).",
     )
     lab.add_argument("ids", nargs="+", type=_positive_int, help="Article ids.")
-    lab.add_argument("--model", default=None, help="LM Studio model id (default: LLM_MODEL).")
+    lab.add_argument(
+        "--provider",
+        choices=("gemini", "local"),
+        default="gemini",
+        help="gemini: Gemini API free tier, with hard request limits (default). local: LM Studio.",
+    )
+    lab.add_argument("--model", default=None, help="Model id (default: GEMINI_MODEL or LLM_MODEL).")
     lab.add_argument("--label", default="", help="Suffix for the output folder name.")
     lab.add_argument(
         "--think",
@@ -131,7 +138,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_cli_logging(verbose=args.verbose)
     try:
         if args.command == "lab":
-            return asyncio.run(lab(args.ids, args.model, args.label, think=args.think))
+            return asyncio.run(
+                lab(args.ids, args.provider, args.model, args.label, think=args.think)
+            )
         if args.command == "lab-compare":
             return asyncio.run(lab_compare(args.runs))
         if args.command == "backup":
@@ -183,15 +192,18 @@ async def ingest(options: IngestOptions) -> int:
     return EXIT_OK if report.status is RunStatus.SUCCEEDED else EXIT_FEED_FAILURES
 
 
-async def lab(ids: list[int], model: str | None, label: str, *, think: bool) -> int:
+async def lab(  # one value per CLI option
+    ids: list[int], provider: str, model: str | None, label: str, *, think: bool
+) -> int:
     settings = get_settings()
+    if provider == "gemini" and settings.gemini_api_key is None:
+        _err("Not ready: GEMINI_API_KEY is not set in .env")
+        return EXIT_NOT_READY
     engine = create_engine(settings, read_only=True)
     extra = {"reasoning_effort": "medium"} if think else None
     try:
         async with httpx.AsyncClient() as client:
-            llm = LocalLLM(
-                client, base_url=settings.llm_base_url, model=model or settings.llm_model
-            )
+            llm = _lab_llm(client, settings, provider, model)
             await llm.ensure_ready()
             async with create_session_factory(engine)() as session:
                 out, results = await run_lab(
@@ -208,6 +220,32 @@ async def lab(ids: list[int], model: str | None, label: str, *, think: bool) -> 
         await engine.dispose()
     sys.stdout.write((out / "summary.md").read_text() + f"\nFull results: {out}\n")
     return EXIT_OK if all(r.ok for r in results) else EXIT_FEED_FAILURES
+
+
+def _lab_llm(
+    client: httpx.AsyncClient, settings: Settings, provider: str, model: str | None
+) -> ChatLLM:
+    if provider == "local":
+        return ChatLLM(client, base_url=settings.llm_base_url, model=model or settings.llm_model)
+    budget = RequestBudget(
+        usage_file=settings.gemini_usage_file,
+        per_run=settings.gemini_max_requests_per_run,
+        per_day=settings.gemini_max_requests_per_day,
+        per_minute=settings.gemini_max_requests_per_minute,
+        input_tokens_per_minute=settings.gemini_max_input_tokens_per_minute,
+    )
+    sys.stderr.write(
+        f"Gemini budget: at most {budget.per_run} requests this run; "
+        f"{budget.used_today()}/{budget.per_day} used today (Pacific time).\n"
+    )
+    return ChatLLM(
+        client,
+        base_url=settings.gemini_base_url,
+        model=model or settings.gemini_model,
+        api_key=settings.gemini_api_key,
+        budget=budget,
+        schema_in_prompt=True,
+    )
 
 
 async def lab_compare(runs: list[Path]) -> int:

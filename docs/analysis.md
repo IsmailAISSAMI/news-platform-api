@@ -71,8 +71,9 @@ news analyze ── readiness: LM Studio up? model loaded? DB migrated?
   `news ingest`. The advisory lock prevents overlapping runs.
 - **LM Studio unavailable:** fail fast with an actionable message (exit 2), with no
   partial writes.
-- **Locality:** inference happens only on localhost, and article text never leaves the
-  machine. The client refuses a non-local `LLM_BASE_URL` unless explicitly overridden.
+- **Locality (changed 2026-11-24):** analysis now runs on the Gemini API free tier,
+  so article text is sent to Google (architecture section 5.5). The client refuses a
+  remote endpoint without an API key and a request budget.
 
 ## 2. Model selection (one model in production)
 

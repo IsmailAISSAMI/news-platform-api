@@ -70,6 +70,11 @@ of them requires an explicit decision by the owner, recorded in the architecture
     Hespress was obtained, and that is recorded too.
   - Article text is **never served** by the API, exported, published or committed. The
     `news_api` role cannot read `article_bodies`.
+  - **AI analysis runs on the Gemini API free tier (owner decision, 2026-11-24;
+    architecture section 5.5)**: article text is sent to Google. Billing stays off on
+    the Google project. Every request goes through `RequestBudget` (3 per test run,
+    1,000 per day). Never raise these limits, add retries after HTTP 429, or call the
+    API from tests without the owner's explicit approval.
   - AI outputs meant for publication must be original work: no reproduced or
     closely paraphrased passages.
 - Bodies leave the rights gate only under `restricted` (with a non-empty

@@ -3,13 +3,15 @@
 import json
 from collections.abc import Callable
 from datetime import date
+from pathlib import Path
 
 import httpx
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
+from app.analysis.budget import RequestBudget
 from app.analysis.evidence import EvidenceStatus, verify
-from app.analysis.llm import LLMOutputError, LLMUnavailableError, LocalLLM
+from app.analysis.llm import ChatLLM, LLMOutputError, LLMUnavailableError
 from app.analysis.prompt import SYSTEM_PROMPT, prepare
 from app.analysis.schema import ArticleAnalysis, EventDate
 
@@ -39,13 +41,13 @@ def reply(content: str, **extra: object) -> httpx.Response:
     )
 
 
-async def client_for(transport: httpx.MockTransport) -> LocalLLM:
-    return LocalLLM(httpx.AsyncClient(transport=transport), base_url=BASE, model="qwen/qwen3.5-9b")
+async def client_for(transport: httpx.MockTransport) -> ChatLLM:
+    return ChatLLM(httpx.AsyncClient(transport=transport), base_url=BASE, model="qwen/qwen3.5-9b")
 
 
 def test_non_local_endpoints_are_refused() -> None:
-    with pytest.raises(ValueError, match="must stay local"):
-        LocalLLM(httpx.AsyncClient(), base_url="https://api.example.com/v1", model="m")
+    with pytest.raises(ValueError, match="without an API key and a budget"):
+        ChatLLM(httpx.AsyncClient(), base_url="https://api.example.com/v1", model="m")
 
 
 async def test_request_uses_the_schema_and_disables_thinking() -> None:
@@ -89,11 +91,11 @@ async def test_unavailable_server_and_missing_model() -> None:
         raise httpx.ConnectError("refused")
 
     with pytest.raises(LLMUnavailableError, match="Start server"):
-        await LocalLLM(
+        await ChatLLM(
             httpx.AsyncClient(transport=httpx.MockTransport(down)), base_url=BASE, model="m"
         ).ensure_ready()
 
-    other = LocalLLM(
+    other = ChatLLM(
         httpx.AsyncClient(transport=server(lambda _: reply("{}"))), base_url=BASE, model="nope"
     )
     with pytest.raises(LLMUnavailableError, match="not available"):
@@ -183,3 +185,93 @@ def test_event_date_rules(event_date: dict[str, object], error: str) -> None:
 def test_precision_is_derived_from_the_value(value: str | None, precision: str) -> None:
     evidence = {"paragraph": 1, "quote": "in November"} if value else None
     assert EventDate.model_validate({"value": value, "evidence": evidence}).precision == precision
+
+
+# --- Remote (Gemini API) mode: key, budget and schema-in-prompt -------------------------
+
+GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+
+def remote(
+    tmp_path: Path, chat: Callable[[httpx.Request], httpx.Response], per_run: int = 3
+) -> ChatLLM:
+    budget = RequestBudget(
+        usage_file=tmp_path / "usage.json",
+        per_run=per_run,
+        per_day=1000,
+        per_minute=25,
+        input_tokens_per_minute=14000,
+    )
+    return ChatLLM(
+        httpx.AsyncClient(transport=httpx.MockTransport(chat)),
+        base_url=GEMINI,
+        model="gemma-4-31b-it",
+        api_key=SecretStr("test-key"),
+        budget=budget,
+        schema_in_prompt=True,
+    )
+
+
+def test_a_remote_endpoint_needs_a_key_and_a_budget() -> None:
+    with pytest.raises(ValueError, match="without an API key and a budget"):
+        ChatLLM(httpx.AsyncClient(), base_url=GEMINI, model="m", api_key=SecretStr("k"))
+
+
+async def test_remote_request_puts_the_schema_in_the_prompt(tmp_path: Path) -> None:
+    seen: list[httpx.Request] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        thought = "<thought>Plan: {not json} then answer.</thought>\n"
+        return reply(thought + 'Here it is:\n```json\n{"answer": "ok"}\n```')
+
+    llm = remote(tmp_path, chat)
+    completion = await llm.structured(Tiny, system="RULES", user="ARTICLE")
+
+    assert completion.parsed == Tiny(answer="ok")  # reasoning and fence are stripped
+    request = seen[0]
+    assert request.headers["Authorization"] == "Bearer test-key"
+    payload = json.loads(request.content)
+    assert "response_format" not in payload
+    assert "reasoning_effort" not in payload  # LM Studio-only option
+    [message] = payload["messages"]
+    assert message["role"] == "user"
+    assert "RULES" in message["content"]
+    assert '"answer"' in message["content"]  # the JSON schema
+    assert llm.budget is not None
+    assert llm.budget.used_today() == 1
+
+
+async def test_the_budget_stops_requests_before_they_are_sent(tmp_path: Path) -> None:
+    sent: list[httpx.Request] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return reply('{"answer": "ok"}')
+
+    llm = remote(tmp_path, chat, per_run=2)
+    await llm.structured(Tiny, system="s", user="u")
+    await llm.structured(Tiny, system="s", user="u")
+
+    with pytest.raises(LLMUnavailableError, match="per-run limit"):
+        await llm.structured(Tiny, system="s", user="u")
+    assert len(sent) == 2
+
+
+async def test_a_quota_error_stops_without_retrying(tmp_path: Path) -> None:
+    sent: list[httpx.Request] = []
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(429, json={"error": "quota"})
+
+    with pytest.raises(LLMUnavailableError, match="429"):
+        await remote(tmp_path, chat).structured(Tiny, system="s", user="u")
+    assert len(sent) == 1
+
+
+async def test_a_remote_readiness_check_costs_no_request(tmp_path: Path) -> None:
+    def chat(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("no request expected")
+
+    await remote(tmp_path, chat).ensure_ready()
