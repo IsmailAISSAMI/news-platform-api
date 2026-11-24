@@ -120,6 +120,16 @@ _PUBLICATION = re.compile(
     r"(the|this) (article|story) (was |is )?published|article publication)\b",
     re.IGNORECASE,
 )
+# Strong markers of something not (yet) done. Weak modals (could, would, may, might)
+# express possibility and caused false alarms on real articles, so they are excluded.
+# Heuristic: used to FLAG for review, never to rewrite.
+_FUTURE = re.compile(
+    r"\b(will|expected|scheduled|planned|plans? to|set to|due to|is to|are to|"
+    r"aims? to|intends? to|preparing|upcoming|proposed|pending)\b",
+    re.IGNORECASE,
+)
+
+
 # Generic words a model may append to a name the article writes in a shared list
 # ("Taourirt, Khenifra and Ifrane provinces" -> "Taourirt province").
 _GENERIC_PLACE_WORDS = re.compile(
@@ -138,6 +148,8 @@ class Issue(StrEnum):
     EVENT_DATE_WITHOUT_DATE_WORDS = "event_date_without_date_words"
     TIMELINE_PUBLICATION_ENTRY = "timeline_publication_entry"  # publication is not an event
     PLACE_NAME_WITH_ADDED_SUFFIX = "place_name_with_added_suffix"  # core name is in article
+    # The quote speaks of the future ("will be signed") but the claim reads as done.
+    POSSIBLE_TENSE_MISMATCH = "possible_tense_mismatch"
 
 
 def semantic_issues(analysis: ArticleAnalysis, paragraphs: list[str]) -> dict[str, Issue]:
@@ -158,6 +170,9 @@ def semantic_issues(analysis: ArticleAnalysis, paragraphs: list[str]) -> dict[st
     quote = event_date.evidence.quote if event_date.evidence else ""
     if event_date.value is not None and not _DATE_WORDS.search(quote):
         issues["$.when.event_date"] = Issue.EVENT_DATE_WITHOUT_DATE_WORDS
+    for index, claim in enumerate(analysis.claims):
+        if _FUTURE.search(claim.evidence.quote) and not _FUTURE.search(claim.text):
+            issues[f"$.claims[{index}]"] = Issue.POSSIBLE_TENSE_MISMATCH
     for index, entry in enumerate(analysis.when.timeline):
         if _PUBLICATION.search(entry.event):
             issues[f"$.when.timeline[{index}]"] = Issue.TIMELINE_PUBLICATION_ENTRY

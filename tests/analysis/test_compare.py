@@ -9,7 +9,7 @@ QUOTE = {"paragraph": 1, "quote": "announced the alert system on Monday"}
 
 def analysis(quote: dict[str, object]) -> dict[str, object]:
     return {
-        "overview": {"headline": "h", "summary": "s", "report_type": "new_event",
+        "overview": {"headline": "h", "report_type": "new_event",
                      "event_status": "completed"},
         "what": {"main_event": "x"},
         "who": [{"name_as_written": "ministry", "full_name": "ministry", "type": "government_body",

@@ -6,7 +6,7 @@ Outputs contain article quotes (private text), so they go OUTSIDE the repository
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.analysis.cleanup import clean, upcoming
 from app.analysis.evidence import EvidenceReport, EvidenceStatus, semantic_issues, verify
 from app.analysis.llm import LLMOutputError, LocalLLM
 from app.analysis.prompt import PROMPT_VERSION, SYSTEM_PROMPT, prepare
@@ -91,6 +92,11 @@ async def run_lab(
             analysis = completion.parsed
             report = verify(analysis, prepared.paragraphs)
             issues = semantic_issues(analysis, prepared.paragraphs)
+            cleaned, cleanup = clean(
+                analysis,
+                prepared.paragraphs,
+                publisher_names=(source.name, source.name.split()[0]),
+            )
             result.issues = len(issues)
             result.ok = True
             result.duration_s = completion.duration_s
@@ -102,7 +108,6 @@ async def run_lab(
                 "where": len(analysis.where),
                 "claims": len(analysis.claims),
                 "timeline": len(analysis.when.timeline),
-                "next": len(analysis.next),
                 "open_questions": len(analysis.open_questions),
             }
             record |= {
@@ -111,7 +116,13 @@ async def run_lab(
                 "reasoning_chars": len(completion.reasoning or ""),
                 "evidence": {k: v.value for k, v in report.statuses.items()},
                 "issues": {k: v.value for k, v in issues.items()},
+                # The model's raw answer is kept unchanged; the cleaned version and every
+                # correction (original, corrected, reason, method) sit beside it.
                 "analysis": analysis.model_dump(),
+                "cleaned_analysis": cleaned.model_dump(),
+                "corrections": [asdict(c) for c in cleanup.items],
+                "review_flags": [asdict(f) for f in cleanup.flags],
+                "upcoming": upcoming(cleaned, article.published_at.date()),
             }
         path = out / f"article-{article_id}.json"
         path.write_text(json.dumps(record, indent=2, ensure_ascii=False, default=str))

@@ -71,7 +71,6 @@ def test_semantic_issues_catch_renamed_names_and_undated_event_dates() -> None:
         {
             "overview": {
                 "headline": "h",
-                "summary": "s",
                 "report_type": "update",
                 "event_status": "ongoing",
             },
@@ -123,7 +122,6 @@ def test_event_date_quotes_need_real_date_words(quote: str, dated: bool) -> None
         {
             "overview": {
                 "headline": "h",
-                "summary": "s",
                 "report_type": "update",
                 "event_status": "ongoing",
             },

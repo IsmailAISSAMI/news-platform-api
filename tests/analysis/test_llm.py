@@ -126,7 +126,6 @@ def test_full_schema_roundtrip_and_verification() -> None:
         {
             "overview": {
                 "headline": "h",
-                "summary": "s",
                 "report_type": "new_event",
                 "event_status": "completed",
             },

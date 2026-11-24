@@ -100,8 +100,16 @@ def _upgrade(analysis: dict[str, object]) -> dict[str, object]:
 
     - v3 -> v4: `precision` is now derived from the date value, so it is dropped.
     - v4 -> v5: place roles origin/destination map to related_event.
+    - v5 -> v6: `next` is no longer asked of the model (derived from predictions), so it
+      is dropped.
+    - v6 -> v7: the free-text summary was removed (it caused the worst, uncheckable
+      errors), so it is dropped.
     Anything else incompatible still fails validation and counts as invalid.
     """
+    analysis.pop("next", None)
+    overview = analysis.get("overview")
+    if isinstance(overview, dict):
+        overview.pop("summary", None)
     when = analysis.get("when")
     if isinstance(when, dict):
         event_date = when.get("event_date")

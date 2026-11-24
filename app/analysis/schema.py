@@ -13,7 +13,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "7"
 
 
 class _Strict(BaseModel):
@@ -30,7 +30,6 @@ class Evidence(_Strict):
 
 class Overview(_Strict):
     headline: str = Field(description="Neutral one-line description of the main event.")
-    summary: str = Field(description="2-3 factual sentences, in your own words.")
     report_type: Literal[
         "new_event", "update", "reaction", "investigation", "analysis", "background", "opinion"
     ]
@@ -161,13 +160,6 @@ class Impact(_Strict):
     evidence: Evidence
 
 
-class NextStep(_Strict):
-    text: str
-    date: str | None
-    certainty: Literal["confirmed", "expected", "possible"]
-    evidence: Evidence
-
-
 class Tone(_Strict):
     label: Literal[
         "neutral", "positive", "negative", "critical", "concerned", "urgent", "analytical"
@@ -188,7 +180,6 @@ class ArticleAnalysis(_Strict):
     context: list[str] = Field(
         default_factory=list, max_length=8, description="Background given BY THE ARTICLE."
     )
-    next: list[NextStep] = Field(default_factory=list, max_length=10)
     open_questions: list[str] = Field(
         default_factory=list, max_length=3, description="The 3 most important unanswered ones."
     )
