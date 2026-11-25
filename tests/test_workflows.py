@@ -20,19 +20,20 @@ def test_ingest_is_scheduled_and_never_runs_on_pull_requests() -> None:
     ingest = _text("ingest.yml")
 
     assert "schedule:" in ingest
+    assert '- cron: "47 22 * * *"' in ingest  # once a day, 23:47 in Morocco
     assert "pull_request" not in ingest
     assert "permissions:\n  contents: read" in ingest
     assert "cancel-in-progress: false" in ingest
 
 
-def test_ingest_only_ingests_with_the_ingest_login_secret() -> None:
+def test_ingest_only_ingests_with_the_database_url_secret() -> None:
     ingest = _text("ingest.yml")
 
-    assert "DATABASE_URL: ${{ secrets.INGEST_DATABASE_URL }}" in ingest
-    assert ingest.count("secrets.") == 1  # no Gemini key, no owner URL
+    assert "DATABASE_URL: ${{ secrets.DATABASE_URL }}" in ingest
+    assert ingest.count("secrets.") == 1  # no Gemini key
     for forbidden in ("news analyze", "news lab", "pytest", "alembic upgrade", "--rewalk"):
         assert forbidden not in ingest
-    assert "uv run --no-dev news ingest" in ingest
+    assert "uv run --no-dev news ingest --since-days 1" in ingest
 
 
 def test_ingest_refuses_the_neon_pooler_and_plain_text_connections() -> None:

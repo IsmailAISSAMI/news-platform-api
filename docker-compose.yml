@@ -28,8 +28,6 @@ services:
     image: news-backend:local
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
-      # news_api_login (SELECT-only). Empty = owner login, which the API warns about.
-      API_DATABASE_URL: ${API_DATABASE_URL:-}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # IPs of the reverse proxy allowed to set X-Forwarded-* (read by uvicorn).

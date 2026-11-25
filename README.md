@@ -70,28 +70,10 @@ DATABASE_URL=postgresql://neondb_owner:change-me@ep-xxx.eu-central-1.aws.neon.te
 
 Never paste a connection string into a chat, an issue or a file in this repo.
 
-**5. Create the tables and the restricted logins**
+**5. Create the tables**
 
 ```bash
 uv run alembic upgrade head
-read -rs NEON_URL      # paste the same connection string, then Enter (nothing is shown)
-docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 < scripts/db_roles.sql
-```
-
-Then give the two restricted logins their passwords (make each with
-`openssl rand -hex 24`, keep them in your password manager):
-
-```bash
-read -rs API_PW && read -rs INGEST_PW
-docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 \
-  -v api_password="$API_PW" -v ingest_password="$INGEST_PW" < scripts/db_login_passwords.sql
-unset NEON_URL API_PW INGEST_PW
-```
-
-Add the API's login to `.env` (same host, `news_api_login` and its password):
-
-```bash
-API_DATABASE_URL=postgresql://news_api_login:change-me@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require
 ```
 
 **6. Start the local test database** (used by the tests only, never by the app):
@@ -119,9 +101,10 @@ Open **<http://localhost:8000/health/ready>** in your browser. You should see:
 ```
 
 **8. Turn on the daily collection** (GitHub): repo → *Settings* → *Environments* → new
-environment `production` → *Add secret* `INGEST_DATABASE_URL`: the same connection
-string with `news_ingest_login` and its password. Then *Actions* → *Daily ingest* →
-*Run workflow* once. After that it runs every day at 05:17 UTC; a failed run emails you.
+environment `production` → *Add secret* `DATABASE_URL`: the same value as
+`DATABASE_URL` in your `.env`. Then *Actions* → *Daily ingest* →
+*Run workflow* once. After that it runs every day at 22:47 UTC (23:47 in Morocco); each run stores only
+the articles published since the previous successful run, and a failed run emails you.
 
 ✅ Setup is done.
 
@@ -241,24 +224,21 @@ uv run news restore-test   # proves that the copy can really be restored
 <details>
 <summary><b>Restore a backup</b> (only if you lost your data)</summary>
 
-This **replaces** the database contents with the backup. Paste the owner connection
-string at the prompt:
+This **replaces** the database contents with the backup. Paste the connection string
+(`DATABASE_URL` from `.env`) at the prompt:
 
 ```bash
 ls ~/Backups/news/      # pick a .dump file
 read -rs NEON_URL
 docker run --rm -i postgres:18-alpine pg_restore --no-owner --no-privileges \
   --clean --if-exists -d "$NEON_URL" < ~/Backups/news/<file>.dump
-docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 < scripts/db_roles.sql
 unset NEON_URL
 ```
 
-The last command restores the database roles' privileges, which a dump does not carry.
-
 </details>
 
-**After each new migration** (when you update the code): run `uv run alembic upgrade head`,
-then `scripts/db_roles.sql` as in setup step 5, before the next daily collection. The
+**After each new migration** (when you update the code): run `uv run alembic upgrade head`
+before the next daily collection. The
 collection refuses to run while the database is behind the code.
 
 ---
@@ -287,7 +267,7 @@ collection refuses to run while the database is behind the code.
 | Problem | Fix |
 | --- | --- |
 | `Not ready: PostgreSQL is not reachable` | Check your internet connection and that `DATABASE_URL` in `.env` is Neon's connection string. Neon wakes an idle database in a few seconds: try again. |
-| `Not ready: The database is at migration …` | You updated the code. Run `uv run alembic upgrade head`, then `scripts/db_roles.sql` (setup step 5). |
+| `Not ready: The database is at migration …` | You updated the code. Run `uv run alembic upgrade head`. |
 | `port is already allocated` for **8000** | Another program uses port 8000. Use `--port 8001` (or `API_PORT=8001 docker compose up -d api`). |
 | Tests say `DATABASE_URL points at Neon` | Set `TEST_DATABASE_URL` in `.env` (setup step 6). Tests never run on Neon. |
 | `Not started: another news ingest is already running` | Wait for the other run to finish (only one runs at a time). |
@@ -375,8 +355,9 @@ in `uv.lock`, which must be committed.
 **All settings** live in `.env`; [.env.example](.env.example) lists every option with its
 default.
 
-**Database roles:** `scripts/db_roles.sql` creates the restricted roles (the API can
-never read article text); re-run it after every migration (setup step 5).
+**Optional database roles:** `scripts/db_roles.sql` and `scripts/db_login_passwords.sql`
+can create restricted logins (an API login that can never read article text). They are
+not used by default: everything connects with `DATABASE_URL`.
 
 **Command exit codes** (useful in scripts): `0` ok · `1` something failed · `2` database
 not ready · `3` already running · `130` interrupted.

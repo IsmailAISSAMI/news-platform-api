@@ -3,11 +3,14 @@ name: Daily ingest
 # Owner decision 2026-11-25 (docs/architecture.md 5.6): once a day, collect the articles
 # published since the last run into the Neon database. This is the only workflow that
 # touches real data. It never runs on pull requests (secrets stay out of forks), never
-# runs tests or Gemini analysis, and uses the least-privilege news_ingest_login.
+# runs tests or Gemini analysis. Its only secret is DATABASE_URL (owner decision
+# 2026-11-25: one connection string everywhere).
 
 on:
   schedule:
-    - cron: "17 5 * * *" # 05:17 UTC daily (off the hour: GitHub delays top-of-hour jobs)
+    # 22:47 UTC = 23:47 in Morocco (UTC+1): after Hespress's publishing day, so one run
+    # captures almost the whole day; :47 avoids GitHub's top-of-hour and midnight-UTC delays.
+    - cron: "47 22 * * *"
   workflow_dispatch:
 
 permissions:
@@ -21,12 +24,12 @@ jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: production # holds the INGEST_DATABASE_URL secret
+    environment: production # holds the DATABASE_URL secret
 
     env:
-      # news_ingest_login on Neon's DIRECT endpoint (no "-pooler" in the host: the
-      # session advisory locks need a real session), with ?sslmode=require.
-      DATABASE_URL: ${{ secrets.INGEST_DATABASE_URL }}
+      # The same value as DATABASE_URL in .env: Neon's DIRECT endpoint (no "-pooler" in
+      # the host: the session advisory locks need a real session), with ?sslmode=require.
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
       ENVIRONMENT: production
 
     steps:
@@ -43,11 +46,14 @@ jobs:
       - name: Refuse a pooled or unencrypted database URL
         run: |
           case "$DATABASE_URL" in
-            "") echo "INGEST_DATABASE_URL secret is not set" >&2; exit 1 ;;
+            "") echo "DATABASE_URL secret is not set" >&2; exit 1 ;;
             *-pooler.*) echo "Use Neon's direct endpoint, not the pooler" >&2; exit 1 ;;
             *sslmode=require*|*sslmode=verify-full*) ;;
             *) echo "The URL must set sslmode=require (or verify-full)" >&2; exit 1 ;;
           esac
 
+      # Each run walks back to the last completed run's checkpoint, so it stores only the
+      # articles published since then (already-stored ones are skipped by post ID).
+      # --since-days 1 applies only to the very first run: start with the last 24 h.
       - name: Ingest
-        run: uv run --no-dev news ingest
+        run: uv run --no-dev news ingest --since-days 1

@@ -82,8 +82,11 @@ The archive backlog (milestone 6) is deferred. Ingestion is a
 **run-to-completion command**, not a daemon. It runs daily from
 `.github/workflows/ingest.yml` (GitHub-hosted, against Neon, architecture 5.6) or by
 hand. No launchd, no self-hosted runner. The workflow runs `news ingest` only, with the
-`INGEST_DATABASE_URL` secret (`news_ingest_login`, Neon's direct endpoint,
+`DATABASE_URL` secret (the same owner URL as `.env`, Neon's direct endpoint,
 `sslmode=require`); never tests, migrations or Gemini analysis.
+**One connection string everywhere** (owner decision 2026-11-25, architecture 5.6):
+`DATABASE_URL` is the only database setting in use; the restricted login roles exist but
+are optional and unused by default. Don't reintroduce them without the owner's decision.
 
 ## Hard rules: content rights and polite crawling
 
@@ -180,8 +183,9 @@ of them requires an explicit decision by the owner, recorded in the architecture
     `news_api_login` and `news_ingest_login`, whose passwords are set by
     `scripts/db_login_passwords.sql` from psql variables (never written in a file).
   - The API's engine is `create_engine(settings, read_only=True)`: its connections set
-    `default_transaction_read_only=on`, and it uses `API_DATABASE_URL` (a
-    `news_api_login` URL) when set. Never give the API a read-write engine.
+    `default_transaction_read_only=on` (with the owner login by default, or the optional
+    `API_DATABASE_URL`). Never give the API a read-write engine; never serve
+    `article_bodies` from any route.
   - Startup privilege guard: `assert_least_privilege` (`app/db/session.py`, called from
     the lifespan) refuses to start in production, and warns elsewhere, if the API's login
     is a superuser or can SELECT `article_bodies`. Never weaken it.
@@ -214,7 +218,7 @@ of them requires an explicit decision by the owner, recorded in the architecture
   except Neon (5.6). The only internet-reachable PostgreSQL is Neon (TLS + passwords);
   the local container stays on localhost. `ci.yml` has no secrets and never touches real
   data; `ingest.yml` is the only workflow with real data, guarded by
-  `tests/test_workflows.py`. Migrations and `scripts/db_roles.sql` are run by the owner.
+  `tests/test_workflows.py`. Migrations are run by the owner, from the Mac.
 - **Backups.** Dumps go to `~/Backups/news/`, outside the repo. A backup only counts once
   a restore test has passed.
 
@@ -243,8 +247,8 @@ of them requires an explicit decision by the owner, recorded in the architecture
 
 - The app's database is **Neon** (`DATABASE_URL`, direct endpoint, never `-pooler`). The
   local container on **5433** (5432 belongs to another project) is for tests only:
-  `tests/conftest.py` refuses a Neon URL, so set `TEST_DATABASE_URL`. Migrations and
-  `scripts/db_roles.sql` against Neon are run from the Mac.
+  `tests/conftest.py` refuses a Neon URL, so set `TEST_DATABASE_URL`. Migrations against
+  Neon are run from the Mac.
 - Port 8000 may be taken by a local uvicorn. Use `--port 8001` or
   `API_PORT=8001 docker compose up -d api`.
 - The VS Code GitHub Actions extension shows false "unable to resolve action" errors.

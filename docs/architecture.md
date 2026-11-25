@@ -395,13 +395,16 @@ earlier rules:
   runs only `news ingest`, never tests, migrations or analysis; refuses a URL without
   `sslmode=require` and Neon's `-pooler` endpoint (session advisory locks need a direct
   session).
-- Its only secret is `INGEST_DATABASE_URL` (in the `production` environment): the
-  `news_ingest_login` role, which can read and write data but not change the schema,
-  read `alembic_version` only, and never create roles. The owner URL never goes to
-  GitHub. `ci.yml` still has no secrets and never touches real data.
-- Migrations and `scripts/db_roles.sql` are run by the owner, from the Mac, against Neon.
-  The ingest refuses to run while the database is behind the code's Alembic head.
-- The API uses `news_api_login` (SELECT allowlist, read-only connections) as before.
+- Its only secret is `DATABASE_URL` (in the `production` environment), the same owner
+  URL as on the Mac. `ci.yml` still has no secrets and never touches real data.
+- **One connection string everywhere (owner decision, 2026-11-25):** the Mac, the API and
+  GitHub all use `DATABASE_URL`, to keep the setup simple. Accepted trade-off: the
+  separate least-privilege logins (`news_ingest_login`, `news_api_login`) are not used,
+  so a leaked secret gives full access to the database. What still protects article
+  text: the API's connections are read-only and no route serves `article_bodies` (tests
+  enforce both); the roles scripts stay in the repo as an optional extra.
+- Migrations are run by the owner, from the Mac, against Neon. The ingest refuses to run
+  while the database is behind the code's Alembic head.
 - **Freshness:** a daily walk to the checkpoint covers the last day and any missed days
   within the RSS depth (section 4). A skipped GitHub schedule is caught up by the next
   run. GitHub disables schedules after 60 days without repository activity: re-enable
@@ -415,7 +418,7 @@ earlier rules:
   on 2026-11-25 (a verified dump from that morning is kept in `~/Backups/news`).
 
 **Reversal plan.**
-1. Disable the workflow in the Actions tab and delete the `INGEST_DATABASE_URL` secret.
+1. Disable the workflow in the Actions tab and delete the `DATABASE_URL` secret.
 2. Dump Neon (`news backup`), restore into the local container, re-run the roles
    scripts, point `DATABASE_URL` back at `localhost:5433`.
 3. Delete the Neon project (this removes the stored article text there). Record it here.
@@ -465,7 +468,9 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 
   Both are NOLOGIN group roles. The login roles `news_api_login` and `news_ingest_login`
   inherit them; their passwords are set by `scripts/db_login_passwords.sql` from psql
-  variables, never from a file. `API_DATABASE_URL` points the API at `news_api_login`.
+  variables, never from a file. `API_DATABASE_URL` can point the API at
+  `news_api_login`. **Since 2026-11-25 these logins are optional and unused by default**
+  (section 5.6: one connection string everywhere).
   At startup the API runs `assert_least_privilege` (`app/db/session.py`): if its login is
   a superuser or can SELECT `article_bodies`, it refuses to start in production and logs
   a warning elsewhere.
@@ -595,7 +600,7 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 - `ci.yml` stays CI-only: ruff, mypy, `alembic upgrade head` + `alembic check`, and
   pytest against a throwaway Postgres service. It has no secrets. No self-hosted runner.
 - `ingest.yml` is the daily ingest against Neon (section 5.6). Its single secret is
-  `INGEST_DATABASE_URL`; `tests/test_workflows.py` guards both workflows.
+  `DATABASE_URL`; `tests/test_workflows.py` guards both workflows.
   - The Postgres service image is pinned by digest (`postgres:18-alpine@sha256:...`).
   - Coverage is measured with branch coverage and must stay at least 95%
     (`fail_under` in `pyproject.toml`). `pytest-randomly` shuffles test order.
@@ -608,7 +613,7 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
     holds SHA-256 hashes only, so the words never appear in the repo.
 - Migrations are applied locally with `uv run alembic upgrade head`. `news ingest`
   refuses to run when the database is behind.
-- One GitHub secret, `INGEST_DATABASE_URL`, used by `ingest.yml` only.
+- One GitHub secret, `DATABASE_URL` (environment `production`), used by `ingest.yml` only.
 - Data never enters git: `.gitignore` covers `backups/`, `*.dump`, `*.sql.gz` and `.env`.
   pre-commit blocks large files and private keys. Test fixtures are synthetic.
 
