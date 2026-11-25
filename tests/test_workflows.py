@@ -36,11 +36,53 @@ def test_ingest_only_ingests_with_the_database_url_secret() -> None:
     assert "uv run --no-dev news ingest --since-days 1" in ingest
 
 
-def test_ingest_refuses_the_neon_pooler_and_plain_text_connections() -> None:
-    ingest = _text("ingest.yml")
+def _run_block(workflow: str, step_name: str) -> list[str]:
+    """The lines of a step's `run: |` block (stdlib text slicing; comments dropped)."""
+    lines = workflow.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.strip() == f"- name: {step_name}")
+    step_indent = len(lines[start]) - len(lines[start].lstrip())
+    block: list[str] = []
+    run_indent: int | None = None
+    for line in lines[start + 1 :]:
+        indent = len(line) - len(line.lstrip())
+        if line.strip() and indent <= step_indent:
+            break  # the next step
+        if run_indent is None:
+            if line.strip() == "run: |":
+                run_indent = indent
+            continue
+        if line.strip() and indent <= run_indent:
+            break  # another key of the same step
+        if line.strip() and not line.strip().startswith("#"):
+            block.append(line.strip())
+    assert block, f"step {step_name!r} has no run block"
+    return block
 
-    assert "*-pooler.*" in ingest
-    assert "sslmode=require" in ingest
+
+def test_ingest_refuses_the_neon_pooler_and_plain_text_connections() -> None:
+    guard = _run_block(_text("ingest.yml"), "Refuse a pooled or unencrypted database URL")
+
+    pooler = next(line for line in guard if line.startswith("*-pooler.*)"))
+    assert "exit 1" in pooler
+    tls = next(line for line in guard if "sslmode=require" in line)
+    assert tls.endswith(";;") and "exit" not in tls  # the only accepted branch
+    fallback = next(line for line in guard if line.startswith("*)"))
+    assert "exit 1" in fallback
+    assert guard.index(pooler) < guard.index(tls) < guard.index(fallback)
+
+
+def test_the_guard_parser_ignores_comments_and_other_steps() -> None:
+    workflow = (
+        "    steps:\n"
+        "      - name: Guard\n"
+        "        run: |\n"
+        "          # *-pooler.*) mentioned in a comment\n"
+        "          true\n"
+        "      - name: Other\n"
+        "        run: |\n"
+        "          *-pooler.*) exit 1 ;;\n"
+    )
+    assert _run_block(workflow, "Guard") == ["true"]
 
 
 def test_every_action_is_pinned_by_sha() -> None:

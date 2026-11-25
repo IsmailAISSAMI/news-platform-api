@@ -7,6 +7,7 @@ from datetime import date
 from typing import Any
 
 from app.analysis.budget import DailyLimitError, DayUsage, Outcome
+from app.analysis.ledger import SENT_OUTCOMES
 
 TODAY = date(2026, 11, 24)
 
@@ -22,7 +23,7 @@ class FakeLedger:
         return sum(
             1
             for r in self.rows.values()
-            if r["model"] == model and r["day"] == quota_day and r["outcome"] != "pending"
+            if r["model"] == model and r["day"] == quota_day and r["outcome"] in SENT_OUTCOMES
         )
 
     async def reserve(  # same signature as the Ledger protocol
@@ -66,7 +67,7 @@ class FakeLedger:
         return [
             (now - r["at"], max(r["in"] or 0, r["est"] or 0))
             for r in sorted(self.rows.values(), key=lambda r: r["at"])
-            if r["model"] == model and now - r["at"] < window_s
+            if r["model"] == model and r["outcome"] in SENT_OUTCOMES and now - r["at"] < window_s
         ]
 
     async def totals(self, model: str, days: int) -> list[DayUsage]:

@@ -30,7 +30,6 @@ jobs:
       # The same value as DATABASE_URL in .env: Neon's DIRECT endpoint (no "-pooler" in
       # the host: the session advisory locks need a real session), with ?sslmode=require.
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      ENVIRONMENT: production
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

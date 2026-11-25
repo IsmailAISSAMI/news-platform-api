@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.analysis.pipeline import ANALYZE_LOCK_KEY
 from app.core.config import Settings
 from app.ingestion.runner import INGEST_LOCK_KEY, AlreadyRunningError
+from app.ops import backup as backup_module
 from app.ops.backup import (
     Backup,
     BackupError,
@@ -138,3 +139,24 @@ async def test_row_count_mismatch_fails_and_is_not_marked_verified(
     assert not result.ok
     assert result.mismatches == {"sources": (999, backup.manifest.row_counts["sources"])}
     assert list_backups(tmp_path)[0].manifest.verified_at is None
+
+
+async def test_restore_into_a_separate_target_counts_with_psql(
+    engine: AsyncEngine, settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D3 round trip: when the restore target differs from the dump's server (Neon dump,
+    local container restore), counts come from psql on the target, not DATABASE_URL."""
+    tools = PgTools.from_settings(settings)
+    target = replace(tools)  # an equal but distinct object: takes the remote-dump branch
+    monkeypatch.setattr(backup_module, "restore_target", lambda *_: target)
+    backup = await create_backup(engine, tools, tmp_path, keep=3, now=NOW)
+
+    result = await verify_backup(backup, tools, settings, now=NOW)
+
+    assert result.ok, result.mismatches
+    assert list_backups(tmp_path)[0].manifest.verified_at == NOW
+    async with engine.connect() as connection:
+        scratch = await connection.scalar(
+            text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": tools.scratch_database}
+        )
+    assert scratch is None

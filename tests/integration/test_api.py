@@ -195,7 +195,7 @@ async def test_article_detail_links_out_with_attribution(
 
 
 @pytest.mark.usefixtures("seeded")
-async def test_no_response_ever_carries_a_body(client: httpx.AsyncClient) -> None:
+async def test_article_list_items_have_no_body_keys(client: httpx.AsyncClient) -> None:
     body = (await client.get("/api/v1/articles", params={"limit": 100})).json()
 
     for item in body["items"]:

@@ -126,9 +126,9 @@ uv run news ingest --since-days 7 -v     # one week, about 2 minutes
 uv run news ingest --since-days 90 -v    # three months, about 20 minutes
 ```
 
-**After that,** run `uv run news ingest` whenever you like: daily, weekly, or after weeks
-away. It always collects exactly what was published since your last run, and nothing
-twice. There is no scheduler to set up.
+**After that,** the daily GitHub run (setup step 8) keeps the database up to date. A
+manual `uv run news ingest` is optional and safe at any time: it collects exactly what
+was published since the last completed run, and nothing twice.
 
 Good to know:
 
@@ -140,9 +140,9 @@ Good to know:
 
   ```
   Ingestion run #3: succeeded in 41.2s
-    hespress-en    rss            +18 new, 0 updated, 0 skipped, 2 page(s) [checkpoint]
-    hespress-en    news_sitemap   +0 new, 0 updated, 0 skipped, 1 page(s) [not_modified]
-  Total: +18 new, 0 updated, 3 page(s)
+    hespress-en    rss            +18 new, 0 updated, 2 unchanged, 0 skipped, 2 page(s) [checkpoint]
+    hespress-en    news_sitemap   +0 new, 0 updated, 0 unchanged, 0 skipped, 1 page(s) [not_modified]
+  Total: +18 new, 0 updated, 2 unchanged, 3 page(s)
   ```
 
 **Fetch article text for articles you collected earlier** (once, if you collected articles
@@ -161,8 +161,9 @@ uv run news ingest --rewalk-days 90 -v   # re-reads the last 90 days, about 15 m
 `GEMINI_API_KEY=change-me` placeholder with a random value, which is **not a key**:
 before running `news analyze` (or `news lab`), put a real key from Google AI Studio in
 `.env` as `GEMINI_API_KEY=...`. Keep billing off on the Google project. The command
-stays within fixed limits (20 requests per minute, 1,000 per day) and can be stopped and
-resumed; `uv run news gemini-usage` shows what was used.
+stays within fixed limits ([architecture 5.5](docs/architecture.md#55-owner-decision-ai-analysis-on-the-gemini-api-free-tier-2026-11-24))
+and can be stopped and resumed; without a network it gives up after a few attempts.
+`uv run news gemini-usage` shows what was used.
 
 ---
 
@@ -204,8 +205,9 @@ The screen reads `GET /api/v1/briefings` (newest first, paged with `next_cursor`
 `GET /api/v1/articles/{id}/briefing`. A briefing never contains article text: evidence
 quotes are removed, unverified items dropped (`review_required` says when that
 happened), and any sentence that copies 8 or more consecutive words from the article is
-removed too. Summary fields that cannot be checked against the article are listed in
-`unverified_fields`. Because of the copy filter, briefings can be short. The page is served with a strict Content Security Policy and `no-cache`, and
+removed too (a copied headline or summary field is shown as empty, `null`). Summary
+fields that cannot be checked against the article are listed in `unverified_fields`.
+Because of the copy filter, briefings can be short. The page is served with a strict Content Security Policy and `no-cache`, and
 it inserts data as text only, never as HTML.
 
 ## Back up your data
@@ -213,9 +215,14 @@ it inserts data as text only, never as HTML.
 Do this after your first collection, then about once a week:
 
 ```bash
+docker compose up -d db    # restore-test needs the local test database running
 uv run news backup         # saves a copy to ~/Backups/news
 uv run news restore-test   # proves that the copy can really be restored
 ```
+
+`restore-test` restores the newest copy into a scratch database in the **local** Docker
+`db` container (never on Neon), compares row counts, and always deletes the scratch
+database afterwards.
 
 - A backup only counts once `restore-test` says **Verified**.
 - The newest 14 backups are kept; older ones are removed automatically.
@@ -272,7 +279,10 @@ collection refuses to run while the database is behind the code.
 | Tests say `DATABASE_URL points at Neon` | Set `TEST_DATABASE_URL` in `.env` (setup step 6). Tests never run on Neon. |
 | `Not started: another news ingest is already running` | Wait for the other run to finish (only one runs at a time). |
 | `password authentication failed` | The password in `.env` doesn't match. For Neon, copy the connection string again (or *Reset password* in the console). |
-| The daily collection stopped running | GitHub pauses scheduled workflows after 60 days without repository activity. Re-enable it in the *Actions* tab. |
+| The daily collection stopped running | GitHub disables scheduled workflows after 60 days without repository activity. Re-enable it: *Actions* → *Daily ingest* → *Enable workflow*, then *Run workflow* once. |
+| Did the daily collection fail? | GitHub emails you when a scheduled run fails. Also glance at the *Actions* tab about once a week. |
+| `... is a connection pooler` | `DATABASE_URL` uses Neon's `-pooler` host. Copy the connection string again with *Connection pooling* off. |
+| `restore-test` says the local `db` container is not reachable | Run `docker compose up -d db`, then try again. |
 | A feed shows `FAILED` in the report | Usually a temporary network or site problem. Run again later. After 20 failures in a row a feed is paused; see `/api/v1/feeds`. |
 | Strange import errors on macOS | If the project is inside an iCloud-synced folder (Desktop or Documents), iCloud can damage the Python environment. Move the project elsewhere, e.g. `~/code`, then run `uv sync`. |
 
@@ -339,6 +349,7 @@ uv run mypy app tests alembic
 uv run pytest                      # needs the local test database (docker compose up -d db)
                                    # and TEST_DATABASE_URL; never touches Neon
 uv run pytest -m "not integration" # quick tests, no database needed
+# exactly like CI's unit run: PG_TOOLS_COMMAND="" REQUIRE_BACKUP_TESTS=1 uv run pytest -m "not integration"
 ```
 
 **Change the database schema:**
@@ -357,7 +368,10 @@ default.
 
 **Optional database roles:** `scripts/db_roles.sql` and `scripts/db_login_passwords.sql`
 can create restricted logins (an API login that can never read article text). They are
-not used by default: everything connects with `DATABASE_URL`.
+not used by default: everything connects with `DATABASE_URL`. The one exception is an
+API started with `ENVIRONMENT=production`: it refuses to start without
+`API_DATABASE_URL` set to a `news_api_login` URL (see `.env.example` and
+[architecture 5.6](docs/architecture.md#56-owner-decision-database-on-neon-daily-ingest-on-github-actions-2026-11-25)).
 
 **Command exit codes** (useful in scripts): `0` ok · `1` something failed · `2` database
 not ready · `3` already running · `130` interrupted.

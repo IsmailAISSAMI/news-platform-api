@@ -5,6 +5,7 @@ interrupted run, deleted checkpoint, downtime beyond the feed's depth, page limi
 duplicates across feed and sitemap, malformed XML, invalid items, rights enforcement.
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -277,6 +278,26 @@ async def test_disabled_source_is_never_fetched(
     with pytest.raises(PolicyError):
         await run.rss()
     assert publisher.page_requests() == []
+
+
+async def test_rights_downgrade_is_logged_without_article_text(
+    publisher: Publisher, run: Runner, source: Source, caplog: pytest.LogCaptureFixture
+) -> None:
+    publisher.publish(*posts(1000, 2, NOW, step=timedelta(hours=1)))
+    source.rights_policy = "restricted"
+    source.rights_basis = ""  # no recorded basis: the gate falls back to metadata_only
+
+    with caplog.at_level(logging.WARNING, logger="app.ingestion.walk"):
+        await run.rss()
+
+    downgrades = [r for r in caplog.records if "rights downgraded" in r.getMessage()]
+    assert len(downgrades) == 2
+    message = downgrades[0].getMessage()
+    assert "restricted without a recorded rights_basis" in message
+    assert source.slug in message
+    assert "http" in message  # the article URL, for tracing
+    assert all("SYNTHETIC-FULL-BODY" not in r.getMessage() for r in caplog.records)
+    assert (await run.session.scalar(select(func.count()).select_from(ArticleBody))) == 0
 
 
 # --- News sitemap ----------------------------------------------------------------------------

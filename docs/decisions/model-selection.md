@@ -4,7 +4,7 @@
 > (Gemini API, free tier) on the same articles and chose Gemma 4 31B. See architecture
 > section 5.5.
 
-**Date:** 2026-11-23 · **Decision:** `qwen/qwen3.5-9b` (LM Studio, MLX 4-bit) · **Status:** adopted
+**Date:** 2026-11-23 · **Decision:** `qwen/qwen3.5-9b` (LM Studio, MLX 4-bit) · **Status:** superseded 2026-11-24 (architecture 5.5)
 
 ## Context
 

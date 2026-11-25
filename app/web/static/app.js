@@ -64,7 +64,7 @@ function statusChips(reportType, eventStatus, review) {
 function card(item) {
   const places = (item.places || []).slice(0, 3).map((p) => p.name_as_written);
   const actors = (item.actors || []).slice(0, 3).map((a) => a.full_name);
-  const source = item.source?.name || item.source_name || "original article";
+  const source = item.source?.name || "original article";
   return el("li", { class: "card" },
     el("div", { class: "meta" },
       el("time", { datetime: item.published_at }, formatPublished(item.published_at)),
@@ -172,12 +172,18 @@ function groupBy(items, key, order) {
   return [...groups].filter(([, v]) => v.length);
 }
 
-// Optional API field: panel keys whose content was not checked against the article.
+// Panel keys whose content was not checked against the article. `$.overview.*` paths
+// (the headline) map to "headline", which is shown as the page heading.
 let unverified = new Set();
 const UNVERIFIED = "Not checked against the article.";
 
 function panel(title, ...content) {
   return el("section", { class: "panel" }, el("h2", {}, title), note(title), ...content);
+}
+
+function unverifiedKey(path) {
+  const key = String(path).replace(/^\$\./, "").split(/[.[]/)[0].toLowerCase();
+  return key === "overview" ? "headline" : key;
 }
 
 function note(title) {
@@ -260,21 +266,21 @@ function detailView(id, token) {
   getJson(`/articles/${encodeURIComponent(id)}/briefing`).then((d) => {
     if (!current(token)) return;
     const b = d.briefing;
-    const fields = d.unverified_fields ?? b.unverified_fields;
-    unverified = new Set(Array.isArray(fields) ? fields.map((f) => String(f).replace(/^\$\./, "").split(/[.[]/)[0].toLowerCase()) : []);
+    unverified = new Set(Array.isArray(d.unverified_fields) ? d.unverified_fields.map(unverifiedKey) : []);
     const o = b.overview || {};
     document.title = `${o.headline || d.title} - Briefing`;
     const source = d.source?.name || "original article";
     const header = el("header", {},
       el("a", { href: "#/" }, "Back to briefings"),
       el("h1", {}, o.headline || d.title),
+      o.headline ? note("Headline") : null,
       el("div", { class: "meta" },
         el("span", {}, d.source?.name || ""),
         el("time", { datetime: d.published_at }, `Published ${formatPublished(d.published_at)}`),
         statusChips(o.report_type, o.event_status, d.review_required)),
-      outLink(d.source_url || d.url, `Open original article (${source})`, "origin"));
-    const banner = d.review_required ? el("div", { class: "banner", role: "note" },
-      `${d.removed_items} item(s) removed: their quotes could not be verified in the article.`) : null;
+      outLink(d.source_url, `Open original article (${source})`, "origin"));
+    const banner = d.removed_items > 0 ? el("div", { class: "banner", role: "note" },
+      `${d.removed_items} item(s) removed (unverified quotes or copied wording)`) : null;
     const why = list(b.why, (c) => [c.text, c.attributed_to
       ? el("span", { class: "attr" }, ` (according to ${c.attributed_to})`) : null]);
     const impact = list(b.impact, (i) => [el("strong", {}, `${label(i.area)}: `), i.text, " ",
@@ -292,7 +298,8 @@ function detailView(id, token) {
       collapsible("Context", [note("Context"), list(b.context, (s) => s)]),
       collapsible("Open questions", [note("Open questions"), list(b.open_questions, (s) => s)]),
       panel("Topics", b.topics?.length ? el("p", {}, b.topics.map((t) => [chip(t), " "])) : notStated()),
-      panel("Tone", b.tone ? el("p", {}, chip(label(b.tone.label)), " ", b.tone.explanation) : notStated())));
+      panel("Tone", b.tone && (b.tone.label || b.tone.explanation)
+        ? el("p", {}, b.tone.label ? [chip(label(b.tone.label)), " "] : null, b.tone.explanation) : notStated())));
   }).catch((error) => {
     if (!current(token)) return;
     show(true, errorView(error, () => detailView(id, nav), "No briefing exists for this article yet."));

@@ -16,6 +16,21 @@ class NotReadyError(Exception):
     """The environment cannot run ingestion. The message says how to fix it."""
 
 
+def refuse_pooled_host(host: str | None) -> None:
+    """Refuse a connection pooler host (Neon's `-pooler` endpoint).
+
+    Session advisory locks (one run at a time) do not hold through PgBouncer's
+    transaction pooling, so ingestion and analysis must use the direct endpoint.
+    """
+    if host and "-pooler" in host.lower():
+        msg = (
+            f"The database host {host!r} is a connection pooler: advisory locks do not "
+            "hold through it. Use Neon's direct endpoint (the host without `-pooler`) "
+            "in DATABASE_URL."
+        )
+        raise NotReadyError(msg)
+
+
 async def wait_for_database(
     engine: AsyncEngine,
     *,
@@ -24,7 +39,11 @@ async def wait_for_database(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> None:
-    """Retry briefly (Docker may still be starting), then give up with a clear message."""
+    """Retry briefly (Docker may still be starting), then give up with a clear message.
+
+    A pooler host is refused first, before any connection or advisory lock.
+    """
+    refuse_pooled_host(engine.url.host)
     deadline = clock() + timeout_s
     while True:
         try:

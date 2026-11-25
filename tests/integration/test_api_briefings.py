@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.analysis.briefing import make_briefing
 from app.analysis.pipeline import AnalyzeOptions, run_analyze
 from app.api.deps import get_db
-from app.models import Article, ArticleAnalysis, Source
+from app.models import Article, ArticleAnalysis, ArticleBody, Source
 from tests.integration.test_pipeline import (  # the pipeline test's synthetic publisher
     answer,
     factory,
@@ -157,6 +157,11 @@ async def test_briefings_are_paginated_newest_first(
     assert len(item["actors"]) == 3
     assert all(a["involvement"] == "central" for a in item["actors"])
     assert item["review_required"] is False
+    assert item["source"] == {
+        "slug": source.slug,
+        "name": source.name,
+        "site_url": source.site_url,
+    }
 
 
 async def test_limit_is_bounded_and_cursor_checked(client: httpx.AsyncClient) -> None:
@@ -358,3 +363,46 @@ async def test_if_none_match_star_returns_304(
     response = await client.get("/api/v1/briefings", headers={"If-None-Match": "*"})
 
     assert response.status_code == 304
+
+
+BODY_SENTINEL = "BODY-SENTINEL-MUST-NEVER-BE-SERVED"
+COPIED = "the synthetic council approved the new water plan for twelve rural communes"
+
+
+async def test_copied_scalars_and_stored_bodies_on_the_briefing_routes(
+    client: httpx.AsyncClient, db_session: AsyncSession, source: Source
+) -> None:
+    """IA-001 end to end, and TI-003: a briefing whose headline, main event and tone
+    explanation were nulled by the originality filter is still served (list and detail),
+    and the stored body never appears in either response."""
+    article = await add(db_session, source, 4, "succeeded", [])
+    paragraphs = [f"{BODY_SENTINEL} Yesterday {COPIED} after a long debate."]
+    db_session.add(
+        ArticleBody(article_id=article.id, body_text="\n\n".join(paragraphs), body_hash="h4")
+    )
+    data = cleaned(4)
+    data["overview"]["headline"] = f"Officials say {COPIED}"
+    data["what"]["main_event"] = f"Members said {COPIED}"
+    data["tone"]["explanation"] = f"Calm: {COPIED}"
+    analysis = (
+        await db_session.execute(
+            select(ArticleAnalysis).where(ArticleAnalysis.article_id == article.id)
+        )
+    ).scalar_one()
+    analysis.briefing = make_briefing(data, [], paragraphs=paragraphs)
+    await db_session.flush()
+
+    detail = await client.get(f"/api/v1/articles/{article.id}/briefing")
+    listed = await client.get("/api/v1/briefings", params={"limit": 100})
+
+    assert detail.status_code == 200
+    briefing = detail.json()["briefing"]
+    assert briefing["overview"]["headline"] is None
+    assert briefing["what"]["main_event"] is None
+    assert briefing["tone"]["explanation"] is None
+    assert detail.json()["copied_items"] == 3
+    mine = next(i for i in listed.json()["items"] if i["article_id"] == article.id)
+    assert mine["headline"] is None
+    for response in (detail, listed):
+        assert BODY_SENTINEL not in response.text
+        assert COPIED not in response.text

@@ -516,3 +516,127 @@ async def test_a_cancelled_request_is_recorded_and_its_slot_released() -> None:
     [row] = ledger.rows.values()
     assert (row["outcome"], row["error"]) == ("failed", "cancelled")
     assert (llm.budget.in_flight_this_run, llm.budget.used_this_run) == (0, 0)
+
+
+# --- recovery batch B2 / D2 (2026-11-25) --------------------------------------------------
+
+SENTINEL = "SENTINEL-ARTICLE-TEXT-7f3a"
+
+
+class Strict(BaseModel):
+    count: int
+
+
+async def test_invalid_output_error_never_contains_the_model_output() -> None:
+    """IA-011: the answer may echo article text; only locations and types are kept."""
+    llm = gemini(lambda _: reply(json.dumps({"count": SENTINEL})))
+
+    with pytest.raises(LLMOutputError) as caught:
+        await llm.structured(Strict, system="s", user="u")
+
+    assert SENTINEL not in str(caught.value)
+    assert "count: int_parsing" in str(caught.value)
+    assert caught.value.raw  # the raw answer stays on the exception for the private file
+
+
+async def test_an_unparseable_answer_reports_the_position_only() -> None:
+    llm = gemini(lambda _: reply(f"{{{SENTINEL}"))
+
+    with pytest.raises(LLMOutputError, match="JSONDecodeError at line 1") as caught:
+        await llm.structured(Strict, system="s", user="u")
+    assert SENTINEL not in str(caught.value)
+
+
+async def test_consecutive_network_errors_give_up_after_five() -> None:
+    """D2: an offline Mac stops instead of reserving its daily budget."""
+    calls = {"n": 0}
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectError("no network", request=request)
+
+    llm = gemini(chat)
+    with pytest.raises(LLMUnavailableError, match="5 network errors in a row"):
+        await llm.structured(Tiny, system="s", user="u")
+
+    assert calls["n"] == 5
+    [today] = await llm.ledger.totals(MODEL, 1)
+    assert (today.requests, today.busy, today.failed, today.pending) == (5, 4, 1, 0)
+    assert llm.budget.used_this_run == 0
+
+
+async def test_four_network_errors_are_still_waited_out() -> None:
+    calls = {"n": 0}
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= 4:
+            raise httpx.ConnectError("no network", request=request)
+        return reply('{"answer": "ok"}')
+
+    assert (await gemini(chat).structured(Tiny, system="s", user="u")).parsed == Tiny(answer="ok")
+    assert calls["n"] == 5
+
+
+async def test_a_google_answer_resets_the_network_error_count() -> None:
+    """Only CONSECUTIVE network errors count: a 503 in between proves the network works."""
+    script = ["net"] * 4 + ["503"] + ["net"] * 4 + ["ok"]
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        step = script.pop(0)
+        if step == "net":
+            raise httpx.ConnectError("no network", request=request)
+        if step == "503":
+            return httpx.Response(503, json=BUSY)
+        return reply('{"answer": "ok"}')
+
+    assert (await gemini(chat).structured(Tiny, system="s", user="u")).parsed == Tiny(answer="ok")
+    assert script == []
+
+
+async def test_timeouts_are_not_capped() -> None:
+    """Timeouts are Google's overload: they keep the wait-until-answered behavior."""
+    calls = {"n": 0}
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] <= 8:
+            raise httpx.ReadTimeout("slow", request=request)
+        return reply('{"answer": "ok"}')
+
+    assert (await gemini(chat).structured(Tiny, system="s", user="u")).parsed == Tiny(answer="ok")
+    assert calls["n"] == 9
+
+
+async def test_connect_timeouts_count_as_network_errors() -> None:
+    """D2 (review): an offline Mac whose connections time out (no route, captive Wi-Fi)
+    must also stop after five, not wait forever like Google's overload."""
+    calls = {"n": 0}
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        raise httpx.ConnectTimeout("no route", request=request)
+
+    llm = gemini(chat)
+    with pytest.raises(LLMUnavailableError, match="5 network errors in a row"):
+        await llm.structured(Tiny, system="s", user="u")
+
+    assert calls["n"] == 5
+
+
+async def test_a_read_timeout_does_not_reset_the_network_error_count() -> None:
+    """Only an HTTP answer proves the network works; a timeout proves nothing."""
+    script = ["net"] * 4 + ["slow"] + ["net"]
+    calls = {"n": 0}
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        step = script.pop(0)
+        if step == "slow":
+            raise httpx.ReadTimeout("slow", request=request)
+        raise httpx.ConnectError("no network", request=request)
+
+    with pytest.raises(LLMUnavailableError, match="5 network errors in a row"):
+        await gemini(chat).structured(Tiny, system="s", user="u")
+
+    assert calls["n"] == 6

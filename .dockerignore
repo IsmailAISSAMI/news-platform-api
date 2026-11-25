@@ -11,3 +11,10 @@ __pycache__
 .ruff_cache
 .coverage
 tests
+*.nosync
+* [0-9]
+* [0-9].*
+.coverage*
+engineering
+docs
+.claude

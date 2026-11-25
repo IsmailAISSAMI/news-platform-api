@@ -575,8 +575,8 @@ def format_report(report: RunReport, *, elapsed_s: float) -> str:
             r = feed.result
             lines.append(
                 f"{label} +{r.items_new} new, {r.items_updated} updated, "
-                f"{r.items_skipped} skipped, {r.pages_fetched} page(s) "
-                f"[{r.stop_reason}]"
+                f"{r.items_unchanged} unchanged, {r.items_skipped} skipped, "
+                f"{r.pages_fetched} page(s) [{r.stop_reason}]"
             )
             if not r.complete:
                 lines.append(f"{'':<32} incomplete: run again to continue the gap")
@@ -585,7 +585,7 @@ def format_report(report: RunReport, *, elapsed_s: float) -> str:
             lines.append(f"{'':<32} not covered by RSS: {since} to {until} (archive backlog)")
     lines.append(
         f"Total: +{report.total('items_new')} new, {report.total('items_updated')} updated, "
-        f"{report.total('pages_fetched')} page(s)"
+        f"{report.total('items_unchanged')} unchanged, {report.total('pages_fetched')} page(s)"
     )
     return "\n".join(lines) + "\n"
 

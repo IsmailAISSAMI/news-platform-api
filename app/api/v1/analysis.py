@@ -7,8 +7,10 @@ versions, the most recently updated briefing is served.
 
 The list uses the same keyset pagination as the catalog: (published_at DESC, id DESC).
 The query walks articles in that order (the `ix_articles_published_at_id` index) and joins
-each one LATERALly to its latest briefing, so a page costs about `limit` index probes
-instead of sorting every briefing first.
+each one LATERALly to its latest briefing. An extra `id IN (briefed articles)` semi-join
+lets the planner skip unbriefed articles with a cheap index-only probe of the briefings
+partial index. Measured on 20k synthetic articles (PA-004): 1 % briefed went from 8,083
+buffers / 47 ms to 2,205 / 2 ms per page; 100 % briefed costs 112 buffers / 0.3 ms.
 
 A stored briefing that no longer matches the response schema is skipped (list) or
 answered 404 (detail), and logged by article id only, never by content.
@@ -83,7 +85,11 @@ async def list_briefings(
         )
     rows = (await db.execute(stmt.limit(limit + 1))).all()
     page = rows[:limit]
-    items = [item for row in page if (item := _summary(row.Article, row.briefing)) is not None]
+    items = [
+        item
+        for row in page
+        if (item := _summary(row.Article, row.Source, row.briefing)) is not None
+    ]
     last = page[-1].Article if page else None
     next_cursor = _encode_cursor(last.published_at, last.id) if len(rows) > limit and last else None
     return cached_json(request, Page[BriefingSummary](items=items, next_cursor=next_cursor))
@@ -111,7 +117,7 @@ async def get_briefing(request: Request, db: DbSession, article_id: ArticleId) -
         title=article.title,
         source_url=article.canonical_url,
         published_at=article.published_at,
-        source=BriefingSource(slug=source.slug, name=source.name, site_url=source.site_url),
+        source=_source(source),
         analyzer_version=row.analyzer_version,
         status=row.status,
         review_required=data.get("review_required") is True,
@@ -148,6 +154,10 @@ def _briefing_query() -> Select[Any]:
         .select_from(Article)
         .join(latest, true())
         .join(Source, Article.source_id == Source.id)
+        # Redundant with the inner LATERAL join, but visible to the planner as a semi-join:
+        # unbriefed articles are rejected by an index-only probe of the briefings partial
+        # index instead of a full LATERAL subquery each (PA-004).
+        .where(Article.id.in_(select(view.article_id)))
         .order_by(Article.published_at.desc(), Article.id.desc())
     )
 
@@ -172,7 +182,11 @@ def _strings(value: Any) -> list[str]:
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
 
-def _summary(article: Article, data: Any) -> BriefingSummary | None:
+def _source(source: Source) -> BriefingSource:
+    return BriefingSource(slug=source.slug, name=source.name, site_url=source.site_url)
+
+
+def _summary(article: Article, source: Source, data: Any) -> BriefingSummary | None:
     briefing = _parse(article.id, data)
     if briefing is None:
         return None
@@ -183,6 +197,7 @@ def _summary(article: Article, data: Any) -> BriefingSummary | None:
         title=article.title,
         canonical_url=article.canonical_url,
         published_at=article.published_at,
+        source=_source(source),
         headline=briefing.overview.headline,
         report_type=briefing.overview.report_type,
         event_status=briefing.overview.event_status,

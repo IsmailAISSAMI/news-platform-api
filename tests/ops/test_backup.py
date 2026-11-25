@@ -1,7 +1,9 @@
 """Backup bookkeeping, without a database or Docker."""
 
+import asyncio
 import os
 import stat
+import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10,9 +12,11 @@ import pytest
 
 from app.core.config import Settings
 from app.ops.backup import (
+    REMOTE_TOOLS_PREFIX,
     BackupError,
     Manifest,
     PgTools,
+    _counts_via_psql,
     _run,
     _run_from_file,
     _run_to_file,
@@ -21,7 +25,9 @@ from app.ops.backup import (
     list_backups,
     manifest_path_for,
     prune,
+    restore_target,
     sha256_of,
+    verify_backup,
 )
 
 NOW = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
@@ -169,3 +175,138 @@ def test_successful_tool_writes_its_output(tmp_path: Path) -> None:
 
     assert target.read_bytes() == b"data"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+# --- D3: a remote (Neon) dump is restored into the local compose container ----------------
+
+REMOTE_URL = (
+    "postgresql+psycopg://owner:test-only-password@ep-x.example.neon.tech/neondb?sslmode=require"
+)
+LOCAL_PREFIX = ["docker", "compose", "exec", "-T", "db"]
+
+
+class FakeRun:
+    """Stands in for subprocess.run: records every argv, answers printenv and psql."""
+
+    def __init__(self, *, container_up: bool = True) -> None:
+        self.calls: list[tuple[list[str], dict[str, str] | None]] = []
+        self.container_up = container_up
+
+    def __call__(self, argv: list[str], **kwargs: object) -> "subprocess.CompletedProcess[bytes]":
+        env = kwargs.get("env")
+        self.calls.append((list(argv), env if isinstance(env, dict) else None))
+        if "printenv" in argv:
+            if not self.container_up:
+                return subprocess.CompletedProcess(argv, 1, b"", b"service db is not running")
+            return subprocess.CompletedProcess(argv, 0, b"news\n", b"")
+        if "psql" in argv:
+            return subprocess.CompletedProcess(argv, 0, b"articles|3\nsources|1\n", b"")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+
+def test_remote_dump_runs_in_a_throwaway_container_without_secrets_in_argv() -> None:
+    tools = PgTools.from_settings(settings_with(REMOTE_URL))
+
+    assert tools.is_remote
+    assert tools.dump()[: len(REMOTE_TOOLS_PREFIX)] == list(REMOTE_TOOLS_PREFIX)
+    assert "test-only-password" not in " ".join(tools.dump())
+    env = tools.env()
+    assert env is not None
+    assert env["PGPASSWORD"] == "test-only-password"
+    assert env["PGSSLMODE"] == "require"
+
+
+def test_remote_dump_is_restored_into_the_local_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_with(REMOTE_URL)
+    tools = PgTools.from_settings(settings)
+    dump = make_backup(tmp_path, NOW)
+    backup = list_backups(tmp_path)[0]
+    assert backup.dump == dump
+    fake = FakeRun()
+    monkeypatch.setattr("app.ops.backup.subprocess.run", fake)
+
+    result = asyncio.run(verify_backup(backup, tools, settings, now=NOW))
+
+    assert result.ok
+    argvs = [argv for argv, _ in fake.calls]
+    assert argvs[0] == [*LOCAL_PREFIX, "printenv", "POSTGRES_USER"]
+    for argv, env in fake.calls:
+        assert argv[: len(LOCAL_PREFIX)] == LOCAL_PREFIX  # never the remote container
+        assert "-h" not in argv
+        assert "ep-x.example.neon.tech" not in argv
+        assert "test-only-password" not in " ".join(argv)
+        assert env is None  # the local socket needs no password
+    assert argvs[1] == [
+        *LOCAL_PREFIX,
+        "dropdb",
+        "-U",
+        "news",
+        "--if-exists",
+        "neondb_restore_check",
+    ]
+    assert argvs[2] == [*LOCAL_PREFIX, "createdb", "-U", "news", "neondb_restore_check"]
+    assert argvs[3][len(LOCAL_PREFIX)] == "pg_restore"
+    assert argvs[4][len(LOCAL_PREFIX)] == "psql"
+    assert argvs[-1] == argvs[1]  # the scratch database is dropped afterwards
+
+
+def test_restore_test_fails_clearly_when_the_local_container_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_with(REMOTE_URL)
+    make_backup(tmp_path, NOW)
+    fake = FakeRun(container_up=False)
+    monkeypatch.setattr("app.ops.backup.subprocess.run", fake)
+
+    with pytest.raises(BackupError, match="docker compose up -d db"):
+        asyncio.run(
+            verify_backup(
+                list_backups(tmp_path)[0], PgTools.from_settings(settings), settings, now=NOW
+            )
+        )
+    assert len(fake.calls) == 1  # nothing created anywhere
+
+
+def test_unreachable_docker_is_reported_as_the_local_container_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr("app.ops.backup.subprocess.run", missing)
+    settings = settings_with(REMOTE_URL)
+
+    with pytest.raises(BackupError, match="local Docker `db` container"):
+        restore_target(PgTools.from_settings(settings), settings)
+
+
+def test_ci_host_mode_and_local_socket_restore_on_the_same_server() -> None:
+    host = settings_with("postgresql+psycopg://u:test-only-password@h/db", tools="")
+    local = settings_with("postgresql+psycopg://news:test-only-password@localhost:5433/news")
+
+    for settings in (host, local):
+        tools = PgTools.from_settings(settings)
+        assert not tools.is_remote
+        assert restore_target(tools, settings) is tools
+    host_tools = PgTools.from_settings(host)
+    assert host_tools.restore("db_restore_check")[:5] == [
+        "pg_restore", "-U", "u", "-h", "h"
+    ]  # fmt: skip
+
+
+def test_counts_via_psql_parses_rows_and_reports_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tools = PgTools(tuple(LOCAL_PREFIX), "news", "neondb")
+    monkeypatch.setattr("app.ops.backup.subprocess.run", FakeRun())
+
+    assert _counts_via_psql(tools, "x") == {"articles": 3, "sources": 1}
+
+    monkeypatch.setattr(
+        "app.ops.backup.subprocess.run",
+        lambda argv, **_: subprocess.CompletedProcess(argv, 2, b"", b"ERROR: boom"),
+    )
+    with pytest.raises(BackupError, match="psql failed: ERROR: boom"):
+        _counts_via_psql(tools, "x")

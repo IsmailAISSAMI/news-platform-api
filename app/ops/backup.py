@@ -6,6 +6,10 @@
   then rename atomically and write a JSON manifest beside it. Old backups beyond `keep` are pruned.
 - `verify_backup`: check the checksum, restore into a scratch database, compare every
   table's row count with the manifest, mark the manifest verified, drop the scratch DB.
+  A dump of a remote server (Neon) is restored into the LOCAL compose `db` container,
+  never on the remote server (owner decision D3: no second copy of article text and no
+  doubled storage on Neon). Otherwise (local socket, or host tools in CI) the scratch
+  database lives on the same server as before.
 
 The live database is only ever read. Secrets never reach a command line or a log line:
 the pg tools run inside the local db container over its socket; for a remote server
@@ -169,6 +173,17 @@ class PgTools:
     def drop_db(self, name: str) -> list[str]:
         return [*self.prefix, "dropdb", *self._conn, "--if-exists", name]
 
+    @property
+    def is_remote(self) -> bool:
+        """A remote server reached by the throwaway container (Neon)."""
+        return self.prefix == REMOTE_TOOLS_PREFIX
+
+    def psql(self, name: str, sql: str) -> list[str]:
+        return [
+            *self.prefix, "psql", *self._conn, "-d", name,
+            "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql,
+        ]  # fmt: skip
+
     def restore(self, name: str) -> list[str]:
         return [
             *self.prefix,
@@ -281,14 +296,18 @@ async def verify_backup(
         raise BackupError(msg)
 
     scratch = tools.scratch_database
-    env = tools.env()
-    await asyncio.to_thread(_run, tools.drop_db(scratch), env)
-    await asyncio.to_thread(_run, tools.create_db(scratch), env)
+    target = await asyncio.to_thread(restore_target, tools, settings)
+    env = target.env()
+    await asyncio.to_thread(_run, target.drop_db(scratch), env)
+    await asyncio.to_thread(_run, target.create_db(scratch), env)
     try:
-        await asyncio.to_thread(_run_from_file, tools.restore(scratch), backup.dump, env)
-        restored = await _counts_in(settings, scratch)
+        await asyncio.to_thread(_run_from_file, target.restore(scratch), backup.dump, env)
+        if target is tools:
+            restored = await _counts_in(settings, scratch)
+        else:
+            restored = await asyncio.to_thread(_counts_via_psql, target, scratch)
     finally:
-        await asyncio.to_thread(_run, tools.drop_db(scratch), env)
+        await asyncio.to_thread(_run, target.drop_db(scratch), env)
 
     result = VerifyResult(backup)
     for table, expected in backup.manifest.row_counts.items():
@@ -300,6 +319,50 @@ async def verify_backup(
         await asyncio.to_thread(_write_private, backup.manifest_path, verified.to_json())
         result.backup = Backup(backup.dump, verified)
     return result
+
+
+LOCAL_DB_DOWN = (
+    "restore-test restores into the local Docker `db` container (never on the remote "
+    "server), and it is not reachable: start it with `docker compose up -d db`"
+)
+COUNTS_SQL = (
+    "SELECT tablename || '|' || (xpath('/row/c/text()', query_to_xml(format("
+    "'SELECT count(*) AS c FROM %I.%I', schemaname, tablename), false, true, '')))[1]::text "
+    "FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+)
+
+
+def restore_target(tools: PgTools, settings: Settings) -> PgTools:
+    """Where the scratch restore runs. A remote dump goes to the local compose `db`
+    container over its socket (the user is read from the container, no password);
+    anything else stays on the same server as the dump (`tools` itself)."""
+    if not tools.is_remote:
+        return tools
+    local = tuple(shlex.split(settings.pg_tools_command))
+    try:
+        completed = subprocess.run(  # noqa: S603  # fixed argv
+            [*local, "printenv", "POSTGRES_USER"], capture_output=True, check=False, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise BackupError(LOCAL_DB_DOWN) from exc
+    user = completed.stdout.decode().strip()
+    if completed.returncode != 0 or not user:
+        raise BackupError(LOCAL_DB_DOWN)
+    return PgTools(local, user, tools.database)
+
+
+def _counts_via_psql(tools: PgTools, database: str) -> dict[str, int]:
+    completed = subprocess.run(  # noqa: S603  # fixed argv
+        tools.psql(database, COUNTS_SQL), capture_output=True, check=False, env=tools.env()
+    )
+    if completed.returncode != 0:
+        raise BackupError(_failure(tools.psql(database, ""), completed.stderr))
+    counts: dict[str, int] = {}
+    for line in completed.stdout.decode().splitlines():
+        if line.strip():
+            table, _, count = line.rpartition("|")
+            counts[table] = int(count)
+    return counts
 
 
 async def _counts_in(settings: Settings, database: str) -> dict[str, int]:
@@ -408,6 +471,6 @@ def _run_from_file(argv: list[str], source: Path, env: dict[str, str] | None = N
 
 
 def _failure(argv: list[str], stderr: bytes) -> str:
-    tool = next((a for a in argv if a.startswith(("pg_", "createdb", "dropdb"))), argv[0])
+    tool = next((a for a in argv if a.startswith(("pg_", "createdb", "dropdb", "psql"))), argv[0])
     detail = stderr.decode(errors="replace").strip().splitlines()
     return f"{tool} failed: {detail[-1] if detail else 'no error output'}"

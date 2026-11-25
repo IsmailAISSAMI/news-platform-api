@@ -14,14 +14,16 @@ class _Out(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
 
+# Scalar fields outside any list may be null: the originality filter nulls a copied one
+# (app/analysis/briefing.py). A null must not make the whole briefing invalid.
 class OverviewOut(_Out):
-    headline: str
-    report_type: str
-    event_status: str
+    headline: str | None
+    report_type: str | None
+    event_status: str | None
 
 
 class WhatOut(_Out):
-    main_event: str
+    main_event: str | None
     secondary_events: list[str] = []
 
 
@@ -73,8 +75,8 @@ class ImpactOut(_Out):
 
 
 class ToneOut(_Out):
-    label: str
-    explanation: str
+    label: str | None
+    explanation: str | None
 
 
 class BriefingOut(_Out):
@@ -144,9 +146,10 @@ class BriefingSummary(_Out):
     title: str
     canonical_url: str = Field(description="Link to the original article (always link out).")
     published_at: datetime
-    headline: str
-    report_type: str
-    event_status: str
+    source: BriefingSource = Field(description="The publisher (attribution).")
+    headline: str | None
+    report_type: str | None
+    event_status: str | None
     event_date: str | None
     places: list[BriefingPlace] = Field(description="Up to 3, event locations first.")
     actors: list[BriefingActor] = Field(description="Up to 3, central actors first.")

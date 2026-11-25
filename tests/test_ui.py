@@ -166,3 +166,29 @@ def test_event_handlers_are_allowlisted() -> None:
 
 def test_light_theme_exists() -> None:
     assert "@media (prefers-color-scheme: light)" in _js("style.css")
+
+
+def test_cards_name_the_publisher_from_the_api_source() -> None:
+    app_js = _js("app.js")
+    card = app_js[app_js.index("function card(") : app_js.index("function matches(")]
+    assert "item.source?.name" in card
+    assert "source_name" not in app_js  # dead fallback (IA-006)
+
+
+def test_unverified_overview_paths_mark_the_headline() -> None:
+    app_js = _js("app.js")
+    assert 'key === "overview" ? "headline"' in app_js
+    assert 'note("Headline")' in app_js
+
+
+def test_no_dead_fallbacks_for_fields_the_api_never_sends() -> None:
+    app_js = _js("app.js")
+    assert "b.unverified_fields" not in app_js
+    assert "d.url" not in app_js
+
+
+def test_removal_banner_covers_quotes_and_copied_wording() -> None:
+    app_js = _js("app.js")
+    assert "d.removed_items > 0 ?" in app_js
+    assert "item(s) removed (unverified quotes or copied wording)" in app_js
+    assert "could not be verified in the article" not in app_js

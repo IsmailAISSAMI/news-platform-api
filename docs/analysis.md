@@ -61,6 +61,12 @@ unknown. Quality means accuracy and traceability, not fluent summaries.
 
 ---
 
+> **Historical design (2026-11-23).** Sections 0, 1, 2, 7 and 8 below were written for
+> LM Studio, which was retired on 2026-11-24 (architecture section 5.5). They are kept
+> as the record of the design and its measurements. Today: the Gemini API, the model set
+> by `GEMINI_MODEL` (allowlist: `gemma-4-31b-it`), concurrency up to 8, readiness =
+> database up and migrated (no LM Studio check).
+
 ## 0. Audit of the specification
 
 **Adopted as written:**
@@ -84,7 +90,7 @@ unknown. Quality means accuracy and traceability, not fluent summaries.
 | 4 | Separate tables for events, claims, entities, locations, timelines and topics | Premature normalization: many tables to migrate whenever the schema evolves | The **full validated JSON per (article, analysis version)** is the source of truth. **Normalized tables only where queries need them:** entities, places and their article links (for "who", "where" and the map). Claims, timeline and topics stay in JSON, indexed with GIN, and are normalized later if a real query needs it. |
 | 5 | Country-specific hierarchies for every country | Not justified by the data: Morocco is the focus, and other countries appear mostly by name | Morocco gets full region / province-prefecture / commune resolution. Other countries get country plus first-level division from the same gazetteer. |
 | 6 | Geography coverage | Geography coverage: the owner has chosen a rights-safe approach; details are kept in the owner's private notes. | Section 5.3: Option A / Option B (details in owner's private notes) |
-| 7 | "Remove the losing model from dependencies" | Models are not code dependencies; they live in LM Studio's storage | The code knows one model through `LLM_MODEL`. Deleting the other model's files is the owner's choice, in LM Studio. |
+| 7 | "Remove the losing model from dependencies" | Models are not code dependencies; they live in LM Studio's storage | The code knows one model through `LLM_MODEL` (historical; today `GEMINI_MODEL`). Deleting the other model's files is the owner's choice, in LM Studio. |
 | 8 | Human evaluation of about 30 articles against the full schema | That is realistically **5–8 hours** of careful work, not 1 | 30 articles across categories, evaluated on **core fields first**, plus a smaller extended-field check. The time is stated upfront. |
 | 9 | An "editable evaluation file containing the article text" | The repo is **public**, so committed evaluation files would publish article text | Evaluation files live **outside the repo** (`~/news-eval/`). Only aggregate scores and the decision record are committed. |
 | 10 | "Bounded concurrency" | LM Studio serves one loaded model on a 16 GB Mac, so parallel requests mostly queue | Concurrency 1 by default, configurable. Resumable batch runs instead. |
@@ -139,7 +145,7 @@ news analyze ── readiness: LM Studio up? model loaded? DB migrated?
      accuracy, geographic accuracy, hallucination rate.
 - **Selection rule:** first, the model with fewer hallucinations and unsupported
   claims. Then completeness. Speed only breaks ties.
-- **After the evaluation:** the winner's id goes in `LLM_MODEL`, and the decision record
+- **After the evaluation:** the winner's id goes in `LLM_MODEL` (historical; today `GEMINI_MODEL`), and the decision record
   (`docs/decisions/model-selection.md`: date, scores, model fingerprints) is committed.
 - **Not built:** no multi-model pipeline and no comparison dashboard. The evaluation is a
   one-off script.

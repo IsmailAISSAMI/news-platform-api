@@ -321,6 +321,15 @@ async def _save(
     except InvalidItemError as exc:
         result.skip(str(exc))
         return None
+    if decision.downgrade_reason is not None:
+        # Reason, source and URL only: never article text.
+        logger.warning(
+            "rights downgraded to %s for source %s (%s): %s",
+            decision.effective_policy,
+            ctx.source.slug,
+            decision.record.canonical_url,
+            decision.downgrade_reason,
+        )
     try:
         async with ctx.session.begin_nested():
             outcome = await save_article(

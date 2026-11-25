@@ -52,7 +52,6 @@ CEILINGS = {
     "concurrency": 8,
 }
 LAB_PER_RUN_CEILING = CEILINGS["lab_per_run"]
-CONCURRENCY_CEILING = CEILINGS["concurrency"]
 # Fields of RequestBudget checked against CEILINGS.
 _BUDGET_FIELDS = ("per_run", "per_day", "per_minute", "input_tokens_per_minute")
 # Pause added to a per-minute wait so the oldest request has surely left the window.

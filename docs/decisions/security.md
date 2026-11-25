@@ -9,6 +9,10 @@
   separate decision recorded in this file.
 - **Why:** the Mac is not always online, PostgreSQL is never exposed to the internet
   (`CLAUDE.md`), and the API has no authentication layer.
+- *Note (2026-11-25):* since architecture section 5.6 the database is on Neon and is
+  reachable from the internet (TLS and passwords). The local Docker database is for
+  tests only and stays bound to localhost. S1 itself is unchanged: the API still binds
+  to `127.0.0.1`.
 - **Open:** no authentication exists. Before any exposure, the owner decides on
   authentication and records it here. Next step: none until then.
 

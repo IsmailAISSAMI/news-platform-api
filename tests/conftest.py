@@ -97,3 +97,17 @@ def client(app: FastAPI) -> Iterator[TestClient]:
     # The context manager runs the app lifespan (engine start/stop).
     with TestClient(app) as test_client:
         yield test_client
+
+
+# CI sets these for the whole job (BC-002); only integration tests may see them, so a unit
+# test behaves the same locally and in CI.
+CI_ONLY_ENV = ("PG_TOOLS_COMMAND", "REQUIRE_BACKUP_TESTS")
+
+
+@pytest.fixture(autouse=True)
+def _unit_tests_ignore_ci_env(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if request.node.get_closest_marker("integration") is None:
+        for name in CI_ONLY_ENV:
+            monkeypatch.delenv(name, raising=False)

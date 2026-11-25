@@ -3,7 +3,8 @@ services:
   # for the test suite only: tests create `<db>_test` here (TEST_DATABASE_URL) and never
   # touch Neon.
   db:
-    image: postgres:18-alpine
+    # Same digest as .github/workflows/ci.yml; bump both together.
+    image: postgres:18-alpine@sha256:1018733457011bf88d81db98cf43aac6d5150afc18787dbe204771fedf80ff95
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}

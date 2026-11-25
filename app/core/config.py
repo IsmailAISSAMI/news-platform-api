@@ -7,6 +7,7 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.analysis.budget import CEILINGS
+from app.analysis.llm import GEMINI_BASE_URL
 
 
 def _package_version() -> str:
@@ -51,7 +52,8 @@ class Settings(BaseSettings):
     # docs/architecture.md 5.5). The Google project must have no billing account: then
     # going over a Google limit is refused (HTTP 429) and nothing can ever be charged.
     gemini_api_key: SecretStr | None = None
-    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    # Default comes from the one allowed endpoint; the client refuses any other value.
+    gemini_base_url: str = GEMINI_BASE_URL
     gemini_model: str = "gemma-4-31b-it"
     # Our limits keep 1/3 of every Google limit unused. They can only be LOWERED:
     # the code refuses values above the ceilings in app/analysis/budget.py.

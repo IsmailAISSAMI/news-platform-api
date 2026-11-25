@@ -1,10 +1,4 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.6
-    hooks:
-      - id: ruff-check
-        args: [--fix]
-      - id: ruff-format
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
@@ -20,6 +14,17 @@ repos:
       - id: gitleaks
   - repo: local
     hooks:
+      # ruff runs from uv.lock (one version locally and in CI).
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
       - id: repo-hygiene
         name: repository hygiene
         # Scans the staged content (what will be committed). CI runs the full-tree scan.

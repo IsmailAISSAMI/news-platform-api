@@ -7,10 +7,14 @@ Article text is sent to Google. Safeguards, all enforced here:
 - no tools, grounding, caching or other options that can be billed: the payload is
   built here and nothing can be added to it;
 - HTTP 429 (quota) stops the run, with no retry;
-- "high demand" errors (503, and 500/502/504, timeouts, no network) are EXPECTED on
-  the free tier: the same request is tried again after 10, 20, 30, then every 60
-  seconds, until Google answers. Every attempt is reserved in the ledger, so the daily
-  limit stays the absolute stop. Each attempt is logged with today's counts.
+- "high demand" errors (503, and 500/502/504, read/write timeouts) are EXPECTED on the
+  free tier: the same request is tried again after 10, 20, 30, then every 60 seconds,
+  until Google answers. Every attempt is reserved in the ledger, so the daily limit stays
+  the absolute stop. Each attempt is logged with today's counts;
+- network errors (no network, connection refused, dropped or timed out while
+  connecting) are retried the same way, but only up to `MAX_TRANSPORT_ERRORS` in a row
+  for one request, counted until Google answers: an offline Mac stops instead of
+  reserving its daily budget (owner decision D2, 2026-11-25).
 """
 
 import asyncio
@@ -20,7 +24,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 from pydantic import BaseModel, SecretStr, ValidationError
@@ -48,6 +52,9 @@ MAX_ADMISSION_ROUNDS = 100
 TRANSIENT_STATUSES = frozenset({500, 502, 503, 504})
 # Pauses between attempts; the last one repeats until Google answers.
 RETRY_PAUSES_S = (10.0, 20.0, 30.0, 60.0)
+# Consecutive network errors (not timeouts, not HTTP answers) for ONE request before it
+# is given up (owner decision D2). Lowering it is allowed; raising it is not.
+MAX_TRANSPORT_ERRORS = 5
 # Models allowed to run: free-tier only, as listed on the owner's AI Studio page.
 FREE_MODELS = frozenset({"gemma-4-31b-it"})
 
@@ -203,7 +210,7 @@ class GeminiClient:
             await self.ledger.record(
                 reservation, "failed", prompt_tokens, completion_tokens, "invalid output"
             )
-            msg = f"invalid output: {type(exc).__name__}: {str(exc)[:300]}"
+            msg = f"invalid output: {_error_summary(exc)}"
             raise LLMOutputError(msg, raw) from exc
         await self.ledger.record(reservation, "answered", prompt_tokens, completion_tokens)
         return Completion(
@@ -225,6 +232,7 @@ class GeminiClient:
         attempt that was answered; its outcome is recorded by the caller.
         """
         attempt = 0
+        transport_errors = 0  # consecutive, for this request only
         tokens = estimate_tokens(content)
         while True:
             attempt += 1
@@ -238,15 +246,22 @@ class GeminiClient:
                         headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
                         timeout=900,
                     )
-                except httpx.TransportError:
-                    # Too slow, offline, or the server dropped the connection mid-answer
-                    # (RemoteProtocolError): all worth waiting for, never a crash of the run.
+                except httpx.TransportError as exc:
+                    # A slow answer is Google's overload: waited out like a 503, and it
+                    # does not reset the network-error count (only an answer does).
+                    # Network errors are waited for, but only a few times in a row.
                     response = None
+                    if _is_network_error(exc):
+                        transport_errors += 1
+                        if transport_errors >= MAX_TRANSPORT_ERRORS:
+                            await self._give_up_offline(reservation, transport_errors, exc)
                 except asyncio.CancelledError:
                     # Ctrl-C or a stopped worker: the request may have reached Google.
                     await self._finish(reservation, "failed", None, None, error="cancelled")
                     raise
                 duration = time.monotonic() - started
+                if response is not None:
+                    transport_errors = 0  # Google answered: the network works
                 if response is not None and response.status_code == httpx.codes.OK:
                     self._busy_streak = 0
                     self.budget.settle_run_slot(answered=True)  # any HTTP 200 uses the slot
@@ -335,6 +350,18 @@ class GeminiClient:
                 self._probe_done.clear()
             return reservation, self.budget.pace(tokens), probe
 
+    async def _give_up_offline(
+        self, reservation: int, count: int, exc: httpx.TransportError
+    ) -> NoReturn:
+        """Too many network errors in a row: record the last attempt and stop (D2)."""
+        kind = type(exc).__name__
+        await self._finish(reservation, "failed", None, None, error=f"network error ({kind})")
+        msg = (
+            f"{self.model}: {count} network errors in a row ({kind}); giving up. "
+            "Check the connection."
+        )
+        raise LLMUnavailableError(msg) from exc
+
     async def _finish(  # the outcome's fields
         self,
         reservation: int,
@@ -347,6 +374,34 @@ class GeminiClient:
         """Record how a request that Google did not answer ended; release its slot."""
         self.budget.settle_run_slot(answered=False)
         await self.ledger.record(reservation, outcome, input_tokens, output_tokens, error)
+
+
+def _is_network_error(exc: httpx.TransportError) -> bool:
+    """No working connection to Google (capped, D2), as opposed to a slow answer.
+
+    Connect and pool timeouts mean the connection was never made (no route, captive
+    Wi-Fi), so they count with refused or dropped connections; read and write timeouts
+    happen once connected and are Google's overload, waited out like a 503.
+    """
+    if isinstance(exc, httpx.ConnectTimeout | httpx.PoolTimeout):
+        return True
+    return not isinstance(exc, httpx.TimeoutException)
+
+
+def _error_summary(exc: json.JSONDecodeError | ValidationError) -> str:
+    """Why the output was invalid, without any of the output itself.
+
+    The model's answer can echo article text, which must never reach logs or the
+    database, so a ValidationError is reduced to error locations and types only.
+    """
+    if isinstance(exc, ValidationError):
+        parts = [
+            f"{'.'.join(str(p) for p in err['loc']) or '<root>'}: {err['type']}"
+            for err in exc.errors(include_input=False, include_url=False, include_context=False)
+        ]
+        return f"ValidationError: {exc.error_count()} error(s): {'; '.join(parts)}"[:300]
+    # Position only (line, column), never the text.
+    return f"JSONDecodeError at line {exc.lineno} column {exc.colno}"
 
 
 def _input_tokens(response: httpx.Response) -> int | None:

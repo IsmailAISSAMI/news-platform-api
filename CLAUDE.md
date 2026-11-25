@@ -1,13 +1,13 @@
 # CLAUDE.md
 
 Personal news-intelligence platform. An ingestion command (`news ingest`), run daily by
-GitHub Actions or by hand, collects articles from publishers into PostgreSQL on **Neon**. A read-only FastAPI API serves
-them to a web frontend. Content analysis comes later. First source: **Hespress English**
+GitHub Actions or by hand, collects articles from publishers into PostgreSQL on **Neon**. A read-only FastAPI API
+serves them and AI briefings (`news analyze`, Gemini) to a web screen. First source: **Hespress English**
 (`https://en.hespress.com`).
 
 Constraints: **$0 infrastructure** (no paid services; no free tier as a dependency
-except **Neon**, owner decision 2026-11-25, architecture section 5.6), and the Mac is
-**not always online**. The approved design,
+except **Neon**, owner decision 2026-11-25, architecture section 5.6). The Mac is
+**not always online**, which is why ingest runs on GitHub. The approved design,
 verified source facts, rights model and roadmap are in
 [docs/architecture.md](docs/architecture.md). Read it before working on ingestion, the
 schema or the API. **Each roadmap milestone needs the owner's approval before it starts.**
@@ -29,6 +29,7 @@ uv run uvicorn app.main:app --reload      # API (port 8000; may be taken locally
 uv run ruff check --fix . && uv run ruff format .
 uv run mypy app tests alembic
 uv run pytest -m "not integration"        # fast, no DB
+PG_TOOLS_COMMAND="" REQUIRE_BACKUP_TESTS=1 uv run pytest -m "not integration"   # as CI runs it
 uv run pytest                             # full suite: local db container + TEST_DATABASE_URL
 uv run alembic revision --autogenerate -m "..." && uv run alembic upgrade head
 uv run alembic check                      # models and migrations must be in sync
@@ -104,20 +105,25 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - **AI analysis runs on Gemma 4 31B via the Gemini API, free tier only (owner
     decision, 2026-11-24; architecture section 5.5)**: article text is sent to Google.
     LM Studio is retired. Billing stays off on the Google project.
-  - Every request goes through `RequestBudget`. Limits (the same numbers in
-    `docs/architecture.md` 5.5 and `.env.example`): 20 requests per minute; 10,000 input
-    tokens per minute; 1,000 requests per day; 3 answered requests per `news lab` test;
-    concurrency default 8. The per-minute and token limits are at least one third below
-    Google's; the daily limit is stricter. Settings can only lower them. Never raise the
-    ceilings, widen the model allowlist, retry anything but Google's temporary overloads
-    (503/500/502/504/timeouts: retried with the same model until answered), add billable
-    request options, or call the real API from tests, without the owner's explicit
-    decision. Check use with `uv run news gemini-usage`.
+  - Every request goes through `RequestBudget` and is reserved in the `api_calls` ledger
+    before it is sent. Limits: 20 requests per minute; 10,000 input tokens per minute;
+    1,000 requests per day; 3 answered requests per `news lab` test; concurrency default
+    8. The per-minute and token limits are at least one third below Google's; the daily
+    limit is stricter. Settings can only lower them. Google's numbers:
+    [architecture 5.5](docs/architecture.md#55-owner-decision-ai-analysis-on-the-gemini-api-free-tier-2026-11-24).
   - How the limits are enforced (`app/analysis/budget.py`, `ledger.py`, `llm.py`): the
     lab ceiling of 3 and the concurrency ceiling of 8 are constants (`CEILINGS`); the
     per-minute window is shared across processes via `api_calls` (a client seeds it from
     the last 60 s of rows before its first request); input tokens are estimated as
     UTF-8 bytes // 3 (+1) before sending.
+  - Retries: Google's temporary overloads (503/500/502/504, read/write timeouts once
+    connected) are retried with the same model until answered; network errors (no
+    network, refused, dropped, connect/pool timeouts) give up after 5 in a row without
+    any HTTP answer (`MAX_TRANSPORT_ERRORS`, owner decision D2); an unusable answer is
+    retried up to 3 times per article (`MAX_ATTEMPTS`). Every attempt counts.
+  - Never raise the ceilings, widen the model allowlist, retry anything else, add
+    billable request options, or call the real API from tests, without the owner's
+    explicit decision. Check use with `uv run news gemini-usage`.
   - AI outputs meant for publication must be original work: no reproduced or
     closely paraphrased passages.
 - **Geography: use Morocco GeoNames datasets only.** Never mention, link to, or map the
@@ -175,20 +181,16 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - All timestamps are `timestamptz` and stored in UTC.
   - Dedup key per article: `UNIQUE(source_id, external_id)`. For Hespress, `external_id`
     is the WordPress post ID from `<guid>` (`?p=149695`).
-  - Roles (`scripts/db_roles.sql`, re-run after each migration and after a restore): the
-    database owner (`neondb_owner` on Neon) owns the schema and runs migrations; `news_ingest` reads and writes;
-    `news_api` is SELECT-only on an explicit allowlist (`articles`, `feeds`, `sources`,
-    the `analysis_briefings` view), never on `article_bodies`, `article_analyses`,
-    `api_calls` or `analysis_runs`. Both are NOLOGIN groups; the login roles are
-    `news_api_login` and `news_ingest_login`, whose passwords are set by
-    `scripts/db_login_passwords.sql` from psql variables (never written in a file).
-  - The API's engine is `create_engine(settings, read_only=True)`: its connections set
-    `default_transaction_read_only=on` (with the owner login by default, or the optional
-    `API_DATABASE_URL`). Never give the API a read-write engine; never serve
-    `article_bodies` from any route.
-  - Startup privilege guard: `assert_least_privilege` (`app/db/session.py`, called from
-    the lifespan) refuses to start in production, and warns elsewhere, if the API's login
-    is a superuser or can SELECT `article_bodies`. Never weaken it.
+  - Roles: `scripts/db_roles.sql` (re-run after each migration and after a restore);
+    `news_api` never gets `article_bodies`. Allowlist, logins and passwords:
+    [architecture section 6](docs/architecture.md#6-data-model-target-built-in-milestone-1).
+  - The API's engine is `create_engine(settings, read_only=True)`. Never give the API a
+    read-write engine; never serve `article_bodies` from any route.
+  - Startup privilege guard (`assert_least_privilege`, `app/db/session.py`, called from
+    the `app/main.py` lifespan) refuses to start in production, and warns elsewhere, if
+    the API's login is a superuser or can SELECT `article_bodies`. Never weaken it.
+    A production API (`ENVIRONMENT=production`) refuses to start without
+    `API_DATABASE_URL` (a `news_api_login` URL); see architecture 5.6, note D1.
   - Seed or reference data goes in migrations, written idempotently
     (`ON CONFLICT DO NOTHING`).
 - **API.**
@@ -220,7 +222,8 @@ of them requires an explicit decision by the owner, recorded in the architecture
   data; `ingest.yml` is the only workflow with real data, guarded by
   `tests/test_workflows.py`. Migrations are run by the owner, from the Mac.
 - **Backups.** Dumps go to `~/Backups/news/`, outside the repo. A backup only counts once
-  a restore test has passed.
+  a restore test has passed. `restore-test` restores into the local `db` container, never
+  on Neon (architecture section 8).
 
 ## Git
 
@@ -245,7 +248,8 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - Never recreate `.venv` as a plain directory.
   - If imports break mysteriously, look for `* 2*` files.
 
-- The app's database is **Neon** (`DATABASE_URL`, direct endpoint, never `-pooler`). The
+- The app's database is **Neon** (`DATABASE_URL`, direct endpoint, never `-pooler`;
+  `news ingest`, `analyze` and `backup` refuse a pooler host). The
   local container on **5433** (5432 belongs to another project) is for tests only:
   `tests/conftest.py` refuses a Neon URL, so set `TEST_DATABASE_URL`. Migrations against
   Neon are run from the Mac.

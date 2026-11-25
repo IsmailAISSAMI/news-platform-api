@@ -32,7 +32,9 @@ def test_a_command_is_required() -> None:
 
 
 def sample_report(status: RunStatus = RunStatus.SUCCEEDED) -> RunReport:
-    walked = WalkResult(StopReason.CHECKPOINT, pages_fetched=2, items_new=15, items_updated=1)
+    walked = WalkResult(
+        StopReason.CHECKPOINT, pages_fetched=2, items_new=15, items_updated=1, items_unchanged=7
+    )
     capped = WalkResult(StopReason.PAGE_LIMIT, pages_fetched=500, items_new=4990)
     since = datetime(2026, 10, 1, tzinfo=UTC)
     until = datetime(2026, 10, 9, tzinfo=UTC)
@@ -52,12 +54,12 @@ def test_format_report() -> None:
     text = cli.format_report(sample_report(), elapsed_s=12.34)
 
     assert text.startswith("Ingestion run #7: succeeded in 12.3s\n")
-    assert "+15 new, 1 updated, 0 skipped, 2 page(s) [checkpoint]" in text
+    assert "+15 new, 1 updated, 7 unchanged, 0 skipped, 2 page(s) [checkpoint]" in text
     assert "not covered by RSS: 2026-10-01 to 2026-10-09" in text
     assert "FAILED (None): WalkError: HTTP 403" in text
     assert "skipped: deferred" in text
     assert "incomplete: run again to continue the gap" in text
-    assert text.endswith("Total: +5005 new, 1 updated, 502 page(s)\n")
+    assert text.endswith("Total: +5005 new, 1 updated, 7 unchanged, 502 page(s)\n")
 
 
 @pytest.fixture

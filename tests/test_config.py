@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import SecretStr, ValidationError
 
+from app.analysis.llm import GEMINI_BASE_URL
 from app.core.config import Settings
 from app.db.base import Base
 
@@ -74,3 +75,7 @@ def test_test_database_url_needs_the_psycopg_driver() -> None:
             database_url=SecretStr("postgresql+psycopg://u:change-me@localhost:5433/news"),
             test_database_url=SecretStr("mysql://u:p@localhost:5433/news"),
         )
+
+
+def test_gemini_base_url_default_is_the_llm_constant() -> None:
+    assert make().gemini_base_url == GEMINI_BASE_URL

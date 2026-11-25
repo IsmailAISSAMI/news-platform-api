@@ -1,7 +1,8 @@
 # Architecture
 
-Status: **approved direction (architecture A, local-first), 2026-11-23. Current state as
-of 2026-11-25:**
+Status: **current design: section 5.6 (Neon database, daily ingest on GitHub Actions,
+2026-11-25).** The original local-first design (architecture A, 2026-11-23) is kept in
+section 2 as history. Current state as of 2026-11-25:
 - **Built:** the schema and roles, the rights gate, the polite fetcher, the Hespress RSS
   walk and news sitemap, `news ingest` (including `--rewalk-days`), the read API
   (`/api/v1`), backups with restore tests, AI analysis on the Gemini API free tier
@@ -23,12 +24,13 @@ The first source is Hespress English. More publishers will follow.
 **Hard constraints:**
 - The infrastructure budget is exactly **$0**. No paid hosting. No free tier as a
   required dependency, **except Neon** (owner decision, section 5.6).
-- The Mac is **not always online**. Ingestion runs **daily on GitHub Actions** against
+- The Mac is **not always online**. That is why ingestion runs on GitHub, not the Mac:
+  it runs **daily on GitHub Actions** against
   Neon (section 5.6), or by hand, and must pick up everything published since the last
   completed run.
 - **Rights first:** what we store and do with content is decided per source, by policy.
 
-## 2. Architecture A: local-first, manual runs
+## 2. History: architecture A, local-first, manual runs (2026-11-23)
 
 > **Superseded in part on 2026-11-25 (section 5.6):** the database is on Neon and a
 > scheduled GitHub Actions workflow runs the daily ingest. The diagram and trade-offs
@@ -109,8 +111,8 @@ Re-verify this table when the publisher's behavior looks different, and update t
    One run at a time needs no job queue: no leases, no `SKIP LOCKED`, no Celery or Redis.
 3. **Per feed,** in order: RSS walk (4.2), news sitemap, archive backlog (4.3).
 4. **Commit after every page,** so an interruption keeps all completed work.
-5. **Write an `ingestion_runs` row** and print a report: new, updated, backlog remaining,
-   unrecoverable items, and duration.
+5. **Write an `ingestion_runs` row** and print a report: new, updated, unchanged, skipped and pages per
+   feed, any window the RSS walk could not cover, and duration.
 
 ### 4.2 RSS walk with a checkpoint
 
@@ -351,7 +353,7 @@ before any public or commercial use. *This document is not legal advice.*
     the reserving process reports it as pending. The daily cap is counted **per model**.
     Only one model is allowed, so this is the project-wide cap; widening the allowlist
     would first need a global count;
-  - "high demand" errors (HTTP 503, also 500/502/504, timeouts, no network) are expected on
+  - "high demand" errors (HTTP 503, also 500/502/504, read/write timeouts once connected) are expected on
     the free tier and never break a run (owner decision): the same request, same model, is
     tried again after 10, 20, 30, then every 60 seconds until Google answers. Every attempt
     counts toward the daily limit, which stays the absolute stop. Busy refusals do not use
@@ -359,6 +361,12 @@ before any public or commercial use. *This document is not legal advice.*
     429 (quota) or any other error stops sending, and the run still writes its report. An
     article too long for the token limit (about 0.5% of articles) is skipped without being
     sent;
+  - *Amended 2026-11-25 (owner decision D2):* network errors (no network, connection
+    refused, dropped, or timed out while connecting: `ConnectTimeout`/`PoolTimeout`) are
+    retried the same way, but one request gives up after 5 in a row
+    (`MAX_TRANSPORT_ERRORS`, `_is_network_error`, `app/analysis/llm.py`). The count resets
+    only when Google answers (any HTTP response), not on a slow read timeout. An offline
+    Mac stops instead of using its daily budget. Every attempt is still reserved in the ledger;
   - the API key lives only in `.env` (see `docs/decisions/security.md`).
 - **Nothing else in 5.4 changes:** article text and analyses are never served, exported,
   published or committed.
@@ -403,16 +411,28 @@ earlier rules:
   so a leaked secret gives full access to the database. What still protects article
   text: the API's connections are read-only and no route serves `article_bodies` (tests
   enforce both); the roles scripts stay in the repo as an optional extra.
+  - *Note (2026-11-25, owner decision D1):* one `DATABASE_URL` stays the rule for
+    everything the owner runs today. The exception is a **production API**: started with
+    `ENVIRONMENT=production`, the API refuses to start unless `API_DATABASE_URL` is set to
+    a `news_api_login` URL (`app/main.py`, lifespan). It is optional and not used today;
+    see `.env.example`. The ingest workflow does not set `ENVIRONMENT`.
 - Migrations are run by the owner, from the Mac, against Neon. The ingest refuses to run
   while the database is behind the code's Alembic head.
 - **Freshness:** a daily walk to the checkpoint covers the last day and any missed days
   within the RSS depth (section 4). A skipped GitHub schedule is caught up by the next
   run. GitHub disables schedules after 60 days without repository activity: re-enable
-  it in the Actions tab.
+  it in the Actions tab. A failed scheduled run is emailed by GitHub (owner decision D8,
+  2026-11-25; README "Troubleshooting").
+- **Pooler refused in code (2026-11-25):** besides the workflow check, `news ingest`,
+  `news analyze` and `news backup` refuse a `-pooler` host before connecting
+  (`refuse_pooled_host`, `app/ingestion/readiness.py`).
 - **Backups:** `news backup` and `news restore-test` work against Neon unchanged: the
   client tools run in a throwaway `postgres:18-alpine` container (Neon runs Postgres 18),
-  and dumps still go to `~/Backups/news` on the Mac. The scratch restore database is
-  created and dropped on Neon.
+  and dumps still go to `~/Backups/news` on the Mac.
+  - *Amended 2026-11-25 (owner decision D3):* the scratch restore database is **no
+    longer created on Neon**. `news restore-test` restores the newest dump into
+    `<db>_restore_check` in the local Docker `db` container, compares row counts and
+    always drops it (section 8). The `db` container must be running.
 - **The local Docker database is for tests only** (`TEST_DATABASE_URL`):
   `tests/conftest.py` refuses a Neon URL. Its old data was deleted by the owner's choice
   on 2026-11-25 (a verified dump from that morning is kept in `~/Backups/news`).
@@ -470,7 +490,8 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   inherit them; their passwords are set by `scripts/db_login_passwords.sql` from psql
   variables, never from a file. `API_DATABASE_URL` can point the API at
   `news_api_login`. **Since 2026-11-25 these logins are optional and unused by default**
-  (section 5.6: one connection string everywhere).
+  (section 5.6: one connection string everywhere), except that a production API requires
+  `API_DATABASE_URL` (5.6, note D1).
   At startup the API runs `assert_least_privilege` (`app/db/session.py`): if its login is
   a superuser or can SELECT `article_bodies`, it refuses to start in production and logs
   a warning elsewhere.
@@ -482,7 +503,7 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 
 - **Endpoints:** `GET /api/v1/sources`, `/feeds`, `/articles`, `/articles/{id}`,
   `/briefings` (keyset-paginated briefing summaries: headline, report type, event status
-  and date, top 3 places and actors, `review_required`) and `/articles/{id}/briefing`
+  and date, top 3 places and actors, `review_required`, the publisher as `source`) and `/articles/{id}/briefing`
   (the full briefing, article metadata and `source_url`; 404 if none). They only read
   stored data; nothing fetches publishers on a request.
 - **Briefings, not analyses:** at save time the pipeline also stores
@@ -498,7 +519,9 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
      consecutive tokens** (`MIN_COPIED_RUN`, after normalization) with an article
      paragraph is removed: its enclosing list item is dropped, or a scalar field outside a
      list is set to null. Proper-name fields (`name_as_written`, `full_name`,
-     `attributed_to`) are exempt.
+     `attributed_to`) are exempt. A nulled field is served as `null`, not dropped: the
+     response schemas (`OverviewOut`, `WhatOut`, `ToneOut`) accept null, so one copied
+     headline never makes the whole briefing invalid.
 
   Added keys: `review_required`, `removed_items` (by quarantine and originality),
   `copied_items` (how many removals the originality filter made), `copied_paths`, and
@@ -563,7 +586,9 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 - **Filters:** source, category, language, date range, and `q` (Postgres full-text
   search, best effort).
 - **Caching:** `ETag` and `Cache-Control` headers.
-- **Access:** connects as the SELECT-only `news_api` role. Local only. API keys and rate
+- **Access:** read-only connections (`default_transaction_read_only`) with
+  `DATABASE_URL` by default, or the SELECT-only `news_api_login` through
+  `API_DATABASE_URL` (required in production, section 5.6). Local only. API keys and rate
   limiting are added only if remote access is ever enabled.
 
 ## 8. Backups
@@ -585,6 +610,9 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   - It verifies the newest dump's sha256, restores it into a scratch database
     `<db>_restore_check` (`--no-owner --no-privileges --exit-on-error`), and compares every
     table's row count with the manifest.
+  - A dump of Neon is restored into the **local Docker `db` container**, never on Neon
+    (owner decision D3, 2026-11-25). Start it first (`docker compose up -d db`); otherwise
+    the command stops with that hint. A dump of a local server is restored on that server.
   - On success it sets `verified_at`. The scratch database is always dropped; the live
     database is only read.
   - **A backup only counts once a restore test has passed.**
@@ -601,11 +629,15 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   pytest against a throwaway Postgres service. It has no secrets. No self-hosted runner.
 - `ingest.yml` is the daily ingest against Neon (section 5.6). Its single secret is
   `DATABASE_URL`; `tests/test_workflows.py` guards both workflows.
-  - The Postgres service image is pinned by digest (`postgres:18-alpine@sha256:...`).
+  - The Postgres service image is pinned by digest (`postgres:18-alpine@sha256:...`);
+    `docker-compose.yml` pins the same digest.
   - Coverage is measured with branch coverage and must stay at least 95%
     (`fail_under` in `pyproject.toml`). `pytest-randomly` shuffles test order.
-  - CI runs `pre-commit run --all-files` (ruff, file checks, gitleaks, mypy), so a
-    skipped local hook is still caught.
+  - CI runs `uv run pre-commit run --all-files` (locked pre-commit; its ruff and mypy
+    hooks run the locked tools through `uv run`), so a skipped local hook is still
+    caught. There are no separate ruff or mypy steps.
+  - **Secret scan:** the pre-commit gitleaks hook only sees staged changes, so CI also
+    runs a SHA-256-checked gitleaks over the whole tree (`gitleaks dir . --redact`).
   - **Hygiene gate:** `scripts/check_repo_hygiene.py` (standard library, no network)
     fails on secret patterns, forbidden file names (dumps, `.env`, JSONL exports),
     article-quote markers, article-text JSON keys (`"quote"`, `"body_text"`,
@@ -631,7 +663,7 @@ before it starts.**
 | 3 ✅ | Polite fetcher | `app/ingestion/fetch.py`, `robots.py` | Conditional GET, robots, delay, limits, retries | `httpx.MockTransport`: 304, 429 with Retry-After, 5xx backoff, timeout, size cap, disallowed path |
 | 4 ✅ (depth probe pending) | Hespress adapter and RSS walk | `app/ingestion/parsers.py`, `sources/wordpress.py`, `store.py`, `walk.py` | Parse, normalize to UTC, guid → ID, checkpoint walk | Malformed XML, repeated runs (idempotent), interrupted run resumes to checkpoint, deleted checkpoint, duplicates across feed and sitemap; **measure real RSS depth with a few probes** |
 | 5 ✅ | `news ingest` command | `app/cli.py`, `app/ingestion/runner.py`, `readiness.py`, `pyproject.toml` script | Readiness, lock, run report, migration-head check | DB down → clean failure; concurrent run refused; `ingestion_runs` recorded |
-| 6 ⏸ deferred | Archive backlog | `app/ingestion/backlog.py`, `page_metadata.py` | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |
+| 6 ⏸ deferred | Archive backlog | planned, not written yet: `app/ingestion/backlog.py`, `page_metadata.py` (the `discovered_urls` table and its enums already exist, with no reader or writer) | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |
 | 7 ✅ | Read API | `app/api/v1/catalog.py`, `app/api/caching.py`, `app/schemas/catalog.py`, `app/db/session.py` | Sources, feeds, articles (keyset, filters, FTS), detail; weak ETag + 304; read-only connections (`default_transaction_read_only`), optional `API_DATABASE_URL` in `news_api` | Every article exactly once across pages; stable under inserts; filters and search; 400/422 validation; no body ever served; 304 revalidation; API engine cannot write |
 | 8 ✅ | Backups | `app/ops/backup.py`, `news backup`, `news restore-test` | Locked, atomic, checksummed dumps; retention; restore into a scratch DB; ingest reminder | Real round trip (local Docker); corrupted dump; row-count mismatch not marked verified; refused during ingest; pruning, partials, freshness, private files |
 | 9 ✅ | Analysis framework | `app/analysis/*`, `news analyze`, `lab`, `gemini-usage`, `eval` | Gemma 4 31B on the Gemini API free tier (section 5.5): budgeted, resumable, evidence-checked; briefings with quarantine and the originality filter (section 7) | Budget ceilings, ledger reservation, retries, evidence and originality rules; the real API is never called from tests |
@@ -653,7 +685,8 @@ before it starts.**
 
 ## 12. Scalability plan
 
-Everything stays on the owner's Mac at $0. Nothing here adds a paid service.
+Everything stays at $0. Nothing here adds a paid service. (Since 2026-11-25 the database
+is on Neon and ingest runs on GitHub, section 5.6; analysis still runs on the Mac.)
 
 - **Analysis throughput (the real bottleneck).** Our limits are 20 requests per minute,
   10,000 input tokens per minute and 1,000 requests per day. A request carries about
