@@ -53,15 +53,19 @@ def _pg_tools_reach_the_database() -> bool:
     return probe.returncode == 0
 
 
-_REACHABLE = _pg_tools_reach_the_database()
-if not _REACHABLE and os.environ.get("REQUIRE_BACKUP_TESTS") == "1":
-    msg = "REQUIRE_BACKUP_TESTS=1 but pg tools cannot reach DATABASE_URL"
-    raise RuntimeError(msg)
+pytestmark = pytest.mark.integration
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not _REACHABLE, reason="pg tools cannot reach DATABASE_URL"),
-]
+
+@pytest.fixture(scope="module", autouse=True)
+def _pg_tools_available(_test_database: None) -> None:
+    """Probe once the test database exists and is migrated (not at collection time:
+    on a fresh server `<db>_test` and its alembic_version table don't exist yet)."""
+    if _pg_tools_reach_the_database():
+        return
+    if os.environ.get("REQUIRE_BACKUP_TESTS") == "1":
+        pytest.fail("REQUIRE_BACKUP_TESTS=1 but pg tools cannot reach DATABASE_URL")
+    pytest.skip("pg tools cannot reach DATABASE_URL")
+
 
 NOW = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
 
