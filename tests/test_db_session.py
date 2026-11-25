@@ -58,7 +58,9 @@ def test_host_pg_tools_pass_the_password_in_the_env_only() -> None:
 
 def test_container_pg_tools_use_the_socket_for_the_local_server() -> None:
     local = "postgresql+psycopg://news:change-me@localhost:5433/news"
-    tools = PgTools.from_settings(make_settings(database_url=local))
+    tools = PgTools.from_settings(
+        make_settings(database_url=local, pg_tools_command="docker compose exec -T db")
+    )
     assert tools.env() is None
     assert tools.dump()[:5] == ["docker", "compose", "exec", "-T", "db"]
     assert "-h" not in tools.dump()
@@ -69,7 +71,9 @@ def test_a_remote_server_uses_a_throwaway_container_with_tls_in_the_env() -> Non
         "postgresql+psycopg://owner:change-me@ep-x.eu-central-1.aws.neon.tech/neondb"
         "?sslmode=require&channel_binding=require"
     )
-    tools = PgTools.from_settings(make_settings(database_url=url))
+    tools = PgTools.from_settings(
+        make_settings(database_url=url, pg_tools_command="docker compose exec -T db")
+    )
     argv = tools.dump()
     assert argv[:4] == ["docker", "run", "--rm", "-i"]
     assert "-h" in argv and "ep-x.eu-central-1.aws.neon.tech" in argv
