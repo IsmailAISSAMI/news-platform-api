@@ -224,6 +224,8 @@ async def test_ingest_role_can_write_but_not_change_schema(db_session: AsyncSess
         with pytest.raises(DBAPIError, match=r"permission denied|must be owner"):
             async with db_session.begin_nested():
                 await db_session.execute(text("ALTER TABLE articles ADD COLUMN body text"))
+        # Readable (the ingest checks the Alembic head), never writable.
+        await db_session.execute(text("SELECT version_num FROM alembic_version"))
         with pytest.raises(DBAPIError, match="permission denied"):
             async with db_session.begin_nested():
-                await db_session.execute(text("SELECT * FROM alembic_version"))
+                await db_session.execute(text("DELETE FROM alembic_version"))

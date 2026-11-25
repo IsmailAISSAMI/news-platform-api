@@ -13,7 +13,8 @@ URL = "postgresql+psycopg://news:change-me@db.example:5544/news_test"
 
 
 def make_settings(**overrides: object) -> Settings:
-    return Settings(_env_file=None, database_url=URL, **overrides)  # type: ignore[call-arg,arg-type]  # test overrides
+    values: dict[str, object] = {"database_url": URL, **overrides}
+    return Settings(_env_file=None, **values)  # type: ignore[call-arg,arg-type]  # test overrides
 
 
 def test_read_only_engine_sets_read_only_and_a_statement_timeout(
@@ -55,7 +56,27 @@ def test_host_pg_tools_pass_the_password_in_the_env_only() -> None:
     assert "change-me" not in repr(tools)
 
 
-def test_container_pg_tools_use_the_socket() -> None:
-    tools = PgTools.from_settings(make_settings())
+def test_container_pg_tools_use_the_socket_for_the_local_server() -> None:
+    local = "postgresql+psycopg://news:change-me@localhost:5433/news"
+    tools = PgTools.from_settings(make_settings(database_url=local))
     assert tools.env() is None
+    assert tools.dump()[:5] == ["docker", "compose", "exec", "-T", "db"]
     assert "-h" not in tools.dump()
+
+
+def test_a_remote_server_uses_a_throwaway_container_with_tls_in_the_env() -> None:
+    url = (
+        "postgresql+psycopg://owner:change-me@ep-x.eu-central-1.aws.neon.tech/neondb"
+        "?sslmode=require&channel_binding=require"
+    )
+    tools = PgTools.from_settings(make_settings(database_url=url))
+    argv = tools.dump()
+    assert argv[:4] == ["docker", "run", "--rm", "-i"]
+    assert "-h" in argv and "ep-x.eu-central-1.aws.neon.tech" in argv
+    assert "change-me" not in " ".join(argv + tools.restore("x") + tools.create_db("x"))
+    assert "change-me" not in repr(tools)
+    env = tools.env()
+    assert env is not None
+    assert env["PGPASSWORD"] == "change-me"
+    assert env["PGSSLMODE"] == "require"
+    assert env["PGCHANNELBINDING"] == "require"

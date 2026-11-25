@@ -6,8 +6,9 @@ at a separate `<name>_test` database on the same server: the dev DB `news` becom
 creates and migrates it on first use. Advisory locks are per database, so tests also
 can't collide with a live `news ingest`.
 
-Only DATABASE_URL is taken from `.env` (for the server's credentials) and rewritten to
-`_test`. Then `Settings.model_config["env_file"]` is cleared, so nothing else (a real
+Only TEST_DATABASE_URL (if set) or DATABASE_URL is taken from `.env` (for the server's
+credentials) and rewritten to `_test`. A Neon URL is refused: tests stay local.
+Then `Settings.model_config["env_file"]` is cleared, so nothing else (a real
 API_DATABASE_URL or Gemini key) can come from `.env`: `API_DATABASE_URL` is rewritten to
 `_test` or dropped, and `GEMINI_API_KEY` is a dummy.
 """
@@ -25,11 +26,26 @@ DUMMY_GEMINI_KEY = "test-dummy-key-not-real"
 
 
 def _real_database_url() -> str:
-    if "DATABASE_URL" in os.environ:
-        return os.environ["DATABASE_URL"]
+    for name in ("TEST_DATABASE_URL", "DATABASE_URL"):
+        if name in os.environ:
+            return _local_only(os.environ[name])
     if Path(".env").exists():
-        return Settings().database_url.get_secret_value()  # type: ignore[call-arg]  # from .env
+        env = Settings()  # type: ignore[call-arg]  # from .env
+        url = env.test_database_url or env.database_url
+        return _local_only(url.get_secret_value())
     return DEFAULT_URL  # fresh clone
+
+
+def _local_only(url: str) -> str:
+    """Tests never create databases on Neon: set TEST_DATABASE_URL to the local server."""
+    host = make_url(url).host or ""
+    if host.endswith(".neon.tech"):
+        msg = (
+            "DATABASE_URL points at Neon: set TEST_DATABASE_URL in .env to the local "
+            "Docker database (postgresql+psycopg://news:change-me@localhost:5433/news)."
+        )
+        raise RuntimeError(msg)
+    return url
 
 
 def _test_database_url(real: str) -> str:

@@ -1,4 +1,7 @@
 services:
+  # The app's database is on Neon (docs/architecture.md 5.6). This local PostgreSQL is
+  # for the test suite only: tests create `<db>_test` here (TEST_DATABASE_URL) and never
+  # touch Neon.
   db:
     image: postgres:18-alpine
     environment:
@@ -18,34 +21,21 @@ services:
       retries: 10
     restart: unless-stopped
 
-  migrate:
-    build: .
-    image: news-backend:local  # same image as `api`, built once
-    command: ["alembic", "upgrade", "head"]
-    environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-    depends_on:
-      db:
-        condition: service_healthy
-    restart: "no"
-
+  # Optional: the read-only API in a container, connected to Neon. Migrations are run by
+  # the owner from the Mac (`uv run alembic upgrade head`), never by this service.
   api:
     build: .
     image: news-backend:local
     environment:
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
-      # Least-privilege login for the containerised API (host "db", port 5432), e.g.
-      # postgresql+psycopg://news_api_login:change-me@db:5432/news. Empty = owner login.
-      API_DATABASE_URL: ${DOCKER_API_DATABASE_URL:-}
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      # news_api_login (SELECT-only). Empty = owner login, which the API warns about.
+      API_DATABASE_URL: ${API_DATABASE_URL:-}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # IPs of the reverse proxy allowed to set X-Forwarded-* (read by uvicorn).
       FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1}
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:

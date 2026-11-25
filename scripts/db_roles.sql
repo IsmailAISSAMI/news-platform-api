@@ -1,7 +1,8 @@
 -- Database roles for least-privilege access (docs/architecture.md §6).
 --
--- Run as the schema owner (the POSTGRES_USER), after `alembic upgrade head`:
---   docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 < scripts/db_roles.sql
+-- Run as the database owner (neondb_owner on Neon), after `alembic upgrade head`:
+--   read -rs NEON_URL    # the owner connection string, not shown
+--   docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 < scripts/db_roles.sql
 --
 -- Idempotent: safe to re-run after every migration. Plain SQL (no psql meta-commands), so
 -- the tests can apply it inside a rolled-back transaction.
@@ -29,8 +30,17 @@ END
 $$;
 
 -- Login roles are plain users: never superuser, never able to create roles or databases.
-ALTER ROLE news_api_login NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-ALTER ROLE news_ingest_login NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+-- CREATE ROLE already defaults to all of these. Only a real superuser may write the
+-- SUPERUSER attribute, so on Neon (whose owner is not a superuser) the re-assertion is
+-- skipped: a non-superuser cannot have granted any of these attributes in the first place.
+DO $$
+BEGIN
+    IF (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+        ALTER ROLE news_api_login NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+        ALTER ROLE news_ingest_login NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    END IF;
+END
+$$;
 GRANT news_api TO news_api_login;
 GRANT news_ingest TO news_ingest_login;
 
@@ -60,5 +70,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO news_ingest;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO news_ingest;
 
--- The migration bookkeeping table is the owner's business only.
+-- The migration bookkeeping table is the owner's business. news_ingest may only read it:
+-- `news ingest` refuses to run unless the database is at the code's Alembic head.
 REVOKE ALL ON alembic_version FROM news_ingest, news_api;
+GRANT SELECT ON alembic_version TO news_ingest;

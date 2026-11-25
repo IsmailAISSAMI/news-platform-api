@@ -1,0 +1,53 @@
+name: Daily ingest
+
+# Owner decision 2026-11-25 (docs/architecture.md 5.6): once a day, collect the articles
+# published since the last run into the Neon database. This is the only workflow that
+# touches real data. It never runs on pull requests (secrets stay out of forks), never
+# runs tests or Gemini analysis, and uses the least-privilege news_ingest_login.
+
+on:
+  schedule:
+    - cron: "17 5 * * *" # 05:17 UTC daily (off the hour: GitHub delays top-of-hour jobs)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ingest # one run at a time; the advisory lock is the second guard
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production # holds the INGEST_DATABASE_URL secret
+
+    env:
+      # news_ingest_login on Neon's DIRECT endpoint (no "-pooler" in the host: the
+      # session advisory locks need a real session), with ?sslmode=require.
+      DATABASE_URL: ${{ secrets.INGEST_DATABASE_URL }}
+      ENVIRONMENT: production
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies (no dev tools)
+        run: uv sync --locked --no-dev
+
+      - name: Refuse a pooled or unencrypted database URL
+        run: |
+          case "$DATABASE_URL" in
+            "") echo "INGEST_DATABASE_URL secret is not set" >&2; exit 1 ;;
+            *-pooler.*) echo "Use Neon's direct endpoint, not the pooler" >&2; exit 1 ;;
+            *sslmode=require*|*sslmode=verify-full*) ;;
+            *) echo "The URL must set sslmode=require (or verify-full)" >&2; exit 1 ;;
+          esac
+
+      - name: Ingest
+        run: uv run --no-dev news ingest

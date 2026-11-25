@@ -8,8 +8,9 @@
   table's row count with the manifest, mark the manifest verified, drop the scratch DB.
 
 The live database is only ever read. Secrets never reach a command line or a log line:
-the pg tools run inside the db container over its local socket, or (PG_TOOLS_COMMAND="")
-on the host with the password passed in the PGPASSWORD environment variable.
+the pg tools run inside the local db container over its socket; for a remote server
+(Neon) in a throwaway `postgres:18-alpine` container; or (PG_TOOLS_COMMAND="") on the
+host. Over the network, the password and TLS settings travel in PG* environment variables.
 """
 
 import asyncio
@@ -88,6 +89,18 @@ class VerifyResult:
         return not self.mismatches
 
 
+# Hosts served by the local compose container (reached over its socket by default).
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "db"})
+# A remote server (Neon): the client tools run in a throwaway container of the server's
+# major version, so no host install is needed. `-e NAME` forwards the variable from our
+# environment without putting its value on a command line.
+REMOTE_TOOLS_PREFIX = (
+    "docker", "run", "--rm", "-i",
+    "-e", "PGPASSWORD", "-e", "PGSSLMODE", "-e", "PGCHANNELBINDING",
+    "postgres:18-alpine",
+)  # fmt: skip
+
+
 @dataclass(frozen=True)
 class PgTools:
     """Builds argv for the PostgreSQL client tools, optionally inside a container."""
@@ -95,10 +108,12 @@ class PgTools:
     prefix: tuple[str, ...]
     user: str
     database: str
-    # Host tools only (empty prefix): where to connect. The password goes in the env.
+    # Network connections only (host tools, or a remote server). Secrets go in the env.
     host: str | None = None
     port: int | None = None
     password: str | None = field(default=None, repr=False)
+    sslmode: str | None = None
+    channel_binding: str | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "PgTools":
@@ -107,9 +122,20 @@ class PgTools:
             msg = "DATABASE_URL must include a user and a database name"
             raise BackupError(msg)
         prefix = tuple(shlex.split(settings.pg_tools_command))
-        if prefix:  # inside the container: its local socket
-            return cls(prefix, url.username, url.database)
-        return cls(prefix, url.username, url.database, url.host, url.port, url.password)
+        if prefix and (url.host is None or url.host in LOCAL_HOSTS):
+            return cls(prefix, url.username, url.database)  # the container's local socket
+        if prefix:
+            prefix = REMOTE_TOOLS_PREFIX
+        return cls(
+            prefix,
+            url.username,
+            url.database,
+            url.host,
+            url.port,
+            url.password,
+            _query_value(url.query.get("sslmode")),
+            _query_value(url.query.get("channel_binding")),
+        )
 
     @property
     def _conn(self) -> list[str]:
@@ -121,10 +147,15 @@ class PgTools:
         return args
 
     def env(self) -> dict[str, str] | None:
-        """Environment for the subprocess: PGPASSWORD for host tools, else inherited."""
-        if self.prefix or self.password is None:
+        """Environment for a network connection (password, TLS); None for the socket."""
+        if self.host is None:
             return None
-        return {**os.environ, "PGPASSWORD": self.password}
+        extra = {
+            "PGPASSWORD": self.password,
+            "PGSSLMODE": self.sslmode,
+            "PGCHANNELBINDING": self.channel_binding,
+        }
+        return {**os.environ, **{k: v for k, v in extra.items() if v is not None}}
 
     def dump(self, snapshot: str | None = None) -> list[str]:
         argv = [*self.prefix, "pg_dump", *self._conn, "-d", self.database, "-Fc"]
@@ -153,6 +184,10 @@ class PgTools:
     @property
     def scratch_database(self) -> str:
         return f"{self.database}_restore_check"
+
+
+def _query_value(value: str | tuple[str, ...] | None) -> str | None:
+    return value[-1] if isinstance(value, tuple) else value
 
 
 # --- Creating backups ---------------------------------------------------------------------

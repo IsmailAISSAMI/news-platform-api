@@ -1,12 +1,13 @@
 # CLAUDE.md
 
-Personal news-intelligence platform. A manually run ingestion command (`news ingest`)
-collects articles from publishers into a local PostgreSQL. A read-only FastAPI API serves
+Personal news-intelligence platform. An ingestion command (`news ingest`), run daily by
+GitHub Actions or by hand, collects articles from publishers into PostgreSQL on **Neon**. A read-only FastAPI API serves
 them to a web frontend. Content analysis comes later. First source: **Hespress English**
 (`https://en.hespress.com`).
 
-Constraints: **$0 infrastructure** (local-first on the owner's Mac; no paid services; no
-free tier as a dependency), and the Mac is **not always online**. The approved design,
+Constraints: **$0 infrastructure** (no paid services; no free tier as a dependency
+except **Neon**, owner decision 2026-11-25, architecture section 5.6), and the Mac is
+**not always online**. The approved design,
 verified source facts, rights model and roadmap are in
 [docs/architecture.md](docs/architecture.md). Read it before working on ingestion, the
 schema or the API. **Each roadmap milestone needs the owner's approval before it starts.**
@@ -23,12 +24,12 @@ Always go through `uv run`; never `pip install` (dependencies are locked in `uv.
 ```bash
 uv sync                                   # install locked deps
 uv add <pkg> / uv add --dev <pkg>         # add a dependency (updates uv.lock)
-docker compose up -d db                   # Postgres on localhost:5433
+docker compose up -d db                   # local TEST Postgres on localhost:5433 (the app uses Neon)
 uv run uvicorn app.main:app --reload      # API (port 8000; may be taken locally)
 uv run ruff check --fix . && uv run ruff format .
 uv run mypy app tests alembic
 uv run pytest -m "not integration"        # fast, no DB
-uv run pytest                             # full suite, needs the db container
+uv run pytest                             # full suite: local db container + TEST_DATABASE_URL
 uv run alembic revision --autogenerate -m "..." && uv run alembic upgrade head
 uv run alembic check                      # models and migrations must be in sync
 uv run news ingest [-v] [--since-days N] [--max-pages N] [--no-sitemap] [--rewalk-days N]
@@ -78,8 +79,11 @@ tests/            unit tests; tests/integration/ needs PostgreSQL (marker: integ
 ```
 
 The archive backlog (milestone 6) is deferred. Ingestion is a
-**run-to-completion command run by hand**, not a daemon: no launchd, no scheduler, no
-GitHub-hosted or self-hosted runner.
+**run-to-completion command**, not a daemon. It runs daily from
+`.github/workflows/ingest.yml` (GitHub-hosted, against Neon, architecture 5.6) or by
+hand. No launchd, no self-hosted runner. The workflow runs `news ingest` only, with the
+`INGEST_DATABASE_URL` secret (`news_ingest_login`, Neon's direct endpoint,
+`sslmode=require`); never tests, migrations or Gemini analysis.
 
 ## Hard rules: content rights and polite crawling
 
@@ -169,7 +173,7 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - Dedup key per article: `UNIQUE(source_id, external_id)`. For Hespress, `external_id`
     is the WordPress post ID from `<guid>` (`?p=149695`).
   - Roles (`scripts/db_roles.sql`, re-run after each migration and after a restore): the
-    `POSTGRES_USER` owns the schema and runs migrations; `news_ingest` reads and writes;
+    database owner (`neondb_owner` on Neon) owns the schema and runs migrations; `news_ingest` reads and writes;
     `news_api` is SELECT-only on an explicit allowlist (`articles`, `feeds`, `sources`,
     the `analysis_briefings` view), never on `article_bodies`, `article_analyses`,
     `api_calls` or `analysis_runs`. Both are NOLOGIN groups; the login roles are
@@ -206,9 +210,11 @@ of them requires an explicit decision by the owner, recorded in the architecture
   loudly. No `feedparser`.
 - **Ingestion tests** use the simulated publisher in `tests/integration/test_walk.py` and
   the synthetic builders in `tests/ingestion/feeds.py`. Never use real feed content.
-- **Infrastructure.** Nothing may require a paid service or a free-tier account.
-  PostgreSQL is never exposed to the internet. GitHub Actions is CI only, and never
-  touches real data.
+- **Infrastructure.** Nothing may require a paid service or a free-tier account,
+  except Neon (5.6). The only internet-reachable PostgreSQL is Neon (TLS + passwords);
+  the local container stays on localhost. `ci.yml` has no secrets and never touches real
+  data; `ingest.yml` is the only workflow with real data, guarded by
+  `tests/test_workflows.py`. Migrations and `scripts/db_roles.sql` are run by the owner.
 - **Backups.** Dumps go to `~/Backups/news/`, outside the repo. A backup only counts once
   a restore test has passed.
 
@@ -235,8 +241,12 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - Never recreate `.venv` as a plain directory.
   - If imports break mysteriously, look for `* 2*` files.
 
-- Port 5432 belongs to another project's Postgres. This project uses **5433**.
-- Port 8000 may be taken by a local uvicorn. Use `API_PORT=8001 docker compose up -d`.
+- The app's database is **Neon** (`DATABASE_URL`, direct endpoint, never `-pooler`). The
+  local container on **5433** (5432 belongs to another project) is for tests only:
+  `tests/conftest.py` refuses a Neon URL, so set `TEST_DATABASE_URL`. Migrations and
+  `scripts/db_roles.sql` against Neon are run from the Mac.
+- Port 8000 may be taken by a local uvicorn. Use `--port 8001` or
+  `API_PORT=8001 docker compose up -d api`.
 - The VS Code GitHub Actions extension shows false "unable to resolve action" errors.
   Verify tags with `gh api repos/<owner>/<repo>/tags` instead. `setup-uv` has no floating
   major tag, so it's pinned by SHA.

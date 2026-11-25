@@ -21,13 +21,18 @@ sources → ingestion → normalization → PostgreSQL → (analysis) → FastAP
 The first source is Hespress English. More publishers will follow.
 
 **Hard constraints:**
-- The infrastructure budget is exactly **$0**. No paid hosting, and no free tier as a
-  required dependency.
-- The Mac is **not always online**. Ingestion is **run manually** and must pick up
-  everything published since the last completed run.
+- The infrastructure budget is exactly **$0**. No paid hosting. No free tier as a
+  required dependency, **except Neon** (owner decision, section 5.6).
+- The Mac is **not always online**. Ingestion runs **daily on GitHub Actions** against
+  Neon (section 5.6), or by hand, and must pick up everything published since the last
+  completed run.
 - **Rights first:** what we store and do with content is decided per source, by policy.
 
 ## 2. Architecture A: local-first, manual runs
+
+> **Superseded in part on 2026-11-25 (section 5.6):** the database is on Neon and a
+> scheduled GitHub Actions workflow runs the daily ingest. The diagram and trade-offs
+> below record the original design; where they conflict, section 5.6 wins.
 
 ```
  Hespress EN                        Your Mac (owned, $0)
@@ -41,7 +46,7 @@ The first source is Hespress English. More publishers will follow.
                                │  6 archive backlog (bounded per run)         │
                                │  7 rights gate → upsert → run report         │
                                │                    │                         │
-                               │        PostgreSQL 18 (Docker, :5433)          │
+                               │        PostgreSQL 18 (Docker, :5433)*         │
                                │                    │                         │
                                │ news analyze (Gemini API free tier, 5.5)     │
                                │ FastAPI /api/v1 (SELECT-only role) → web app │
@@ -50,6 +55,9 @@ The first source is Hespress English. More publishers will follow.
  GitHub: CI only. It runs lint, types, migration check and tests against a throwaway
  Postgres. No production data, no article content, no secrets.
 ```
+
+\* Since 2026-11-25 the database is on Neon and the local container is for tests only
+(section 5.6).
 
 **Why this design** (options compared on 2026-11-23):
 - **GitHub-hosted scheduled runners:** the filesystem is ephemeral, so they need a
@@ -362,6 +370,56 @@ before any public or commercial use. *This document is not legal advice.*
   3. Stored outputs: delete the affected rows from `article_analyses` (and related rows)
      only when the owner decides.
 
+### 5.6 Owner decision: database on Neon, daily ingest on GitHub Actions (2026-11-25)
+
+**Decision.** The owner wants the data reachable while the Mac is off. The whole
+database, including `article_bodies`, moves to **Neon** (serverless PostgreSQL, free
+plan, region AWS Europe/Frankfurt). A scheduled GitHub Actions workflow runs
+`news ingest` **once a day**. The owner accepted, explicitly, these exceptions to
+earlier rules:
+
+- **Article text leaves the Mac.** It is stored privately on Neon's servers (AWS). Still
+  never served, exported, published or committed: everything else in 5.4 holds.
+- **A free tier is a dependency.** Neon's free plan can change and a project can be
+  suspended. The local Docker database stays usable as a fallback (see reversal).
+- **PostgreSQL is reachable from the internet** (Neon's endpoint), protected by TLS
+  (`sslmode=require`) and passwords. This is the only exception: the local container is
+  still bound to localhost.
+- **Ingestion runs on a schedule, on a GitHub-hosted runner.** It replaces "run by hand"
+  (manual runs still work). Gemini analysis is **not** scheduled: it stays a manual
+  command.
+
+**How it is constrained.**
+- `.github/workflows/ingest.yml`: daily cron and manual dispatch; never on pull requests;
+  `contents: read`; one run at a time (workflow concurrency, then the advisory lock);
+  runs only `news ingest`, never tests, migrations or analysis; refuses a URL without
+  `sslmode=require` and Neon's `-pooler` endpoint (session advisory locks need a direct
+  session).
+- Its only secret is `INGEST_DATABASE_URL` (in the `production` environment): the
+  `news_ingest_login` role, which can read and write data but not change the schema,
+  read `alembic_version` only, and never create roles. The owner URL never goes to
+  GitHub. `ci.yml` still has no secrets and never touches real data.
+- Migrations and `scripts/db_roles.sql` are run by the owner, from the Mac, against Neon.
+  The ingest refuses to run while the database is behind the code's Alembic head.
+- The API uses `news_api_login` (SELECT allowlist, read-only connections) as before.
+- **Freshness:** a daily walk to the checkpoint covers the last day and any missed days
+  within the RSS depth (section 4). A skipped GitHub schedule is caught up by the next
+  run. GitHub disables schedules after 60 days without repository activity: re-enable
+  it in the Actions tab.
+- **Backups:** `news backup` and `news restore-test` work against Neon unchanged: the
+  client tools run in a throwaway `postgres:18-alpine` container (Neon runs Postgres 18),
+  and dumps still go to `~/Backups/news` on the Mac. The scratch restore database is
+  created and dropped on Neon.
+- **The local Docker database is for tests only** (`TEST_DATABASE_URL`):
+  `tests/conftest.py` refuses a Neon URL. Its old data was deleted by the owner's choice
+  on 2026-11-25 (a verified dump from that morning is kept in `~/Backups/news`).
+
+**Reversal plan.**
+1. Disable the workflow in the Actions tab and delete the `INGEST_DATABASE_URL` secret.
+2. Dump Neon (`news backup`), restore into the local container, re-run the roles
+   scripts, point `DATABASE_URL` back at `localhost:5433`.
+3. Delete the Neon project (this removes the stored article text there). Record it here.
+
 ## 6. Data model (target, built in milestone 1)
 
 ```sql
@@ -398,9 +456,10 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 - **Content hash:** `content_hash` over the stored fields detects publisher edits, which
   update the row and `modified_at`.
 - **Database roles** (`scripts/db_roles.sql`, idempotent, re-run after each migration):
-  - the schema owner is the `POSTGRES_USER` (`news`), which runs migrations;
-  - `news_ingest` reads and writes data, cannot change the schema, and has no access to
-    `alembic_version`;
+  - the schema owner is the database owner (`neondb_owner` on Neon; `news` in the local
+    test container), which runs migrations;
+  - `news_ingest` reads and writes data, cannot change the schema, and can only read
+    `alembic_version` (the ingest checks the migration head);
   - `news_api` has SELECT only, on an explicit allowlist: `articles`, `feeds`, `sources`
     and the `analysis_briefings` view. Nothing else, not even future tables.
 
@@ -509,9 +568,10 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
     while an ingest runs.
   - **Snapshot-consistent:** it opens a `REPEATABLE READ, READ ONLY` transaction,
     exports its snapshot (`pg_export_snapshot()`), records exact per-table row counts and
-    the Alembic revision inside it, then streams `pg_dump -Fc --snapshot=...` **inside
-    the db container**, so the counts and the dump describe the same data. The tool version always matches the server,
-    and no password ever appears on a command line.
+    the Alembic revision inside it, then streams `pg_dump -Fc --snapshot=...`, so the counts and the dump describe the
+    same data. For Neon the tools run in a throwaway `postgres:18-alpine` container (the
+    server's major version); the password and TLS settings travel in `PG*` environment
+    variables, never on a command line.
   - It writes `news-<UTC stamp>.dump.partial` and renames it atomically. A JSON manifest
     holds the size, sha256, revision, counts and `verified_at`.
   - Files are mode 600 in a 700 directory, `~/Backups/news/`: outside the repo and outside
@@ -525,16 +585,17 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   - **A backup only counts once a restore test has passed.**
 - **Reminder:** `news ingest` warns when there is no *verified* backup newer than
   `BACKUP_MAX_AGE_DAYS` (7).
-- **Restoring for real** (disaster recovery) is deliberately manual:
-  `docker compose exec -T db pg_restore -U news -d news --clean --if-exists < <dump>`,
+- **Restoring for real** (disaster recovery) is deliberately manual (README, "Restore a
+  backup"): `pg_restore --no-owner --no-privileges --clean --if-exists` into Neon,
   then **re-run `scripts/db_roles.sql`** (and `scripts/db_login_passwords.sql` if the
   login roles are new): dumps are restored without privileges.
 
 ## 9. CI and GitHub
 
 - `ci.yml` stays CI-only: ruff, mypy, `alembic upgrade head` + `alembic check`, and
-  pytest against a throwaway Postgres service. There is no ingestion workflow and no
-  self-hosted runner.
+  pytest against a throwaway Postgres service. It has no secrets. No self-hosted runner.
+- `ingest.yml` is the daily ingest against Neon (section 5.6). Its single secret is
+  `INGEST_DATABASE_URL`; `tests/test_workflows.py` guards both workflows.
   - The Postgres service image is pinned by digest (`postgres:18-alpine@sha256:...`).
   - Coverage is measured with branch coverage and must stay at least 95%
     (`fail_under` in `pyproject.toml`). `pytest-randomly` shuffles test order.
@@ -547,7 +608,7 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
     holds SHA-256 hashes only, so the words never appear in the repo.
 - Migrations are applied locally with `uv run alembic upgrade head`. `news ingest`
   refuses to run when the database is behind.
-- No GitHub secrets are needed.
+- One GitHub secret, `INGEST_DATABASE_URL`, used by `ingest.yml` only.
 - Data never enters git: `.gitignore` covers `backups/`, `*.dump`, `*.sql.gz` and `.env`.
   pre-commit blocks large files and private keys. Test fixtures are synthetic.
 

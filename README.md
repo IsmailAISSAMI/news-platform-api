@@ -1,13 +1,15 @@
 # News Platform API
 
 Collect news articles from publishers into your own database, then browse and search them
-through a simple web API. Everything runs on your own computer, for free.
+through a simple web API. The database is a free [Neon](https://neon.com) PostgreSQL, so
+the data stays reachable while your computer is off; a GitHub workflow collects new
+articles once a day.
 
 The first supported publisher is **[Hespress English](https://en.hespress.com)**.
 
 > **What it stores:** article information (title, link, date, author, categories), plus,
-> for sources configured for it, the article text **kept privately on your computer** for
-> analysis. The API never shows article text: every article links back to the original.
+> for sources configured for it, the article text **kept privately in your own database**
+> for analysis. The API never shows article text: every article links back to the original.
 > See [Respecting publishers](#respecting-publishers).
 
 ---
@@ -19,7 +21,8 @@ Install these three tools first (all free):
 | Tool | What it's for | Install |
 | --- | --- | --- |
 | **Git** | Download the project | [git-scm.com/downloads](https://git-scm.com/downloads) |
-| **Docker Desktop** | Runs the database and the API | [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) |
+| **Docker Desktop** | Runs the test database, the backup tools and (optionally) the API | [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/) |
+| **A Neon account** | Hosts the database (free plan) | [neon.com](https://neon.com) |
 | **uv** | Runs the project's Python tools (installs Python for you) | [docs.astral.sh/uv](https://docs.astral.sh/uv/getting-started/installation/) |
 
 Then **start Docker Desktop** and leave it running.
@@ -37,15 +40,16 @@ git clone https://github.com/IsmailAISSAMI/news-platform-api.git
 cd news-platform-api
 ```
 
-**2. Create your settings file with a secure password**
+**2. Create your settings file**
 
 ```bash
 cp .env.example .env
 PW=$(openssl rand -hex 24) && sed -i.bak "s/change-me/$PW/g" .env && rm .env.bak
 ```
 
-This copies the example settings and replaces every `change-me` with a random password.
-The `.env` file is private: it is never uploaded to GitHub.
+This copies the example settings and replaces every `change-me` with a random password
+(used by the local test database). The `.env` file is private: it is never uploaded to
+GitHub.
 
 **3. Install the Python tools**
 
@@ -53,16 +57,60 @@ The `.env` file is private: it is never uploaded to GitHub.
 uv sync
 ```
 
-**4. Start the database and the API**
+**4. Create the Neon database**
+
+In the [Neon console](https://console.neon.tech): new project, region **AWS Europe
+(Frankfurt)**, Postgres **18**, only the *Postgres database* service. Then *Connect*,
+turn **Connection pooling off** (the address must not contain `-pooler`), and copy the
+connection string into `.env` as is:
 
 ```bash
-docker compose up -d --build
+DATABASE_URL=postgresql://neondb_owner:change-me@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
 ```
 
-This starts PostgreSQL, prepares the database, and starts the API. The first time takes a
-few minutes while Docker downloads what it needs.
+Never paste a connection string into a chat, an issue or a file in this repo.
 
-**5. Check that it works**
+**5. Create the tables and the restricted logins**
+
+```bash
+uv run alembic upgrade head
+read -rs NEON_URL      # paste the same connection string, then Enter (nothing is shown)
+docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 < scripts/db_roles.sql
+```
+
+Then give the two restricted logins their passwords (make each with
+`openssl rand -hex 24`, keep them in your password manager):
+
+```bash
+read -rs API_PW && read -rs INGEST_PW
+docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 \
+  -v api_password="$API_PW" -v ingest_password="$INGEST_PW" < scripts/db_login_passwords.sql
+unset NEON_URL API_PW INGEST_PW
+```
+
+Add the API's login to `.env` (same host, `news_api_login` and its password):
+
+```bash
+API_DATABASE_URL=postgresql://news_api_login:change-me@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require
+```
+
+**6. Start the local test database** (used by the tests only, never by the app):
+
+```bash
+docker compose up -d db
+```
+
+and point the tests at it in `.env` (the password is `POSTGRES_PASSWORD` from `.env`):
+
+```bash
+TEST_DATABASE_URL=postgresql+psycopg://news:change-me@localhost:5433/news
+```
+
+**7. Start the API and check it**
+
+```bash
+uv run uvicorn app.main:app --port 8000
+```
 
 Open **<http://localhost:8000/health/ready>** in your browser. You should see:
 
@@ -70,11 +118,18 @@ Open **<http://localhost:8000/health/ready>** in your browser. You should see:
 {"status": "ready"}
 ```
 
+**8. Turn on the daily collection** (GitHub): repo → *Settings* → *Environments* → new
+environment `production` → *Add secret* `INGEST_DATABASE_URL`: the same connection
+string with `news_ingest_login` and its password. Then *Actions* → *Daily ingest* →
+*Run workflow* once. After that it runs every day at 05:17 UTC; a failed run emails you.
+
 ✅ Setup is done.
 
 ---
 
 ## Collect articles
+
+GitHub collects new articles every day (setup step 8). To collect now from your computer:
 
 ```bash
 uv run news ingest -v
@@ -159,15 +214,7 @@ A read-only briefing screen ships with the API (plain HTML, CSS and JavaScript i
 light theme** and follows your system setting (light when your computer is set to
 light mode, dark otherwise).
 
-If the Docker API is running (setup step 4), the screen is already there: open
-<http://localhost:8000/ui/>. To run the API from your working copy instead, use another
-port so it does not collide with the Docker API on 8000:
-
-```bash
-uv run uvicorn app.main:app --port 8001
-```
-
-Then open <http://127.0.0.1:8001/ui/>. The list shows the newest briefings; open one to
+With the API running (setup step 7), open <http://localhost:8000/ui/>. The list shows the newest briefings; open one to
 see what, when, where and who, the claims, and a link to the original article.
 
 The screen reads `GET /api/v1/briefings` (newest first, paged with `next_cursor`) and
@@ -194,73 +241,25 @@ uv run news restore-test   # proves that the copy can really be restored
 <details>
 <summary><b>Restore a backup</b> (only if you lost your data)</summary>
 
-This **replaces** the current database contents with the backup:
+This **replaces** the database contents with the backup. Paste the owner connection
+string at the prompt:
 
 ```bash
 ls ~/Backups/news/      # pick a .dump file
-docker compose exec -T db pg_restore -U news -d news --clean --if-exists < ~/Backups/news/<file>.dump
-docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 < scripts/db_roles.sql
+read -rs NEON_URL
+docker run --rm -i postgres:18-alpine pg_restore --no-owner --no-privileges \
+  --clean --if-exists -d "$NEON_URL" < ~/Backups/news/<file>.dump
+docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 < scripts/db_roles.sql
+unset NEON_URL
 ```
 
-The second command restores the database roles' privileges, which a dump does not carry.
+The last command restores the database roles' privileges, which a dump does not carry.
 
 </details>
 
----
-
-## Owner setup after round 3
-
-Round 3 added migrations and separate database logins. Run these steps once, **in this
-order**, from the project folder with the database running.
-
-**1. Bring the database to the latest migration**
-
-```bash
-uv run alembic upgrade head
-```
-
-**2. Create or update the database roles** (also creates the `news_api_login` and
-`news_ingest_login` users, without passwords)
-
-```bash
-docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 < scripts/db_roles.sql
-```
-
-**3. Set the two login passwords.** `read -rs` reads each password without showing it
-or saving it in your shell history (type one, press Enter, type the other, press Enter):
-
-```bash
-read -rs API_PW && read -rs INGEST_PW
-docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 \
-  -v api_password="$API_PW" -v ingest_password="$INGEST_PW" \
-  < scripts/db_login_passwords.sql
-```
-
-Then add this line to `.env`, replacing `change-me` with the `API_PW` password you typed
-(hex passwords from `openssl rand -hex 24` are safe in a URL):
-
-```bash
-API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@localhost:5433/news
-```
-
-and clear the variables: `unset API_PW INGEST_PW`.
-
-**4. Restart the API** so it connects as `news_api_login`:
-
-```bash
-uv run uvicorn app.main:app --port 8001   # stop the old one first (Ctrl-C)
-```
-
-At startup the API checks its own login: if it could read article text (a superuser, or
-any role allowed to read `article_bodies`), it logs a warning, and in production
-(`ENVIRONMENT=production`) it refuses to start.
-
-For the Docker `api` service, the database host is `db` on port 5432, so it reads a
-separate variable. Add it to `.env` too, then run `docker compose up -d api`:
-
-```bash
-DOCKER_API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@db:5432/news
-```
+**After each new migration** (when you update the code): run `uv run alembic upgrade head`,
+then `scripts/db_roles.sql` as in setup step 5, before the next daily collection. The
+collection refuses to run while the database is behind the code.
 
 ---
 
@@ -268,8 +267,8 @@ DOCKER_API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@db:5432/ne
 
 | I want to… | Command |
 | --- | --- |
-| Start everything | `docker compose up -d` |
-| Stop everything (your data is kept) | `docker compose stop` |
+| Start the API | `uv run uvicorn app.main:app --port 8000` (or `docker compose up -d api`) |
+| Start the test database | `docker compose up -d db` |
 | Collect new articles | `uv run news ingest` |
 | Collect with progress details | `uv run news ingest -v` |
 | Back up and verify | `uv run news backup && uv run news restore-test` |
@@ -279,7 +278,7 @@ DOCKER_API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@db:5432/ne
 | Export a sample to label (to `~/news-eval/gold`) | `uv run news eval export` |
 | Score the labelled sample | `uv run news eval score ~/news-eval/gold/<dir>/labels.csv` |
 | See all options | `uv run news --help` |
-| Update to the latest version | `git pull && uv sync && docker compose up -d --build` |
+| Update to the latest version | `git pull && uv sync && uv run alembic upgrade head` |
 
 ---
 
@@ -287,12 +286,13 @@ DOCKER_API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@db:5432/ne
 
 | Problem | Fix |
 | --- | --- |
-| `Not ready: PostgreSQL is not reachable` | Start Docker Desktop, then run `docker compose up -d`. |
-| `Not ready: The database is at migration …` | You updated the code. Run `docker compose up -d --build` (or `uv run alembic upgrade head`). |
-| `port is already allocated` for **8000** | Another program uses port 8000. Run `API_PORT=8001 docker compose up -d` and use `http://localhost:8001`. |
-| `port is already allocated` for **5433** | Another program uses port 5433. Stop it, or change `5433` in `docker-compose.yml` **and** in `DATABASE_URL` in `.env`. |
+| `Not ready: PostgreSQL is not reachable` | Check your internet connection and that `DATABASE_URL` in `.env` is Neon's connection string. Neon wakes an idle database in a few seconds: try again. |
+| `Not ready: The database is at migration …` | You updated the code. Run `uv run alembic upgrade head`, then `scripts/db_roles.sql` (setup step 5). |
+| `port is already allocated` for **8000** | Another program uses port 8000. Use `--port 8001` (or `API_PORT=8001 docker compose up -d api`). |
+| Tests say `DATABASE_URL points at Neon` | Set `TEST_DATABASE_URL` in `.env` (setup step 6). Tests never run on Neon. |
 | `Not started: another news ingest is already running` | Wait for the other run to finish (only one runs at a time). |
-| `password authentication failed` | The password in `.env` doesn't match the database. If you have no data yet: `docker compose down -v` (⚠️ deletes the database), then `docker compose up -d --build`. |
+| `password authentication failed` | The password in `.env` doesn't match. For Neon, copy the connection string again (or *Reset password* in the console). |
+| The daily collection stopped running | GitHub pauses scheduled workflows after 60 days without repository activity. Re-enable it in the *Actions* tab. |
 | A feed shows `FAILED` in the report | Usually a temporary network or site problem. Run again later. After 20 failures in a row a feed is paused; see `/api/v1/feeds`. |
 | Strange import errors on macOS | If the project is inside an iCloud-synced folder (Desktop or Documents), iCloud can damage the Python environment. Move the project elsewhere, e.g. `~/code`, then run `uv sync`. |
 
@@ -302,8 +302,9 @@ DOCKER_API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@db:5432/ne
 
 This project is designed to be a good citizen:
 
-- **Article text stays private.** For Hespress, full text is stored only on your computer,
-  for non-commercial educational analysis: the owner's decision, recorded in the database.
+- **Article text stays private.** For Hespress, full text is stored only in your private
+  Neon database, for non-commercial educational analysis: the owner's decision, recorded
+  in the database and in `docs/architecture.md` sections 5.4 and 5.6.
   The API never shows it, and nothing is exported or published. The one exception: AI
   analysis sends article text to Google's Gemini API (free tier); see
   `docs/architecture.md` section 5.5. Hespress's terms reserve
@@ -326,8 +327,8 @@ legal advice.
 <details>
 <summary><b>Project layout, tests and contributing</b></summary>
 
-**How it fits together:** a manually run command (`news ingest`) collects articles into a
-local PostgreSQL; a read-only FastAPI app serves them. The full design, including how
+**How it fits together:** a command (`news ingest`), run daily by GitHub Actions or by hand,
+collects articles into PostgreSQL on Neon; a read-only FastAPI app serves them. The full design, including how
 catch-up and rights handling work, is in
 [docs/architecture.md](docs/architecture.md). Conventions for AI-assisted work are in
 [CLAUDE.md](CLAUDE.md).
@@ -344,7 +345,7 @@ app/
   models/         database tables
   schemas/        API response shapes
 alembic/          database migrations
-scripts/          database roles (optional extra security)
+scripts/          database roles and login passwords
 tests/            automated tests
 docs/             architecture and design decisions
 ```
@@ -355,8 +356,8 @@ docs/             architecture and design decisions
 uv run pre-commit install          # once: run checks automatically before each commit
 uv run ruff check . && uv run ruff format --check .
 uv run mypy app tests alembic
-uv run pytest                      # needs the database running; uses a separate
-                                   # news_test database, never your real data
+uv run pytest                      # needs the local test database (docker compose up -d db)
+                                   # and TEST_DATABASE_URL; never touches Neon
 uv run pytest -m "not integration" # quick tests, no database needed
 ```
 
@@ -374,12 +375,8 @@ in `uv.lock`, which must be committed.
 **All settings** live in `.env`; [.env.example](.env.example) lists every option with its
 default.
 
-**Optional extra security:** `scripts/db_roles.sql` creates restricted database roles. The
-API is read-only even without them; see the comments in that file.
-
-```bash
-docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 < scripts/db_roles.sql
-```
+**Database roles:** `scripts/db_roles.sql` creates the restricted roles (the API can
+never read article text); re-run it after every migration (setup step 5).
 
 **Command exit codes** (useful in scripts): `0` ok · `1` something failed · `2` database
 not ready · `3` already running · `130` interrupted.

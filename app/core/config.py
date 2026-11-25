@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     database_url: SecretStr
     # Optional: a login user in the SELECT-only `news_api` role, used by the API.
     api_database_url: SecretStr | None = None
+    # Tests only (tests/conftest.py): the server the `<db>_test` database lives on. Set it
+    # when DATABASE_URL points at a remote database (Neon): tests then stay local.
+    test_database_url: SecretStr | None = None
 
     # Outbound HTTP (ingestion). The User-Agent identifies us and gives publishers a contact.
     user_agent: str = (
@@ -70,13 +73,21 @@ class Settings(BaseSettings):
     # default, so tool and server versions always match. Use "" for host-installed tools.
     pg_tools_command: str = "docker compose exec -T db"
 
-    @field_validator("api_database_url", mode="before")
+    @field_validator("database_url", "api_database_url", "test_database_url", mode="before")
     @classmethod
-    def _empty_api_url_means_unset(cls, value: object) -> object:
+    def _normalize_database_url(cls, value: object) -> object:
         # docker compose passes an unset variable as "": treat it as not configured.
-        return None if value == "" else value
+        if value == "":
+            return None
+        # Neon (and most providers) show `postgresql://` or `postgres://`: use psycopg 3.
+        raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+        if isinstance(raw, str):
+            for prefix in ("postgresql://", "postgres://"):
+                if raw.startswith(prefix):
+                    return "postgresql+psycopg://" + raw.removeprefix(prefix)
+        return value
 
-    @field_validator("database_url", "api_database_url")
+    @field_validator("database_url", "api_database_url", "test_database_url")
     @classmethod
     def _require_async_capable_driver(cls, value: SecretStr | None) -> SecretStr | None:
         if value is not None and not value.get_secret_value().startswith("postgresql+psycopg://"):

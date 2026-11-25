@@ -2,11 +2,11 @@
 --
 -- Passwords come from psql variables, never from this file. Run db_roles.sql first, then:
 --
---   read -rs API_PW && read -rs INGEST_PW
---   docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 \
+--   read -rs NEON_URL && read -rs API_PW && read -rs INGEST_PW
+--   docker run --rm -i postgres:18-alpine psql "$NEON_URL" -v ON_ERROR_STOP=1 \
 --     -v api_password="$API_PW" -v ingest_password="$INGEST_PW" \
 --     < scripts/db_login_passwords.sql
---   unset API_PW INGEST_PW
+--   unset NEON_URL API_PW INGEST_PW
 --
 -- The server stores a SCRAM hash (password_encryption = scram-sha-256, the default).
 
