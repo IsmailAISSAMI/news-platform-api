@@ -6,9 +6,35 @@ any `User-agent` line. We deliberately apply such orphan rules to everyone: foll
 publisher's evident intent is the conservative choice.
 """
 
+import logging
+import math
 import re
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
+from urllib.parse import quote
+
+logger = logging.getLogger(__name__)
+
+# A Crawl-delay above this is treated as this (with a warning): one request a minute is
+# still polite, and an absurd value must not stall a run forever.
+MAX_CRAWL_DELAY_S = 60.0
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_ESCAPE = re.compile(r"%([0-9A-Fa-f]{2})")
+
+
+def normalize_path(value: str) -> str:
+    """Percent-encoding normal form (RFC 3986 §6.2.2), so paths and patterns compare equal.
+
+    Escapes of unreserved characters are decoded (`%7E` -> `~`), other escapes are
+    upper-cased (`%c3` -> `%C3`), and raw non-ASCII characters are UTF-8 encoded.
+    """
+
+    def unescape(match: re.Match[str]) -> str:
+        char = chr(int(match.group(1), 16))
+        return char if char in _UNRESERVED else f"%{match.group(1).upper()}"
+
+    encoded = quote(value, safe="".join(chr(c) for c in range(0x21, 0x7F)))
+    return _ESCAPE.sub(unescape, encoded)
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,11 +47,13 @@ class Rule:
         return len(self.pattern)
 
     def matches(self, path: str) -> bool:
+        """`path` must already be in normal form (`normalize_path`)."""
         return _compile(self.pattern).match(path) is not None
 
 
 @lru_cache(maxsize=512)
 def _compile(pattern: str) -> re.Pattern[str]:
+    pattern = normalize_path(pattern)
     anchored = pattern.endswith("$")
     body = pattern[:-1] if anchored else pattern
     regex = ".*".join(re.escape(part) for part in body.split("*"))
@@ -58,6 +86,7 @@ class RobotsPolicy:
             return False
         if path == "/robots.txt":
             return True
+        path = normalize_path(path)
         for rule in self._ordered:
             if rule.matches(path):
                 return rule.allow
@@ -128,4 +157,11 @@ def _parse_delay(value: str) -> float | None:
         delay = float(value)
     except ValueError:
         return None
-    return delay if delay >= 0 else None
+    if not math.isfinite(delay) or delay < 0:
+        return None
+    if delay > MAX_CRAWL_DELAY_S:
+        logger.warning(
+            "Crawl-delay %gs is above %gs; using %gs", delay, MAX_CRAWL_DELAY_S, MAX_CRAWL_DELAY_S
+        )
+        return MAX_CRAWL_DELAY_S
+    return delay

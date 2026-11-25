@@ -9,13 +9,16 @@ import base64
 import binascii
 import json
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from pydantic import AwareDatetime
 from sqlalchemy import Select, func, select, tuple_
 
 from app.api.caching import cached_json
 from app.api.deps import DbSession
+from app.core.errors import NOT_FOUND
 from app.models import Article, Feed, Source
 from app.schemas.catalog import (
     ArticleOut,
@@ -30,6 +33,13 @@ from app.schemas.catalog import (
 router = APIRouter()
 
 MAX_LIMIT = 100
+MAX_ID = 2**63 - 1  # PostgreSQL bigint
+NO_NUL = r"^[^\x00]*$"  # PostgreSQL text cannot hold NUL: reject it as invalid input
+
+ArticleId = Annotated[int, Path(ge=1, le=MAX_ID)]
+Cursor = Annotated[
+    str | None, Query(max_length=200, description="`next_cursor` from a previous page.")
+]
 
 
 @router.get("/sources", response_model=list[SourceOut], tags=["Sources"])
@@ -66,23 +76,45 @@ async def list_articles(  # noqa: PLR0913  # each query parameter is a documente
     request: Request,
     db: DbSession,
     *,
-    source: Annotated[str | None, Query(description="Source slug, e.g. hespress-en.")] = None,
-    category: Annotated[str | None, Query(description="Exact category name.")] = None,
-    language: Annotated[str | None, Query(description="Language code, e.g. en.")] = None,
-    published_after: Annotated[datetime | None, Query()] = None,
-    published_before: Annotated[datetime | None, Query()] = None,
+    source: Annotated[
+        str | None,
+        Query(max_length=64, pattern=NO_NUL, description="Source slug, e.g. hespress-en."),
+    ] = None,
+    category: Annotated[
+        str | None, Query(max_length=100, pattern=NO_NUL, description="Exact category name.")
+    ] = None,
+    language: Annotated[
+        str | None, Query(max_length=16, pattern=NO_NUL, description="Language code, e.g. en.")
+    ] = None,
+    published_after: Annotated[
+        AwareDatetime | None, Query(description="Inclusive; needs a UTC offset.")
+    ] = None,
+    published_before: Annotated[
+        AwareDatetime | None, Query(description="Exclusive; needs a UTC offset.")
+    ] = None,
     q: Annotated[
         str | None,
         Query(
             min_length=2,
             max_length=200,
+            pattern=NO_NUL,
             description="Full-text search over titles (and excerpts when stored). "
             "Best effort, English stemming. Results stay in newest-first order.",
         ),
     ] = None,
-    cursor: Annotated[str | None, Query(description="`next_cursor` from a previous page.")] = None,
+    cursor: Cursor = None,
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = 20,
 ) -> Response:
+    if published_after and published_before and published_after >= published_before:
+        raise RequestValidationError(
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("query", "published_after"),
+                    "msg": "published_after must be earlier than published_before",
+                }
+            ]
+        )
     stmt = _article_query()
     if source:
         stmt = stmt.where(Source.slug == source)
@@ -115,11 +147,9 @@ async def list_articles(  # noqa: PLR0913  # each query parameter is a documente
     "/articles/{article_id}",
     response_model=ArticleOut,
     tags=["Articles"],
-    responses={404: {"description": "No such article"}},
+    responses=NOT_FOUND,
 )
-async def get_article(
-    request: Request, db: DbSession, article_id: Annotated[int, Path(ge=1)]
-) -> Response:
+async def get_article(request: Request, db: DbSession, article_id: ArticleId) -> Response:
     row = (await db.execute(_article_query().where(Article.id == article_id))).first()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Article not found")
@@ -159,15 +189,19 @@ def _encode_cursor(published_at: datetime, article_id: int) -> str:
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, int]:
+    invalid = HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor")
     try:
         raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
-        data = json.loads(raw)
-        published_at = datetime.fromisoformat(data["p"])
-        article_id = int(data["i"])
+        data: Any = json.loads(raw)
+        stamp, article_id = data["p"], data["i"]
+        if not isinstance(stamp, str):
+            raise invalid
+        published_at = datetime.fromisoformat(stamp)
     except (binascii.Error, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor"
-        ) from exc
+        raise invalid from exc
+    # Exactly an int: JSON true/false and floats such as 1.5 are not ids.
+    if type(article_id) is not int or not 1 <= article_id <= MAX_ID:
+        raise invalid
     if published_at.tzinfo is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid cursor")
+        raise invalid
     return published_at, article_id

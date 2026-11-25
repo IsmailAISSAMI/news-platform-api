@@ -12,8 +12,10 @@ Design (owner rules, docs/architecture.md 5.5):
   next run picks up whatever is not done yet. Nothing is analysed twice for the same
   analyzer version (model + prompt + schema).
 - Safety net for unusable answers (cut off, invalid JSON, schema errors): the article
-  is retried later in the same run, up to `MAX_ATTEMPTS` in total, every attempt
-  stored with its raw answer. A cut-off answer is retried with a compact-output
+  is retried later in the same run, up to `MAX_ATTEMPTS` in total. The row keeps only
+  the LAST attempt's raw answer; every attempt is summarised in `attempt_history`
+  (status, error, finish reason, tokens, time; no raw text), appended, never replaced.
+  A cut-off answer is retried with a compact-output
   instruction (the same request would be cut off again). After the last attempt it
   waits for `--retry-failed`.
 - Never breaks on Google's "busy" errors: the client waits them out (shared cooldown).
@@ -24,11 +26,16 @@ Design (owner rules, docs/architecture.md 5.5):
   leaves `finished_at` NULL.
 
 Status rule (`analysis_status`), the only place that decides it:
-- `needs_review` when at least one evidence quote is UNVERIFIED: its status is
-  fabricated (not in the article), misplaced (only in another paragraph) or
+- `needs_review` when at least one evidence quote of the model's answer is UNVERIFIED:
+  its status is fabricated (not in the article), misplaced (only in another paragraph),
   bad_paragraph (cites a paragraph that does not exist and the quote is not in the
-  article). The paths are stored sorted in `unverified_paths`. Such an answer is kept
-  for a person to check, and it is never trusted as `succeeded`.
+  article) or too_short (proves nothing). These paths, into the model's answer, are
+  stored sorted in `unverified_paths`, and the statuses in `evidence`. Such an answer is
+  kept for a person to check, and it is never trusted as `succeeded`.
+- Quarantine works on the CLEANED analysis, the object the briefing is built from:
+  cleanup drops and merges items, so raw indexes would point at the wrong item. The
+  cleaned analysis is verified again (statuses stored in `evidence` under `cleaned:`)
+  and its unverified items are removed from the briefing.
 - `succeeded` only when `unverified_paths` is empty.
 - Semantic issues (`Issue` values such as a name that is not in the article) are
   review flags only: they never change the status.
@@ -41,8 +48,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime
 from typing import Any, Literal
 
-from sqlalchemy import and_, func, or_, select, text, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import and_, cast, func, literal, or_, select, text, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.analysis.briefing import make_briefing
@@ -70,7 +77,12 @@ COMPACT_INSTRUCTION = (
     "Keep every string short. Output the JSON object only, with no reasoning before it."
 )
 UNVERIFIED = frozenset(
-    {EvidenceStatus.FABRICATED, EvidenceStatus.MISPLACED, EvidenceStatus.BAD_PARAGRAPH}
+    {
+        EvidenceStatus.FABRICATED,
+        EvidenceStatus.MISPLACED,
+        EvidenceStatus.BAD_PARAGRAPH,
+        EvidenceStatus.TOO_SHORT,
+    }
 )
 
 OutcomeStatus = Literal["succeeded", "needs_review", "failed", "skipped", "stopped", "missing"]
@@ -205,6 +217,12 @@ async def analyse_article(
     )  # fmt: skip
     unverified = sorted(p for p, s in evidence.statuses.items() if s in UNVERIFIED)
     status = analysis_status(unverified)
+    cleaned_evidence = verify(cleaned, paragraphs)  # same object as the briefing
+    quarantined = sorted(p for p, s in cleaned_evidence.statuses.items() if s in UNVERIFIED)
+    briefing = make_briefing(
+        cleaned.model_dump(mode="json"), quarantined, paragraphs=paragraphs,
+        review_required=status == "needs_review",
+    )  # fmt: skip
     duration = round(completion.duration_s, 1)
     values: dict[str, Any] = {
         "status": status,
@@ -217,9 +235,10 @@ async def analyse_article(
         "evidence": {
             **{k: v.value for k, v in evidence.statuses.items()},
             **{f"issue:{k}": v.value for k, v in issues.items()},
+            **{f"cleaned:{k}": v.value for k, v in cleaned_evidence.statuses.items()},
         },
         "unverified_paths": unverified,
-        "briefing": make_briefing(cleaned.model_dump(mode="json"), unverified),
+        "briefing": briefing,
         "input_tokens": completion.prompt_tokens,
         "output_tokens": completion.completion_tokens,
         "duration_s": duration,
@@ -315,6 +334,16 @@ async def _run_locked(
     workers = [asyncio.create_task(run.worker()) for _ in range(concurrency)]
     try:
         await asyncio.gather(*workers)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Ctrl+C or a cancelled task: an orderly stop, not a crash. Record the run as
+        # interrupted, then let the cancellation through.
+        report.stop_reason = "interrupted"
+        for worker in workers:
+            worker.cancel()
+        report.not_sent = queue.qsize()
+        report.elapsed_s = time.monotonic() - run.started
+        await asyncio.shield(_finish_run(session, report))
+        raise
     finally:
         for worker in workers:
             worker.cancel()
@@ -323,8 +352,8 @@ async def _run_locked(
         report.pending_after = len(
             await pending_article_ids(session, version, retry_failed=options.retry_failed)
         )
-    # Only reached when the walk ended normally (a limit or a stop included). A crash
-    # skips this, so the run row keeps finished_at NULL.
+    # Reached when the walk ended normally (a limit or a stop included); an interruption
+    # finished the row above. A crash skips both, so the row keeps finished_at NULL.
     await _finish_run(session, report)
     return report
 
@@ -410,7 +439,8 @@ class _Run:
                 self.report.durations.append(result.duration_s)
             await _save(
                 session, article_id, self.version, self.llm.model,
-                {"attempts": attempts, **result.values},
+                {"attempts": attempts, **result.values,
+                 "attempt_history": [attempt_entry(attempts, result)]},
             )  # fmt: skip
         logger.info("%s · %s · %s", outcome, self.progress(), await self.llm.usage_line())
 
@@ -433,17 +463,45 @@ async def _previous(session: AsyncSession, article_id: int, version: str) -> Art
     )
 
 
+def attempt_entry(attempt: int, result: AnalysisOutcome) -> dict[str, Any]:
+    """One `attempt_history` entry: no raw answer, no article text."""
+    if result.status == "failed":
+        finish = "length" if is_cut_off(result.error) else "invalid"
+    elif result.status == "skipped":
+        finish = None  # never sent
+    else:
+        finish = "stop"
+    return {
+        "attempt": attempt,
+        "status": result.status,
+        "error": (result.error or None) and result.error.split(": ", 1)[0][:200],
+        "finish_reason": finish,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "at": datetime.now(UTC).isoformat(),
+    }
+
+
 async def _save(
     session: AsyncSession, article_id: int, version: str, model: str, values: dict[str, Any]
 ) -> None:
-    """Insert or update this article's analysis for `version`, and commit at once."""
+    """Insert or update this article's analysis for `version`, and commit at once.
+
+    `values["attempt_history"]` (this attempt's entry) is appended to the stored list;
+    earlier entries are kept.
+    """
     statement = insert(ArticleAnalysis).values(
         article_id=article_id, analyzer_version=version, model=model, **values
     )
+    history = func.coalesce(ArticleAnalysis.attempt_history, cast(literal("[]"), JSONB))
     await session.execute(
         statement.on_conflict_do_update(
             index_elements=[ArticleAnalysis.article_id, ArticleAnalysis.analyzer_version],
-            set_={**values, "updated_at": func.now()},
+            set_={
+                **values,
+                "attempt_history": history.op("||")(statement.excluded.attempt_history),
+                "updated_at": func.now(),
+            },
         )
     )
     await session.commit()

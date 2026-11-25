@@ -1,11 +1,17 @@
 // Briefing screen: list and detail views over the read-only JSON API (same origin).
 import {
-  chip, collapsible, el, formatDate, formatPublished, label, list, notStated, NOT_STATED,
+  chip, collapsible, el, formatDate, formatPublished, hidden, label, list, notStated, NOT_STATED,
+  outLink,
 } from "./dom.js";
 
 const API = "/api/v1";
 const PAGE = 20;
 const main = () => document.getElementById("main");
+const TITLE = "News briefings";
+
+// Navigation token: each route change bumps it; responses for an older token are dropped.
+let nav = 0;
+const current = (token) => token === nav;
 
 class HttpError extends Error {
   constructor(status) { super(`HTTP ${status}`); this.status = status; }
@@ -21,18 +27,23 @@ async function getJson(path) {
   return response.json();
 }
 
-function show(...nodes) {
+// Focus moves to main only on a route change (focus = true), never on a repaint.
+function show(focus, ...nodes) {
   const root = main();
   // Skip empty slots (e.g. no review banner): replaceChildren would print "null".
   root.replaceChildren(...nodes.filter((n) => n !== null && n !== undefined));
-  root.focus({ preventScroll: true });
+  if (focus) root.focus({ preventScroll: true });
 }
 
-function errorView(error, retry) {
-  if (error instanceof HttpError && error.status === 404) {
-    return el("div", { class: "banner error", role: "alert" }, "No analysis for this article yet. ",
-      el("a", { href: "#/" }, "Back to briefings"));
-  }
+function notFoundView(message) {
+  document.title = `Not found - ${TITLE}`;
+  return el("div", { class: "banner error", role: "alert" }, `${message} `,
+    el("a", { href: "#/" }, "Back to briefings"));
+}
+
+function errorView(error, retry, notFound) {
+  if (error instanceof HttpError && error.status === 404) return notFoundView(notFound);
+  document.title = `Error - ${TITLE}`;
   return el("div", { class: "banner error", role: "alert" },
     "Could not reach the API. ",
     el("button", { type: "button", onclick: retry }, "Retry"));
@@ -53,6 +64,7 @@ function statusChips(reportType, eventStatus, review) {
 function card(item) {
   const places = (item.places || []).slice(0, 3).map((p) => p.name_as_written);
   const actors = (item.actors || []).slice(0, 3).map((a) => a.full_name);
+  const source = item.source?.name || item.source_name || "original article";
   return el("li", { class: "card" },
     el("div", { class: "meta" },
       el("time", { datetime: item.published_at }, formatPublished(item.published_at)),
@@ -61,7 +73,8 @@ function card(item) {
     el("div", { class: "facts" },
       el("span", {}, "When: ", formatDate(item.event_date) || "date not stated"),
       el("span", {}, "Where: ", places.length ? places.join(", ") : "not stated"),
-      el("span", {}, "Who: ", actors.length ? actors.join(", ") : "not stated")));
+      el("span", {}, "Who: ", actors.length ? actors.join(", ") : "not stated")),
+    el("p", { class: "source" }, "Read at ", outLink(item.canonical_url, source)));
 }
 
 function matches(item) {
@@ -72,52 +85,76 @@ function matches(item) {
   return hay.includes(state.query);
 }
 
-function renderList() {
-  const statuses = [...new Set(state.items.map((i) => i.event_status).filter(Boolean))].sort();
+// The toolbar is built once per visit; later updates repaint only cards, options and count.
+let ui = null;
+
+function buildList() {
   const search = el("input", {
     type: "search", "aria-label": "Search loaded briefings", placeholder: "Search loaded briefings",
     value: state.query,
+    oninput: () => { state.query = search.value.trim().toLowerCase(); paintCards(); },
   });
-  const select = el("select", { "aria-label": "Filter by event status" },
-    el("option", { value: "" }, "All statuses"),
-    statuses.map((s) => el("option", { value: s, selected: s === state.status }, label(s))));
-  const cards = el("ul", { class: "cards", "aria-live": "polite" });
+  const select = el("select", { "aria-label": "Filter by event status",
+    onchange: () => { state.status = select.value; paintCards(); } });
+  const cards = el("ul", { class: "cards" });
   const count = el("p", { class: "muted", role: "status" });
-  const more = state.cursor
-    ? el("button", { type: "button", onclick: () => loadMore(more) }, "Load more")
-    : null;
-
-  const paint = () => {
-    const visible = state.items.filter(matches);
-    cards.replaceChildren(...visible.map(card));
-    count.textContent = `${visible.length} of ${state.items.length} loaded briefing(s) shown.`;
-  };
-  search.addEventListener("input", () => { state.query = search.value.trim().toLowerCase(); paint(); });
-  select.addEventListener("change", () => { state.status = select.value; paint(); });
-  paint();
-
-  show(el("h1", {}, "Latest briefings"),
+  const more = el("button", { type: "button", onclick: () => loadMore(nav, true) }, "Load more");
+  ui = { search, select, cards, count, more };
+  show(true, el("h1", {}, "Latest briefings"),
     el("div", { class: "toolbar" }, search, select), count, cards, more);
-  if (state.items.length === 0) cards.replaceChildren(el("li", { class: "muted" }, "No briefings yet."));
 }
 
-async function loadMore(button) {
-  if (button) { button.disabled = true; button.textContent = "Loading..."; }
+function paintOptions() {
+  const statuses = [...new Set(state.items.map((i) => i.event_status).filter(Boolean))].sort();
+  if (state.status && !statuses.includes(state.status)) statuses.push(state.status);
+  ui.select.replaceChildren(el("option", { value: "" }, "All statuses"),
+    ...statuses.map((s) => el("option", { value: s, selected: s === state.status }, label(s))));
+}
+
+function paintCards() {
+  const visible = state.items.filter(matches);
+  ui.cards.replaceChildren(...(state.items.length === 0
+    ? [el("li", { class: "muted" }, "No briefings yet.")] : visible.map(card)));
+  ui.count.textContent = `${visible.length} of ${state.items.length} loaded briefing(s) shown.`;
+  ui.more.hidden = !state.cursor;
+  ui.more.disabled = false;
+  ui.more.textContent = "Load more";
+}
+
+async function loadMore(token, focusNew) {
+  if (ui && focusNew) { ui.more.disabled = true; ui.more.textContent = "Loading..."; }
   try {
     const query = `?limit=${PAGE}` + (state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : "");
     const page = await getJson(`/briefings${query}`);
+    if (!current(token)) return;
+    const before = state.items.length;
     state.items.push(...page.items);
     state.cursor = page.next_cursor;
     state.loaded = true;
-    renderList();
+    if (!ui) buildList();
+    paintOptions();
+    paintCards();
+    if (focusNew) {
+      // Focus the first newly loaded card's link, if it is visible under the filter.
+      const fresh = state.items.slice(before).find(matches);
+      const link = fresh && ui.cards.querySelector(`a[href="#/article/${fresh.article_id}"]`);
+      if (link) link.focus();
+    }
   } catch (error) {
-    show(errorView(error, () => loadMore()));
+    if (!current(token)) return;
+    ui = null;
+    show(true, errorView(error, () => loadMore(nav, false), "The briefings list was not found."));
   }
 }
 
-function listView() {
-  if (state.loaded) renderList();
-  else loadMore();
+function listView(token) {
+  document.title = TITLE;
+  ui = null;
+  if (state.loaded) { buildList(); paintOptions(); paintCards(); }
+  else {
+    show(true, el("p", { class: "muted" }, "Loading briefings..."));
+    loadMore(token, false);
+  }
 }
 
 // --- detail -------------------------------------------------------------------------
@@ -135,13 +172,29 @@ function groupBy(items, key, order) {
   return [...groups].filter(([, v]) => v.length);
 }
 
+// Optional API field: panel keys whose content was not checked against the article.
+let unverified = new Set();
+const UNVERIFIED = "Not checked against the article.";
+
 function panel(title, ...content) {
-  return el("section", { class: "panel", "aria-label": title }, el("h2", {}, title), ...content);
+  return el("section", { class: "panel" }, el("h2", {}, title), note(title), ...content);
+}
+
+function note(title) {
+  return unverified.has(title.toLowerCase().replace(/ /g, "_"))
+    ? el("p", { class: "unverified" }, UNVERIFIED) : null;
+}
+
+// The publication timestamp as a UTC calendar date (YYYY-MM-DD).
+function utcDate(iso) {
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? String(iso).slice(0, 10) : date.toISOString().slice(0, 10);
 }
 
 // A date counts as "happened" when it is on or before publication, at its own precision.
+// Event dates are calendar dates; publication is converted to its UTC date to match.
 function happened(date, published) {
-  const pub = published.slice(0, 10);
+  const pub = utcDate(published);
   const d = String(date).slice(0, 10);
   return d <= pub.slice(0, d.length);
 }
@@ -174,9 +227,22 @@ function whoPanel(actors) {
   if (!actors.length) return panel("Who", notStated());
   return panel("Who", groupBy(actors, "involvement", INVOLVEMENT).map(([inv, items]) => [
     el("h3", {}, label(inv)),
-    list(items, (a) => el("span", { class: `actor t-${String(a.type || "other").toLowerCase()}` },
+    list(items, (a) => el("span", { class: "actor" }, actorTag(a.type),
       a.full_name || a.name_as_written,
       a.role ? el("span", { class: "attr" }, ` (${a.role}; ${label(a.type)})`) : null))]));
+}
+
+const ACTOR_TYPES = {
+  person: "P", government_body: "G", political_party: "Pa", company: "Co", ngo: "N",
+  international_org: "I", court: "Ct", media: "M", group: "Gr", country: "C", other: "?",
+};
+
+// Visible short tag is decoration; the full type is read out from a visually-hidden label.
+function actorTag(type) {
+  const key = String(type || "other").toLowerCase();
+  return el("span", { class: "tag" },
+    el("span", { "aria-hidden": "true" }, `[${ACTOR_TYPES[key] || "?"}]`),
+    hidden(`${label(key)}: `));
 }
 
 function claimsPanel(claims) {
@@ -188,12 +254,17 @@ function claimsPanel(claims) {
     c.attributed_to ? el("div", { class: "attr" }, `according to ${c.attributed_to}`) : null))));
 }
 
-function detailView(id) {
-  show(el("p", { class: "muted" }, "Loading briefing..."));
+function detailView(id, token) {
+  document.title = `Loading briefing - ${TITLE}`;
+  show(true, el("p", { class: "muted" }, "Loading briefing..."));
   getJson(`/articles/${encodeURIComponent(id)}/briefing`).then((d) => {
+    if (!current(token)) return;
     const b = d.briefing;
+    const fields = d.unverified_fields ?? b.unverified_fields;
+    unverified = new Set(Array.isArray(fields) ? fields.map((f) => String(f).replace(/^\$\./, "").split(/[.[]/)[0].toLowerCase()) : []);
     const o = b.overview || {};
     document.title = `${o.headline || d.title} - Briefing`;
+    const source = d.source?.name || "original article";
     const header = el("header", {},
       el("a", { href: "#/" }, "Back to briefings"),
       el("h1", {}, o.headline || d.title),
@@ -201,37 +272,44 @@ function detailView(id) {
         el("span", {}, d.source?.name || ""),
         el("time", { datetime: d.published_at }, `Published ${formatPublished(d.published_at)}`),
         statusChips(o.report_type, o.event_status, d.review_required)),
-      el("a", { class: "origin", href: d.source_url, target: "_blank", rel: "noopener noreferrer" },
-        `Open original article (${d.source?.name || "source"})`));
+      outLink(d.source_url || d.url, `Open original article (${source})`, "origin"));
     const banner = d.review_required ? el("div", { class: "banner", role: "note" },
       `${d.removed_items} item(s) removed: their quotes could not be verified in the article.`) : null;
     const why = list(b.why, (c) => [c.text, c.attributed_to
       ? el("span", { class: "attr" }, ` (according to ${c.attributed_to})`) : null]);
     const impact = list(b.impact, (i) => [el("strong", {}, `${label(i.area)}: `), i.text, " ",
       chip(label(i.certainty))]);
-    show(header, banner, el("div", { class: "grid" },
+    show(false, header, banner, el("div", { class: "grid" },
       panel("What", b.what?.main_event ? el("p", {}, b.what.main_event) : notStated(),
         el("h3", {}, "Secondary events"), list(b.what?.secondary_events, (s) => s)),
       whenPanel(b, d.published_at),
       wherePanel(b.where || []),
       whoPanel(b.who || []),
       el("div", { class: "panel wide" }, claimsPanel(b.claims || [])),
-      collapsible("Why", why),
-      collapsible("How", b.how ? el("p", {}, b.how) : notStated()),
-      collapsible("Impact", impact),
-      collapsible("Context", list(b.context, (s) => s)),
-      collapsible("Open questions", list(b.open_questions, (s) => s)),
+      collapsible("Why", [note("Why"), why]),
+      collapsible("How", [note("How"), b.how ? el("p", {}, b.how) : notStated()]),
+      collapsible("Impact", [note("Impact"), impact]),
+      collapsible("Context", [note("Context"), list(b.context, (s) => s)]),
+      collapsible("Open questions", [note("Open questions"), list(b.open_questions, (s) => s)]),
       panel("Topics", b.topics?.length ? el("p", {}, b.topics.map((t) => [chip(t), " "])) : notStated()),
       panel("Tone", b.tone ? el("p", {}, chip(label(b.tone.label)), " ", b.tone.explanation) : notStated())));
-  }).catch((error) => show(errorView(error, () => detailView(id))));
+  }).catch((error) => {
+    if (!current(token)) return;
+    show(true, errorView(error, () => detailView(id, nav), "No briefing exists for this article yet."));
+  });
 }
 
 // --- routing ------------------------------------------------------------------------
 
 function route() {
-  const m = /^#\/article\/(\d+)$/.exec(location.hash);
-  if (m) detailView(m[1]);
-  else { document.title = "News briefings"; listView(); }
+  // The skip link targets #main: it is not a route.
+  if (location.hash === "#main") { main().focus(); return; }
+  const token = ++nav;
+  const hash = location.hash;
+  const m = /^#\/article\/([1-9]\d{0,18})$/.exec(hash);
+  if (m) detailView(m[1], token);
+  else if (hash === "" || hash === "#" || hash === "#/") listView(token);
+  else { ui = null; show(true, notFoundView("This page does not exist.")); }
 }
 
 window.addEventListener("hashchange", route);

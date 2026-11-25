@@ -39,7 +39,10 @@ def test_ready_returns_503_when_database_is_down(app: FastAPI, client: TestClien
     response = client.get("/health/ready")
 
     assert response.status_code == 503
-    assert response.json() == {"detail": "Database unavailable"}
+    assert response.json()["error"] == {
+        "code": "service_unavailable",
+        "message": "Database unavailable",
+    }
 
 
 def test_unversioned_legacy_route_is_gone(client: TestClient) -> None:

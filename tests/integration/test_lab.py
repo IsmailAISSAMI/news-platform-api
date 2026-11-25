@@ -62,8 +62,10 @@ async def articles(db_session: AsyncSession, source: Source, count: int) -> list
 
 
 def client(chat: Callable[[httpx.Request], httpx.Response]) -> GeminiClient:
-    async def no_sleep(_: float) -> None:
-        return None
+    clock = {"t": 0.0}
+
+    async def no_sleep(seconds: float) -> None:  # time moves on, instantly
+        clock["t"] += seconds
 
     return GeminiClient(
         httpx.AsyncClient(transport=httpx.MockTransport(chat)),
@@ -71,10 +73,11 @@ def client(chat: Callable[[httpx.Request], httpx.Response]) -> GeminiClient:
         model="gemma-4-31b-it",
         api_key=SecretStr("test-key"),
         budget=RequestBudget(
-            per_run=10,
+            per_run=3,
             per_day=1000,
             per_minute=10,
             input_tokens_per_minute=8000,
+            monotonic=lambda: clock["t"],
         ),
         ledger=FakeLedger(),
         sleep=no_sleep,

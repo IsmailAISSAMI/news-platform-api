@@ -22,10 +22,36 @@ audited against the real data and the hardware. Last updated 2026-11-25.
   under an advisory lock before each request is sent, as a `'failed'` placeholder that
   over-counts and never under-counts; the daily cap is counted per model (one model is
   allowed). `news gemini-usage` reads it. Details: architecture section 5.5.
-- **Briefings:** the servable part of an analysis (`make_briefing`: no evidence, no
-  unverified item), read by the API only through the `analysis_briefings` view
-  (`GET /api/v1/briefings`, `GET /api/v1/articles/{id}/briefing`, and the `/ui` screen).
-  Architecture section 7.
+- **Briefings:** the servable part of an analysis, read by the API only through the
+  `analysis_briefings` view (`GET /api/v1/briefings`, `GET /api/v1/articles/{id}/briefing`,
+  and the `/ui` screen). Architecture section 7. Since round 3 (2026-11-25),
+  `make_briefing` (`app/analysis/briefing.py`):
+  - **quarantines on the cleaned analysis:** the pipeline verifies the cleaned analysis,
+    the object the briefing is built from, and drops every unverified item; a path that
+    does not resolve raises;
+  - removes every `evidence` key;
+  - applies the **originality filter:** a string sharing a run of 8 or more consecutive
+    normalized tokens (`MIN_COPIED_RUN`) with any article paragraph is removed (its list
+    item, or a scalar set to null). Proper-name fields are exempt. The briefing records
+    `copied_items` (how many removals) and `copied_paths`;
+  - lists `unverified_fields`: served summary fields with no evidence at all (headline,
+    main event, how, context, open questions, topics, ...).
+- **Evidence and attribution checks** (`app/analysis/evidence.py`, `cleanup.py`): quotes
+  must match whole words; a quote is `too_short` unless it has at least 4 tokens or at
+  least 20 characters. A claim from an anonymous source with no attribution, or an
+  attribution naming someone the article never names, is flagged for review.
+- **Attempt history:** `article_analyses.attempt_history` keeps one entry per attempt
+  (no raw answer, no article text).
+- **Round-3 migrations:** `de01c28240f2` (indexes, non-negative CHECKs, identity id),
+  `7c3e9a1f5b20` (`api_calls.est_input_tokens` and `error`, for pacing across
+  processes), `aa372fadc9eb` (adds `attempt_history` and recomputes every answered
+  analysis's evidence statuses, status and briefing under the new rules, with a frozen
+  copy of the transform; no model call).
+- **Effect on the real data (to watch):** the originality filter removed between 1 and
+  13 copied items per article. Across 10 articles, 83 items were removed in total, and
+  74 of them were copies. Briefings are now much thinner: originality is an owner rule,
+  but this is a quality and coverage tradeoff. A next prompt version may need to ask for
+  original wording more firmly, so less is dropped.
 - **Evaluation:** `news eval export|score` (section 6).
 - **Open items:** section 8b ("Decision status") and section 9.
 

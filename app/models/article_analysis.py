@@ -3,13 +3,17 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    Identity,
+    Index,
     Integer,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -34,16 +38,40 @@ class ArticleAnalysis(Base):
     """
 
     __tablename__ = "article_analyses"
-    __table_args__ = (UniqueConstraint("article_id", "analyzer_version"),)
+    __table_args__ = (
+        # Also serves lookups by article_id alone (leftmost column).
+        UniqueConstraint("article_id", "analyzer_version"),
+        CheckConstraint(
+            "status IN ('succeeded', 'needs_review', 'failed', 'skipped')", name="status_known"
+        ),
+        CheckConstraint(
+            "status <> 'succeeded' OR unverified_paths IS NULL "
+            "OR jsonb_array_length(unverified_paths) = 0",
+            name="succeeded_fully_verified",
+        ),
+        CheckConstraint("attempts >= 0", name="attempts_non_negative"),
+        CheckConstraint("input_tokens >= 0", name="input_tokens_non_negative"),
+        CheckConstraint("output_tokens >= 0", name="output_tokens_non_negative"),
+        CheckConstraint("duration_s >= 0", name="duration_s_non_negative"),
+        # The analysis_briefings view (newest briefing per article).
+        Index(
+            "ix_article_analyses_briefings",
+            "article_id",
+            text("updated_at DESC"),
+            postgresql_where=text(
+                "status IN ('succeeded', 'needs_review') AND briefing IS NOT NULL"
+            ),
+        ),
+    )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     article_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("articles.id", ondelete="CASCADE"), index=True
+        BigInteger, ForeignKey("articles.id", ondelete="CASCADE")
     )
     analyzer_version: Mapped[str] = mapped_column(Text)  # e.g. "gemma-4-31b-it|p8|s7"
     model: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text)
-    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     error: Mapped[str | None] = mapped_column(Text)
     raw_output: Mapped[str | None] = mapped_column(Text)
     analysis: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -55,6 +83,9 @@ class ArticleAnalysis(Base):
     # Servable part (app/analysis/briefing.py): no evidence, no unverified item. Read by the
     # API only through the `analysis_briefings` view.
     briefing: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # One entry per attempt, appended (never overwritten): status, error, finish reason,
+    # tokens and time. No raw answer and no article text.
+    attempt_history: Mapped[list[Any]] = mapped_column(JSONB, server_default=text("'[]'::jsonb"))
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     duration_s: Mapped[float | None] = mapped_column(Float)

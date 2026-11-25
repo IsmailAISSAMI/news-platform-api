@@ -17,10 +17,13 @@ Where each limit lives:
 - the DAILY limit is the absolute stop. It is enforced by the `Ledger` (database), under
   a Postgres advisory lock, so two processes can never both take the last slot. Deleting
   or copying any local file cannot change it;
-- the PER-RUN limit is a counter in this process: it counts only ANSWERED requests;
-- the PER-MINUTE limits are a window in this process. They are exact only when one
-  analysis process runs at a time, which `news analyze` and `news lab` enforce with the
-  same Postgres advisory lock (`ANALYZE_LOCK_KEY`).
+- the PER-RUN limit is a counter in this process: it counts every request Google
+  answered with HTTP 200, usable or not. A `news lab` run can never use more than
+  `LAB_PER_RUN_CEILING` (3); `news analyze` uses its own per-run cap, at most the daily cap;
+- the PER-MINUTE limits are a window in this process, SEEDED from the database at the
+  first request (`Ledger.recent`: the requests and tokens of the last 60 s), so a new
+  process started right after another one still waits. Only one analysis process runs at
+  a time (`ANALYZE_LOCK_KEY`).
 
 Going over a per-minute limit only makes the caller wait. Going over any other limit
 refuses the request, which is then never sent.
@@ -40,7 +43,20 @@ WINDOW_S = 60.0
 # Google's free-tier limits for Gemma 4 31B, read on the owner's AI Studio page.
 GOOGLE_LIMITS = {"per_day": 14_400, "per_minute": 30, "input_tokens_per_minute": 16_000}
 # Our hard ceilings, far below Google's. Code refuses any setting above them.
-CEILINGS = {"per_run": 1000, "per_day": 1000, "per_minute": 20, "input_tokens_per_minute": 10_000}
+CEILINGS = {
+    "per_run": 1000,  # `news analyze`: never above the daily cap
+    "lab_per_run": 3,  # `news lab`: 3 answered requests per test
+    "per_day": 1000,
+    "per_minute": 20,
+    "input_tokens_per_minute": 10_000,
+    "concurrency": 8,
+}
+LAB_PER_RUN_CEILING = CEILINGS["lab_per_run"]
+CONCURRENCY_CEILING = CEILINGS["concurrency"]
+# Fields of RequestBudget checked against CEILINGS.
+_BUDGET_FIELDS = ("per_run", "per_day", "per_minute", "input_tokens_per_minute")
+# Pause added to a per-minute wait so the oldest request has surely left the window.
+PACE_PAD_S = 0.5
 
 Outcome = Literal["answered", "refused_busy", "failed"]
 
@@ -60,12 +76,12 @@ class RequestTooLargeError(BudgetExceededError):
 def estimate_tokens(text: str) -> int:
     """Estimate made before sending, a little above the real count.
 
-    Measured on Gemma 4 31B (2026-11-24): about 4.4 characters per input token, so
-    dividing by 4 over-estimates by about 10%. After each answer the per-minute window
-    is corrected to Google's real count (`RequestBudget.correct_last_estimate`), so
-    pacing stays exact.
+    Measured on Gemma 4 31B (2026-11-24): about 4.4 characters per input token on
+    English text. Counting UTF-8 BYTES divided by 3 keeps a wide margin, also for
+    accented or non-Latin text (more bytes per character, often more tokens). After each
+    answer the window is corrected to Google's real count (`RequestBudget.correct`).
     """
-    return len(text) // 4 + 1
+    return len(text.encode("utf-8")) // 3 + 1
 
 
 def quota_day_now() -> date:
@@ -100,26 +116,50 @@ class Ledger(Protocol):
         """Requests sent on `quota_day`: answered + refused_busy + failed."""
         ...
 
-    async def reserve(self, model: str, quota_day: date, per_day: int, run_id: int | None) -> int:
+    async def reserve(  # the reservation's fields
+        self,
+        model: str,
+        quota_day: date,
+        per_day: int,
+        run_id: int | None,
+        est_input_tokens: int | None = None,
+    ) -> int:
         """Count one request BEFORE it is sent. Returns the reservation id.
 
         Raises DailyLimitError (and stores nothing) if `per_day` requests were already sent.
         """
         ...
 
-    async def record(
+    async def record(  # the outcome's fields
         self,
         reservation_id: int,
         outcome: Outcome,
         input_tokens: int | None,
         output_tokens: int | None,
+        error: str | None = None,
     ) -> None:
         """Store how a reserved request ended."""
+        ...
+
+    async def recent(self, model: str, window_s: float) -> list[tuple[float, int]]:
+        """Requests sent in the last `window_s` seconds, by any process.
+
+        One (age in seconds, input tokens) pair per request, oldest first. Tokens are
+        Google's count when known, else the estimate stored at reservation.
+        """
         ...
 
     async def totals(self, model: str, days: int) -> list[DayUsage]:
         """Usage for the last `days` quota days, oldest first (days without use are 0)."""
         ...
+
+
+@dataclass
+class PaceHandle:
+    """One request in the per-minute window; `RequestBudget.correct` fixes its tokens."""
+
+    stamp: float
+    tokens: int
 
 
 @dataclass
@@ -132,13 +172,13 @@ class RequestBudget:
     input_tokens_per_minute: int
     now: Callable[[], datetime] = lambda: datetime.now(UTC)
     monotonic: Callable[[], float] = time.monotonic
-    used_this_run: int = 0  # answered by Google in this process (busy and failed excluded)
+    used_this_run: int = 0  # HTTP 200 answers in this process (busy and errors excluded)
     in_flight_this_run: int = 0  # admitted, not yet answered or refused
-    _window: deque[tuple[float, int]] = field(default_factory=deque, init=False)
+    _window: deque[PaceHandle] = field(default_factory=deque, init=False)
 
     def __post_init__(self) -> None:
-        for name, ceiling in CEILINGS.items():
-            value = getattr(self, name)
+        for name in _BUDGET_FIELDS:
+            value, ceiling = getattr(self, name), CEILINGS[name]
             if not 1 <= value <= ceiling:
                 msg = f"{name}={value} is outside the allowed range 1..{ceiling}"
                 raise ValueError(msg)
@@ -146,7 +186,7 @@ class RequestBudget:
     def quota_day(self) -> date:
         return self.now().astimezone(QUOTA_ZONE).date()
 
-    # --- per-run limit (process-local, answered requests only) ----------------------
+    # --- per-run limit (process-local, HTTP-200 answers only) -----------------------
 
     def check_size(self, tokens: int) -> None:
         if tokens > self.input_tokens_per_minute:
@@ -157,42 +197,59 @@ class RequestBudget:
             raise RequestTooLargeError(msg)
 
     def open_run_slot(self) -> None:
-        """Take one answered-request slot for a request about to be sent."""
+        """Take one per-run slot for a request about to be sent."""
         if self.used_this_run + self.in_flight_this_run >= self.per_run:
             msg = f"per-run limit reached ({self.per_run} answered requests)"
             raise BudgetExceededError(msg)
         self.in_flight_this_run += 1
 
     def settle_run_slot(self, *, answered: bool) -> None:
-        """Release the slot; only an answered request keeps it used."""
+        """Release the slot; a request Google answered (HTTP 200) keeps it used."""
         self.in_flight_this_run -= 1
         if answered:
             self.used_this_run += 1
 
-    # --- per-minute pacing (process-local) -------------------------------------------
+    # --- per-minute pacing (seeded from the database, then process-local) ------------
+
+    def _expire(self) -> float:
+        current = self.monotonic()
+        while self._window and current - self._window[0].stamp >= WINDOW_S:
+            self._window.popleft()
+        return current
+
+    def window_usage(self) -> tuple[int, int]:
+        """(requests, input tokens) in the last 60 s, as this budget counts them."""
+        self._expire()
+        return len(self._window), sum(h.tokens for h in self._window)
 
     def wait_seconds(self, tokens: int) -> float:
         """How long to wait before the per-minute limits allow this request (0 = now)."""
-        current = self.monotonic()
-        while self._window and current - self._window[0][0] >= WINDOW_S:
-            self._window.popleft()
+        current = self._expire()
         if (
             not self._window
             or tokens > self.input_tokens_per_minute  # never sendable: check_size refuses
             or (
                 len(self._window) < self.per_minute
-                and sum(t for _, t in self._window) + tokens <= self.input_tokens_per_minute
+                and sum(h.tokens for h in self._window) + tokens <= self.input_tokens_per_minute
             )
         ):
             return 0.0
-        return WINDOW_S - (current - self._window[0][0]) + 0.5
+        return WINDOW_S - (current - self._window[0].stamp) + PACE_PAD_S
 
-    def pace(self, tokens: int) -> None:
+    def seed(self, recent: list[tuple[float, int]]) -> None:
+        """Add requests other processes sent in the last minute: (age s, tokens)."""
+        current = self.monotonic()
+        merged = [PaceHandle(current - age, tokens) for age, tokens in recent]
+        merged += self._window
+        self._window = deque(sorted(merged, key=lambda h: h.stamp))
+
+    def pace(self, tokens: int) -> PaceHandle:
         """Count a request in the per-minute window, as it is sent."""
-        self._window.append((self.monotonic(), tokens))
+        handle = PaceHandle(self.monotonic(), tokens)
+        self._window.append(handle)
+        return handle
 
-    def correct_last_estimate(self, input_tokens: int | None) -> None:
-        """Pace on Google's real input count when the estimate was too low."""
-        if input_tokens and self._window:
-            stamp, estimate = self._window[-1]
-            self._window[-1] = (stamp, max(estimate, input_tokens))
+    def correct(self, handle: PaceHandle, input_tokens: int | None) -> None:
+        """Pace THIS request on Google's real input count when the estimate was too low."""
+        if input_tokens:
+            handle.tokens = max(handle.tokens, input_tokens)

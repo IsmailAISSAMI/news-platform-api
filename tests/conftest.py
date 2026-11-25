@@ -5,6 +5,11 @@ at a separate `<name>_test` database on the same server: the dev DB `news` becom
 `news_test`, and CI's `news` becomes `news_test` too. `tests/integration/conftest.py`
 creates and migrates it on first use. Advisory locks are per database, so tests also
 can't collide with a live `news ingest`.
+
+Only DATABASE_URL is taken from `.env` (for the server's credentials) and rewritten to
+`_test`. Then `Settings.model_config["env_file"]` is cleared, so nothing else (a real
+API_DATABASE_URL or Gemini key) can come from `.env`: `API_DATABASE_URL` is rewritten to
+`_test` or dropped, and `GEMINI_API_KEY` is a dummy.
 """
 
 import os
@@ -15,6 +20,8 @@ from sqlalchemy import make_url
 from app.core.config import Settings
 
 TEST_SUFFIX = "_test"
+DEFAULT_URL = "postgresql+psycopg://news:change-me@localhost:5433/news"  # compose default
+DUMMY_GEMINI_KEY = "test-dummy-key-not-real"
 
 
 def _real_database_url() -> str:
@@ -22,7 +29,7 @@ def _real_database_url() -> str:
         return os.environ["DATABASE_URL"]
     if Path(".env").exists():
         return Settings().database_url.get_secret_value()  # type: ignore[call-arg]  # from .env
-    return "postgresql+psycopg://news:change-me@localhost:5433/news"  # fresh clone
+    return DEFAULT_URL  # fresh clone
 
 
 def _test_database_url(real: str) -> str:
@@ -35,6 +42,13 @@ def _test_database_url(real: str) -> str:
 
 # Must run before `app.main` is imported: it builds the app (and caches settings).
 os.environ["DATABASE_URL"] = _test_database_url(_real_database_url())
+if os.environ.get("API_DATABASE_URL"):
+    os.environ["API_DATABASE_URL"] = _test_database_url(os.environ["API_DATABASE_URL"])
+else:
+    os.environ.pop("API_DATABASE_URL", None)
+os.environ["GEMINI_API_KEY"] = DUMMY_GEMINI_KEY
+# From here on nothing else comes from .env (no real API_DATABASE_URL or Gemini key).
+Settings.model_config["env_file"] = None
 
 from collections.abc import Iterator  # noqa: E402
 
@@ -48,8 +62,12 @@ from app.main import create_app  # noqa: E402
 @pytest.fixture
 def settings() -> Settings:
     settings = Settings()  # type: ignore[call-arg]  # DATABASE_URL comes from the environment
-    database = make_url(settings.database_url.get_secret_value()).database or ""
-    assert database.endswith(TEST_SUFFIX), f"refusing to test against {database!r}"
+    for url in (settings.database_url, settings.api_database_url):
+        if url is not None:
+            database = make_url(url.get_secret_value()).database or ""
+            assert database.endswith(TEST_SUFFIX), f"refusing to test against {database!r}"
+    key = settings.gemini_api_key
+    assert key is None or key.get_secret_value() == DUMMY_GEMINI_KEY, "real Gemini key in tests"
     return settings
 
 

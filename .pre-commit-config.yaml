@@ -14,11 +14,16 @@ repos:
       - id: check-yaml
       - id: check-added-large-files
       - id: detect-private-key
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1  # 83d9cd684c87d95d656c1458ef04895a7f1cbd8e
+    hooks:
+      - id: gitleaks
   - repo: local
     hooks:
       - id: repo-hygiene
         name: repository hygiene
-        entry: uv run python scripts/check_repo_hygiene.py
+        # Scans the staged content (what will be committed). CI runs the full-tree scan.
+        entry: uv run python scripts/check_repo_hygiene.py --staged
         language: system
         pass_filenames: false
         always_run: true

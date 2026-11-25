@@ -479,3 +479,125 @@ async def test_rewalk_fills_in_bodies_for_articles_stored_without_them(
     assert result.items_updated == 25  # bodies added to existing articles
     assert (await run.session.scalar(select(func.count()).select_from(ArticleBody))) == 25
     assert (await run.feed()).checkpoint_published_at == checkpoint  # not moved backwards
+
+
+# --- Review fixes: re-walk, checkpoint date, empty pages, margin -----------------------------
+
+
+async def test_shallow_rewalk_never_moves_the_checkpoint_past_an_unwalked_gap(
+    publisher: Publisher, run: Runner
+) -> None:
+    publisher.publish(*posts(1000, 20, NOW, step=timedelta(hours=1)))
+    await run.rss()
+    before = await run.feed()
+    checkpoint = (before.checkpoint_external_id, before.checkpoint_published_at)
+    validators = (before.etag, before.last_modified)
+    publisher.publish(*posts(5000, 40, NOW + timedelta(hours=40), step=timedelta(hours=1)))
+    later = NOW + timedelta(hours=41)
+
+    feed = await run.feed()
+    shallow = await walk_rss(
+        run.ctx(later),
+        feed,
+        bootstrap_since=later - timedelta(days=30),
+        max_pages=50,
+        rewalk_since=NOW + timedelta(hours=30),  # leaves hours 1-29 unwalked
+    )
+    assert shallow.stop_reason is StopReason.REWALK_FLOOR
+    feed = await run.feed()
+    assert (feed.checkpoint_external_id, feed.checkpoint_published_at) == checkpoint
+    assert (feed.etag, feed.last_modified) == validators
+
+    result = await run.rss(now=later)
+
+    assert result.stop_reason is StopReason.CHECKPOINT
+    assert len(await run.stored_ids()) == 20 + 40  # the gap the re-walk skipped
+    assert (await run.feed()).checkpoint_published_at == NOW + timedelta(hours=40)
+
+
+async def test_republished_checkpoint_does_not_end_the_walk(
+    publisher: Publisher, run: Runner
+) -> None:
+    publisher.publish(*posts(1000, 20, NOW, step=timedelta(hours=1)))
+    await run.rss()
+    checkpoint_id = (await run.feed()).checkpoint_external_id
+    assert checkpoint_id is not None
+    publisher.posts = [p for p in publisher.posts if str(p.post_id) != checkpoint_id]
+    publisher.publish(*posts(5000, 25, NOW + timedelta(hours=25), step=timedelta(hours=1)))
+    publisher.publish(Post(int(checkpoint_id), NOW + timedelta(hours=30)))  # re-dated: on top
+
+    result = await run.rss(now=NOW + timedelta(hours=31))
+
+    # Not CHECKPOINT on page 1: the walk goes on. Every old post is within the 1-day
+    # margin of the stored checkpoint date, so it reads to the end of the feed.
+    assert result.stop_reason is StopReason.FEED_END
+    assert result.pages_fetched > 1
+    assert len(await run.stored_ids()) == 20 + 25
+
+
+async def test_empty_page_after_a_full_page_is_an_error(publisher: Publisher, run: Runner) -> None:
+    publisher.publish(*posts(1000, 30, NOW, step=timedelta(hours=1)))
+    publisher.empty_pages = {2}
+
+    with pytest.raises(WalkError, match="empty page 2"):
+        await run.rss()
+    assert (await run.feed()).checkpoint_external_id is None
+
+
+async def test_empty_page_after_a_short_page_ends_the_feed(
+    publisher: Publisher, run: Runner
+) -> None:
+    publisher.publish(*posts(1000, 15, NOW, step=timedelta(hours=1)))  # page 2 has 5
+    publisher.empty_pages = {3}
+
+    result = await run.rss()
+
+    assert result.stop_reason is StopReason.FEED_END
+    assert result.items_new == 15
+
+
+async def test_checkpoint_margin_keeps_12h_older_items_and_stops_at_25h(
+    publisher: Publisher, run: Runner
+) -> None:
+    publisher.publish(Post(1, NOW))
+    await run.rss()
+    publisher.posts = []  # the checkpoint article was deleted
+    publisher.publish(
+        Post(4, NOW + timedelta(hours=1)),
+        Post(2, NOW - timedelta(hours=12)),  # backdated: inside the margin
+        Post(3, NOW - timedelta(hours=25)),  # beyond the margin
+    )
+
+    result = await run.rss(now=NOW + timedelta(hours=2))
+
+    assert result.stop_reason is StopReason.DATE_FLOOR
+    assert {"2", "4"} <= await run.stored_ids()
+    assert "3" not in await run.stored_ids()
+
+
+async def test_checkpoint_wins_over_the_floor_on_the_same_page(
+    publisher: Publisher, run: Runner
+) -> None:
+    publisher.publish(*posts(1000, 6, NOW, step=timedelta(hours=12)))  # down to NOW - 60h
+    await run.rss()
+    publisher.publish(*posts(5000, 3, NOW + timedelta(hours=3), step=timedelta(hours=1)))
+
+    result = await run.rss(now=NOW + timedelta(hours=4))
+
+    # Page 1 holds the 3 new posts, the checkpoint, then items past the date floor.
+    assert result.pages_fetched == 1
+    assert result.stop_reason is StopReason.CHECKPOINT
+
+
+async def test_equal_published_at_advances_the_checkpoint(
+    publisher: Publisher, run: Runner
+) -> None:
+    publisher.publish(Post(1, NOW))
+    await run.rss()
+    assert (await run.feed()).checkpoint_external_id == "1"
+    publisher.posts = [Post(2, NOW), Post(1, NOW)]  # same instant, the new one listed first
+
+    await run.rss(now=NOW + timedelta(hours=1))
+
+    feed = await run.feed()
+    assert (feed.checkpoint_external_id, feed.checkpoint_published_at) == ("2", NOW)

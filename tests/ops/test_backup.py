@@ -1,5 +1,6 @@
 """Backup bookkeeping, without a database or Docker."""
 
+import os
 import stat
 import sys
 from datetime import UTC, datetime, timedelta
@@ -129,7 +130,8 @@ def test_pg_tools_can_run_on_the_host() -> None:
         settings_with("postgresql+psycopg://u:test-only-password@h/db", tools="")
     )
 
-    assert tools.drop_db("db_x") == ["dropdb", "-U", "u", "--if-exists", "db_x"]
+    assert tools.drop_db("db_x") == ["dropdb", "-U", "u", "-h", "h", "--if-exists", "db_x"]
+    assert tools.env() == {**os.environ, "PGPASSWORD": "test-only-password"}
 
 
 def test_pg_tools_need_a_user_and_database() -> None:

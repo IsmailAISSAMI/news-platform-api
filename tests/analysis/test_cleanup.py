@@ -335,3 +335,41 @@ def test_uninformative_causes_are_flagged() -> None:
 
     assert len(cleaned.why) == 2  # never removed
     assert [(f.path, f.reason) for f in report.flags] == [("$.why[0]", "uninformative cause")]
+
+
+def test_the_publisher_is_matched_exactly_never_by_substring() -> None:
+    paragraphs = [
+        "Ambassador Martin visited Agadir on Monday, HESPRESS English reports.",
+        "The Hespress English Readers Club and the Press Office answered questions.",
+    ]
+    original = analysis(
+        who=[
+            actor("Martin", "Martin"),
+            actor("Hespress English Readers Club", "Hespress English Readers Club"),
+            actor("Press Office", "Press Office"),  # "press" is inside "Hespress"
+            actor("the Hespress", "the Hespress"),
+        ]
+    )
+    cleaned, report = clean(original, paragraphs, publisher_names=("Hespress English", "Hespress"))
+    assert [a.name_as_written for a in cleaned.who] == [
+        "Martin",
+        "Hespress English Readers Club",
+        "Press Office",
+    ]
+    assert [c.reason for c in report.items] == ["the publisher itself"]
+
+
+def test_an_attribution_the_article_never_names_is_flagged_not_changed() -> None:
+    quote = {"paragraph": 1, "quote": "Ambassador Martin visited Agadir on Monday"}
+    claims = [
+        {"text": "Visit held", "kind": "fact", "attributed_to": "Martin", "evidence": quote},
+        {"text": "Visit held", "kind": "fact", "attributed_to": "Leila Haddad", "evidence": quote},
+        {"text": "Visit held", "kind": "fact", "attributed_to": "unnamed officials",
+         "evidence": quote},
+    ]  # fmt: skip
+    original = analysis(claims=claims)
+    cleaned, report = clean(original, PARAGRAPHS, publisher_names=("Hespress",))
+    assert cleaned == original
+    assert [(f.path, f.reason) for f in report.flags] == [
+        ("$.claims[1].attributed_to", "attribution not named in the article")
+    ]

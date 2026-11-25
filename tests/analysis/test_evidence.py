@@ -5,6 +5,7 @@ from datetime import date
 import pytest
 
 from app.analysis.evidence import (
+    EvidenceReport,
     EvidenceStatus,
     Issue,
     check,
@@ -12,6 +13,7 @@ from app.analysis.evidence import (
     mentions,
     normalize,
     semantic_issues,
+    verify,
 )
 from app.analysis.schema import ArticleAnalysis, Evidence
 
@@ -187,7 +189,7 @@ def test_normalize_drops_invisible_characters_and_folds_dashes() -> None:
 
 
 def test_a_quote_with_a_soft_hyphen_in_the_article_verifies() -> None:
-    assert check(ev(1, "the budget vote"), ["Then the bud\u00adget vote passed."]) is (
+    assert check(ev(1, "the budget vote passed"), ["Then the bud\u00adget vote passed."]) is (
         EvidenceStatus.VERIFIED
     )
 
@@ -294,3 +296,105 @@ def test_uninformative_causes(text: str, flagged: bool) -> None:
     issues = semantic_issues(ArticleAnalysis.model_validate(base(why=[cause(text)])), ["x"])
 
     assert (issues.get("$.why[0]") is Issue.UNINFORMATIVE_CAUSE) is flagged
+
+
+@pytest.mark.parametrize(
+    ("quote", "status"),
+    [
+        ("the budget", EvidenceStatus.TOO_SHORT),  # 2 tokens, 10 characters
+        ("declined to comment", EvidenceStatus.TOO_SHORT),  # 3 tokens, 19 characters
+        ("Officials in Rabat declined", EvidenceStatus.VERIFIED),  # 4 tokens
+        ("declined to comment.", EvidenceStatus.TOO_SHORT),  # edge punctuation not counted
+    ],
+)
+def test_short_quotes_prove_nothing(quote: str, status: EvidenceStatus) -> None:
+    assert check(ev(3, quote), PARAGRAPHS) is status
+
+
+def test_short_event_date_quotes_are_allowed() -> None:
+    assert check(ev(1, "on Monday"), PARAGRAPHS, allow_short=True) is EvidenceStatus.VERIFIED
+    analysis = minimal({"value": "2026-11-23", "evidence": {"paragraph": 1, "quote": "on Monday"}})
+    assert verify(analysis, PARAGRAPHS).statuses == {
+        "$.when.event_date.evidence": EvidenceStatus.VERIFIED
+    }
+
+
+def test_quotes_match_whole_words_only() -> None:
+    paragraphs = ["The wholesale market reopened in the morning after the storm."]
+    assert check(ev(1, "sale market reopened in the"), paragraphs) is EvidenceStatus.FABRICATED
+    assert check(ev(1, "market reopened in the mor"), paragraphs) is EvidenceStatus.FABRICATED
+    assert check(ev(1, "market reopened in the morning"), paragraphs) is EvidenceStatus.VERIFIED
+
+
+def test_verified_rate_is_none_without_quotes() -> None:
+    assert EvidenceReport().verified_rate is None
+    report = EvidenceReport({"a": EvidenceStatus.VERIFIED, "b": EvidenceStatus.TOO_SHORT})
+    assert report.verified_rate == 0.5
+
+
+@pytest.mark.parametrize(
+    ("quote", "dated"),
+    [
+        ("10 people were injured in the fire", False),  # a bare number is not a date
+        ("on 23 November the council met", True),
+        ("the 3rd round of talks began", False),
+        ("in 2025 the plan was adopted", True),
+    ],
+)
+def test_digits_are_date_words_only_as_years_or_with_a_month(quote: str, dated: bool) -> None:
+    analysis = minimal({"value": "2026-11-23", "evidence": {"paragraph": 1, "quote": quote}})
+    assert ("$.when.event_date" not in semantic_issues(analysis, [quote])) is dated
+
+
+def new_claim(text: str, quote: str, attributed_to: str | None = None) -> dict[str, object]:
+    return {"text": text, "kind": "fact", "attributed_to": attributed_to,
+            "evidence": {"paragraph": 1, "quote": quote}}  # fmt: skip
+
+
+def test_due_to_is_a_cause_not_the_future() -> None:
+    paragraphs = ["The road closed due to heavy rain last night.", "The minister is due to sign."]
+    analysis = minimal(
+        None,
+        claims=[
+            new_claim("The road closed.", "The road closed due to heavy rain"),
+            {**new_claim("The minister signed.", "The minister is due to sign"),
+             "evidence": {"paragraph": 2, "quote": "The minister is due to sign"}},
+        ],
+    )  # fmt: skip
+    issues = semantic_issues(analysis, paragraphs)
+    assert "$.claims[0]" not in issues
+    assert issues["$.claims[1]"] is Issue.POSSIBLE_TENSE_MISMATCH
+
+
+@pytest.mark.parametrize(
+    ("attributed_to", "flagged"),
+    [
+        ("Karim Benali", False),  # named in the article
+        ("Youssef Amrani", True),  # never named: invented or substituted
+        ("Hespress sources", False),  # anonymous-source description
+        ("an unnamed official", False),
+        (None, False),
+    ],
+)
+def test_attributions_must_be_named_in_the_article(
+    attributed_to: str | None, flagged: bool
+) -> None:
+    paragraphs = ["Karim Benali said the harbour works were finished in spring."]
+    analysis = minimal(
+        None,
+        claims=[new_claim("Works finished.", "the harbour works were finished", attributed_to)],
+    )
+    issues = semantic_issues(analysis, paragraphs)
+    assert (issues.get("$.claims[0].attributed_to") is Issue.ATTRIBUTION_NOT_IN_ARTICLE) is flagged
+
+
+def minimal(event_date: object, **extra: object) -> ArticleAnalysis:
+    data: dict[str, object] = {
+        "overview": {"headline": "h", "report_type": "update", "event_status": "ongoing"},
+        "what": {"main_event": "x"},
+        "who": [], "where": [], "claims": [], "how": None,
+        "when": {"event_date": event_date},
+        "topics": [], "tone": {"label": "neutral", "explanation": "x"},
+    }  # fmt: skip
+    data.update(extra)
+    return ArticleAnalysis.model_validate(data)

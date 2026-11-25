@@ -1,6 +1,8 @@
 """Strict, hardened XML parsing for RSS 2.0 and Google News sitemaps.
 
-`defusedxml` rejects entity expansion ("billion laughs"), external entities and DTDs.
+`defusedxml` rejects entity declarations ("billion laughs") and external entities by
+default; we also pass `forbid_dtd=True`, so any `<!DOCTYPE>` is rejected. RSS and
+sitemaps never need a DTD.
 Malformed documents raise `FeedParseError`: we would rather record a failed page than
 silently ingest garbage. Parsers only extract fields; they make no rights decisions
 (that is `policy.apply_policy`'s job).
@@ -48,7 +50,7 @@ class NewsSitemapEntry:
 
 def _parse_xml(content: bytes) -> Element:
     try:
-        return SafeET.fromstring(content)
+        return SafeET.fromstring(content, forbid_dtd=True)
     except (ParseError, DefusedXmlException) as exc:
         msg = f"unparseable or unsafe XML: {type(exc).__name__}: {exc}"
         raise FeedParseError(msg) from exc

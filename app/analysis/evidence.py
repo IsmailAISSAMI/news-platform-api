@@ -1,9 +1,12 @@
 """Code-side verification of the model's evidence. The model's word is never enough.
 
 A quote is verified when, after normalizing whitespace, quotation marks, dashes and case,
-it appears inside the cited paragraph. Quotes that only appear in another paragraph are
-counted as `misplaced` (still real text, wrong pointer). Quotes found nowhere are
-`fabricated`.
+it appears inside the cited paragraph as whole words (a quote cannot start or end in the
+middle of a word). Quotes that only appear in another paragraph are counted as
+`misplaced` (still real text, wrong pointer). Quotes found nowhere are `fabricated`.
+A quote shorter than MIN_QUOTE_TOKENS tokens and MIN_QUOTE_CHARS characters is
+`too_short`: two words are in almost every article and prove nothing. Event-date quotes
+are exempt ("on Monday" is a complete date quote).
 """
 
 import re
@@ -50,6 +53,12 @@ class EvidenceStatus(StrEnum):
     MISPLACED = "misplaced"  # the quote exists, but in another paragraph
     FABRICATED = "fabricated"  # the quote exists nowhere in the article
     BAD_PARAGRAPH = "bad_paragraph"  # cites a paragraph number that does not exist
+    TOO_SHORT = "too_short"  # too short to prove anything
+
+
+MIN_QUOTE_TOKENS = 4
+MIN_QUOTE_CHARS = 20
+EVENT_DATE_EVIDENCE = "$.when.event_date.evidence"
 
 
 # Quotation marks are dropped entirely: models re-quote nested quotes inside JSON (a
@@ -76,30 +85,40 @@ class EvidenceReport:
         return len(self.statuses)
 
     @property
-    def verified_rate(self) -> float:
-        return self.count(EvidenceStatus.VERIFIED) / self.total if self.total else 1.0
+    def verified_rate(self) -> float | None:
+        """Share of verified quotes; None when there is no quote at all (nothing to rate)."""
+        return self.count(EvidenceStatus.VERIFIED) / self.total if self.total else None
 
 
-def check(evidence: Evidence, paragraphs: list[str]) -> EvidenceStatus:
+def _contains(paragraph: str, quote: str) -> bool:
+    return re.search(rf"(?<!\w){re.escape(quote)}(?!\w)", paragraph) is not None
+
+
+def check(
+    evidence: Evidence, paragraphs: list[str], *, allow_short: bool = False
+) -> EvidenceStatus:
     quote = normalize(evidence.quote).strip(_EDGE_PUNCT)
     if not quote:
         return EvidenceStatus.FABRICATED
+    short = len(quote.split()) < MIN_QUOTE_TOKENS and len(quote) < MIN_QUOTE_CHARS
+    if short and not allow_short:
+        return EvidenceStatus.TOO_SHORT
     normalized = [normalize(p) for p in paragraphs]
     if not 1 <= evidence.paragraph <= len(paragraphs):
-        found = any(quote in p for p in normalized)
+        found = any(_contains(p, quote) for p in normalized)
         return EvidenceStatus.MISPLACED if found else EvidenceStatus.BAD_PARAGRAPH
-    if quote in normalized[evidence.paragraph - 1]:
+    if _contains(normalized[evidence.paragraph - 1], quote):
         return EvidenceStatus.VERIFIED
-    if any(quote in p for p in normalized):
+    if any(_contains(p, quote) for p in normalized):
         return EvidenceStatus.MISPLACED
     return EvidenceStatus.FABRICATED
 
 
 def verify(analysis: ArticleAnalysis, paragraphs: list[str]) -> EvidenceReport:
-    """Check every Evidence object anywhere in the analysis."""
+    """Check every Evidence object anywhere in the analysis (paths index into `analysis`)."""
     report = EvidenceReport()
     for path, evidence in _walk(analysis, "$"):
-        report.statuses[path] = check(evidence, paragraphs)
+        report.statuses[path] = check(evidence, paragraphs, allow_short=path == EVENT_DATE_EVIDENCE)
     return report
 
 
@@ -118,10 +137,12 @@ def _walk(node: Any, path: str) -> list[tuple[str, Evidence]]:
 
 # --- Semantic checks beyond quotes ---------------------------------------------------------
 
-# Date words that can anchor an event date. Generic "year"/"month"/"week" only count with a
+# Date words that can anchor an event date. A bare number is not a date ("10 people"):
+# digits count only as a 4-digit year, and a day number only counts through the month
+# name next to it (which matches on its own). Generic "year"/"month"/"week" only count with a
 # relative qualifier ("last week"), so "four-year-old" or "decades" do not pass.
 _DATE_WORDS = re.compile(
-    r"\b(\d{4}|\d{1,2}(st|nd|rd|th)?|jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|"
+    r"\b(\d{4}|jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|june?|"
     r"july?|aug(ust)?|sep(t|tember)?|oct(ober)?|nov(ember)?|dec(ember)?|monday|tuesday|"
     r"wednesday|thursday|friday|saturday|sunday|yesterday|today|tonight|"
     r"(this|last|next|past)\s+(week|month|year|weekend))\b(?!-)",
@@ -137,7 +158,7 @@ _PUBLICATION = re.compile(
 # express possibility and caused false alarms on real articles, so they are excluded.
 # Heuristic: used to FLAG for review, never to rewrite.
 _FUTURE = re.compile(
-    r"\b(will|expected|scheduled|planned|plans? to|set to|due to|is to|are to|"
+    r"\b(will|expected|scheduled|planned|plans? to|set to|(is|are) due to|is to|are to|"
     r"aims? to|intends? to|preparing|upcoming|proposed|pending)\b",
     re.IGNORECASE,
 )
@@ -201,37 +222,75 @@ class Issue(StrEnum):
     # Dated with the article's publication date while the quote holds no date words.
     TIMELINE_PUBLICATION_DATE = "timeline_publication_date"
     UNINFORMATIVE_CAUSE = "uninformative_cause"  # too short, or restates the main event
+    # attributed_to names someone the article never names (anonymous sources exempt).
+    ATTRIBUTION_NOT_IN_ARTICLE = "attribution_not_in_article"
 
 
-def semantic_issues(  # noqa: PLR0912  # one branch per check, kept side by side
+def semantic_issues(
     analysis: ArticleAnalysis, paragraphs: list[str], published: date | None = None
 ) -> dict[str, Issue]:
     """Problems the JSON schema cannot catch, found by checking against the article.
 
     `published` (the article's publication date) enables the publication-date timeline
-    check; without it that check is skipped.
+    check; without it that check is skipped. One function per section, merged in order.
     """
     article = normalize(" ".join(paragraphs))
+    return {
+        **_actor_issues(analysis, article),
+        **_place_issues(analysis, article),
+        **_event_date_issues(analysis),
+        **_claim_issues(analysis, article, paragraphs),
+        **_timeline_issues(analysis, published),
+        **_cause_issues(analysis, article),
+    }
+
+
+def _actor_issues(analysis: ArticleAnalysis, article: str) -> dict[str, Issue]:
     issues: dict[str, Issue] = {}
     for index, actor in enumerate(analysis.who):
         for field_name in ("name_as_written", "full_name"):
             if not mentions(article, getattr(actor, field_name)):
                 issues[f"$.who[{index}].{field_name}"] = Issue.NAME_NOT_IN_ARTICLE
+    return issues
+
+
+def _place_issues(analysis: ArticleAnalysis, article: str) -> dict[str, Issue]:
+    issues: dict[str, Issue] = {}
     for index, place in enumerate(analysis.where):
         written = place.name_as_written
-        if not mentions(article, written) and mentions(article, core_place_name(written)):
-            issues[f"$.where[{index}].name_as_written"] = Issue.PLACE_NAME_WITH_ADDED_SUFFIX
-        elif not mentions(article, written):
-            issues[f"$.where[{index}].name_as_written"] = Issue.NAME_NOT_IN_ARTICLE
+        if mentions(article, written):
+            continue
+        suffixed = mentions(article, core_place_name(written))
+        issues[f"$.where[{index}].name_as_written"] = (
+            Issue.PLACE_NAME_WITH_ADDED_SUFFIX if suffixed else Issue.NAME_NOT_IN_ARTICLE
+        )
+    return issues
+
+
+def _event_date_issues(analysis: ArticleAnalysis) -> dict[str, Issue]:
     event_date = analysis.when.event_date
     quote = event_date.evidence.quote if event_date.evidence else ""
     if event_date.value is not None and not _DATE_WORDS.search(quote):
-        issues["$.when.event_date"] = Issue.EVENT_DATE_WITHOUT_DATE_WORDS
+        return {"$.when.event_date": Issue.EVENT_DATE_WITHOUT_DATE_WORDS}
+    return {}
+
+
+def _claim_issues(
+    analysis: ArticleAnalysis, article: str, paragraphs: list[str]
+) -> dict[str, Issue]:
+    issues: dict[str, Issue] = {}
     for index, claim in enumerate(analysis.claims):
         if _FUTURE.search(claim.evidence.quote) and not _FUTURE.search(claim.text):
             issues[f"$.claims[{index}]"] = Issue.POSSIBLE_TENSE_MISMATCH
         if _anonymous_unattributed(claim, paragraphs):
             issues[f"$.claims[{index}].attributed_to"] = Issue.ANONYMOUS_SOURCE_UNATTRIBUTED
+        elif _unknown_attribution(article, claim.attributed_to):
+            issues[f"$.claims[{index}].attributed_to"] = Issue.ATTRIBUTION_NOT_IN_ARTICLE
+    return issues
+
+
+def _timeline_issues(analysis: ArticleAnalysis, published: date | None) -> dict[str, Issue]:
+    issues: dict[str, Issue] = {}
     for index, entry in enumerate(analysis.when.timeline):
         if _PUBLICATION.search(entry.event):
             issues[f"$.when.timeline[{index}]"] = Issue.TIMELINE_PUBLICATION_ENTRY
@@ -241,13 +300,37 @@ def semantic_issues(  # noqa: PLR0912  # one branch per check, kept side by side
             and not _DATE_WORDS.search(entry.evidence.quote)
         ):
             issues[f"$.when.timeline[{index}]"] = Issue.TIMELINE_PUBLICATION_DATE
+    return issues
+
+
+def _cause_issues(analysis: ArticleAnalysis, article: str) -> dict[str, Issue]:
+    issues: dict[str, Issue] = {}
     main_event = normalize(analysis.what.main_event)
     for index, cause in enumerate(analysis.why):
         text = normalize(cause.text)
         restates = bool(main_event) and (text in main_event or main_event in text)
         if len(text) < MIN_CAUSE_LENGTH or restates:
             issues[f"$.why[{index}]"] = Issue.UNINFORMATIVE_CAUSE
+        if _unknown_attribution(article, cause.attributed_to):
+            issues[f"$.why[{index}].attributed_to"] = Issue.ATTRIBUTION_NOT_IN_ARTICLE
     return issues
+
+
+# An attribution that describes an unnamed source ("Hespress sources", "an unnamed
+# official") need not appear verbatim: the prompt asks for the article's description.
+_ANONYMOUS_PHRASE = re.compile(
+    r"\b(sources?|unnamed|anonymous|unidentified|officials?|insiders?|observers?|"
+    r"witness(es)?|residents?)\b",
+    re.IGNORECASE,
+)
+
+
+def _unknown_attribution(article: str, attributed_to: str | None) -> bool:
+    if attributed_to is None or not attributed_to.strip():
+        return False
+    if _ANONYMOUS_PHRASE.search(attributed_to):
+        return False
+    return not mentions(article, attributed_to)
 
 
 def _anonymous_unattributed(claim: Claim, paragraphs: list[str]) -> bool:

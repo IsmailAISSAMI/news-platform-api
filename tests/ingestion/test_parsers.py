@@ -166,3 +166,10 @@ def test_rss_item_is_none_without_an_id() -> None:
         loc="https://x.test/about", title="t", published_at=T, language=None
     )
     assert adapter.news_sitemap_item(no_id_entry, language="en") is None
+
+
+def test_any_dtd_is_rejected_even_without_entities() -> None:
+    doc = b'<?xml version="1.0"?><!DOCTYPE rss SYSTEM "rss.dtd"><rss><channel/></rss>'
+
+    with pytest.raises(FeedParseError, match="DTDForbidden"):
+        parse_rss(doc)

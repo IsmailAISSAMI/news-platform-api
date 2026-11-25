@@ -9,9 +9,12 @@ import pytest
 
 from app.analysis.budget import (
     CEILINGS,
+    PACE_PAD_S,
+    WINDOW_S,
     BudgetExceededError,
     RequestBudget,
     RequestTooLargeError,
+    estimate_tokens,
 )
 
 
@@ -110,9 +113,11 @@ def test_settings_can_lower_the_limits_but_never_raise_them() -> None:
 def test_the_ceilings_are_the_owner_limits() -> None:
     assert CEILINGS == {
         "per_run": 1000,
+        "lab_per_run": 3,
         "per_day": 1000,
         "per_minute": 20,
         "input_tokens_per_minute": 10_000,
+        "concurrency": 8,
     }
 
 
@@ -127,3 +132,96 @@ def test_no_local_file_is_involved_in_the_budget() -> None:
     """The quota is in the database: the budget has no file to delete or copy."""
     fields = set(RequestBudget.__dataclass_fields__)
     assert not {"usage_file"} & fields
+
+
+# --- boundary tests: each fails if its comparison operator is changed -------------------
+
+
+def test_check_size_accepts_the_limit_and_refuses_one_more() -> None:
+    b = budget(Clock(NOON_UTC))
+    b.check_size(1000)
+    with pytest.raises(RequestTooLargeError):
+        b.check_size(1001)
+
+
+def test_pace_then_wait_at_exactly_the_request_limit() -> None:
+    clock = Clock(NOON_UTC)
+    b = budget(clock)  # 2 requests per minute
+    b.pace(10)
+    assert b.wait_seconds(10) == 0  # 1 < 2: a second one may go
+    b.pace(10)
+    assert b.wait_seconds(10) == WINDOW_S + PACE_PAD_S  # exactly at the limit: wait
+
+
+def test_tokens_at_exactly_the_token_limit_are_allowed() -> None:
+    b = budget(Clock(NOON_UTC))
+    b.pace(600)
+    assert b.wait_seconds(400) == 0  # 600 + 400 == 1000: allowed
+    assert b.wait_seconds(401) > 0
+
+
+def test_the_window_expires_at_exactly_60_seconds() -> None:
+    clock = Clock(NOON_UTC)
+    b = budget(clock)
+    b.pace(10)
+    b.pace(10)
+    clock.mono = 59.999
+    assert b.wait_seconds(10) > 0
+    clock.mono = 60.0
+    assert b.wait_seconds(10) == 0
+    assert b.window_usage() == (0, 0)
+
+
+def test_the_wait_is_the_time_left_plus_exactly_half_a_second() -> None:
+    clock = Clock(NOON_UTC)
+    b = budget(clock)
+    b.pace(10)
+    b.pace(10)
+    clock.mono = 20.0
+    assert b.wait_seconds(10) == 40.5
+    assert PACE_PAD_S == 0.5
+
+
+def test_a_correction_changes_the_pacing_of_that_request() -> None:
+    clock = Clock(NOON_UTC)
+    b = budget(clock)
+    first = b.pace(100)
+    b_second = b.pace(100)
+    clock.mono = 1.0
+    b.window_usage()
+    b.correct(first, 950)  # Google counted more than estimated for the FIRST request
+    assert first.tokens == 950
+    assert b_second.tokens == 100  # the other request is untouched
+    b.correct(b_second, 50)  # never lowered below the estimate
+    assert b_second.tokens == 100
+
+
+def test_a_correction_makes_the_next_request_wait() -> None:
+    clock = Clock(NOON_UTC)
+    b = RequestBudget(
+        per_run=3, per_day=5, per_minute=5, input_tokens_per_minute=1000,
+        monotonic=lambda: clock.mono,
+    )  # fmt: skip
+    handle = b.pace(100)
+    assert b.wait_seconds(500) == 0
+    b.correct(handle, 600)
+    assert b.wait_seconds(500) > 0  # 600 + 500 > 1000
+
+
+def test_the_window_is_seeded_with_other_processes_requests() -> None:
+    clock = Clock(NOON_UTC)
+    clock.mono = 100.0
+    b = budget(clock)
+    b.seed([(50.0, 10), (10.0, 10)])  # two requests 50 s and 10 s ago
+    assert b.window_usage() == (2, 20)
+    assert b.wait_seconds(10) == 10.0 + PACE_PAD_S  # the oldest leaves in 10 s
+
+
+def test_the_estimate_counts_utf8_bytes_over_three() -> None:
+    assert estimate_tokens("a" * 300) == 101
+    assert estimate_tokens("é" * 300) == 201  # 2 bytes each: a wider margin
+
+
+def test_the_concurrency_and_lab_ceilings() -> None:
+    assert CEILINGS["concurrency"] == 8
+    assert CEILINGS["lab_per_run"] == 3

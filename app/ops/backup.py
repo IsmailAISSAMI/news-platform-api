@@ -1,19 +1,22 @@
 """Backups that are proven restorable (docs/architecture.md §8).
 
-- `create_backup`: under the ingest lock (no half-written run in the dump), record exact
-  row counts, stream `pg_dump -Fc` to `<dir>/news-<UTC stamp>.dump.partial`, then rename
-  atomically and write a JSON manifest beside it. Old backups beyond `keep` are pruned.
+- `create_backup`: under the ingest and analyze locks (no half-written run in the dump),
+  export a snapshot, record exact row counts inside it, stream `pg_dump -Fc --snapshot`
+  (the dump and the counts see the same data) to `<dir>/news-<UTC stamp>.dump.partial`,
+  then rename atomically and write a JSON manifest beside it. Old backups beyond `keep` are pruned.
 - `verify_backup`: check the checksum, restore into a scratch database, compare every
   table's row count with the manifest, mark the manifest verified, drop the scratch DB.
 
 The live database is only ever read. Secrets never reach a command line or a log line:
-the pg tools run inside the db container over its local socket.
+the pg tools run inside the db container over its local socket, or (PG_TOOLS_COMMAND="")
+on the host with the password passed in the PGPASSWORD environment variable.
 """
 
 import asyncio
 import hashlib
 import json
 import logging
+import os
 import shlex
 import subprocess  # fixed argv lists only, never a shell
 from dataclasses import asdict, dataclass, field, replace
@@ -23,6 +26,7 @@ from pathlib import Path
 from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
+from app.analysis.pipeline import ANALYZE_LOCK_KEY
 from app.core.config import Settings
 from app.ingestion.runner import INGEST_LOCK_KEY, AlreadyRunningError
 
@@ -91,6 +95,10 @@ class PgTools:
     prefix: tuple[str, ...]
     user: str
     database: str
+    # Host tools only (empty prefix): where to connect. The password goes in the env.
+    host: str | None = None
+    port: int | None = None
+    password: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "PgTools":
@@ -98,23 +106,43 @@ class PgTools:
         if not url.username or not url.database:
             msg = "DATABASE_URL must include a user and a database name"
             raise BackupError(msg)
-        return cls(tuple(shlex.split(settings.pg_tools_command)), url.username, url.database)
+        prefix = tuple(shlex.split(settings.pg_tools_command))
+        if prefix:  # inside the container: its local socket
+            return cls(prefix, url.username, url.database)
+        return cls(prefix, url.username, url.database, url.host, url.port, url.password)
 
-    def dump(self) -> list[str]:
-        return [*self.prefix, "pg_dump", "-U", self.user, "-d", self.database, "-Fc"]
+    @property
+    def _conn(self) -> list[str]:
+        args = ["-U", self.user]
+        if self.host:
+            args += ["-h", self.host]
+        if self.port:
+            args += ["-p", str(self.port)]
+        return args
+
+    def env(self) -> dict[str, str] | None:
+        """Environment for the subprocess: PGPASSWORD for host tools, else inherited."""
+        if self.prefix or self.password is None:
+            return None
+        return {**os.environ, "PGPASSWORD": self.password}
+
+    def dump(self, snapshot: str | None = None) -> list[str]:
+        argv = [*self.prefix, "pg_dump", *self._conn, "-d", self.database, "-Fc"]
+        if snapshot:
+            argv.append(f"--snapshot={snapshot}")
+        return argv
 
     def create_db(self, name: str) -> list[str]:
-        return [*self.prefix, "createdb", "-U", self.user, name]
+        return [*self.prefix, "createdb", *self._conn, name]
 
     def drop_db(self, name: str) -> list[str]:
-        return [*self.prefix, "dropdb", "-U", self.user, "--if-exists", name]
+        return [*self.prefix, "dropdb", *self._conn, "--if-exists", name]
 
     def restore(self, name: str) -> list[str]:
         return [
             *self.prefix,
             "pg_restore",
-            "-U",
-            self.user,
+            *self._conn,
             "-d",
             name,
             "--no-owner",
@@ -138,18 +166,31 @@ async def create_backup(
     partial = dump.with_name(dump.name + ".partial")
 
     async with engine.connect() as connection:
-        if not await connection.scalar(
-            text("SELECT pg_try_advisory_lock(:k)"), {"k": INGEST_LOCK_KEY}
-        ):
-            msg = "an ingest run is in progress; back up after it finishes"
-            raise AlreadyRunningError(msg)
+        held: list[int] = []
         try:
+            for key, what in ((INGEST_LOCK_KEY, "an ingest"), (ANALYZE_LOCK_KEY, "an analyze")):
+                locked = await connection.scalar(
+                    text("SELECT pg_try_advisory_lock(:k)"), {"k": key}
+                )
+                await connection.commit()
+                if not locked:
+                    msg = f"{what} run is in progress; back up after it finishes"
+                    raise AlreadyRunningError(msg)
+                held.append(key)
+            # One snapshot for the counts and the dump: they describe the same data.
+            await connection.execute(
+                text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            )
+            snapshot = str(await connection.scalar(text("SELECT pg_export_snapshot()")))
             counts = await table_row_counts(connection)
             revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
+            # The snapshot stays valid while this transaction is open.
+            await asyncio.to_thread(_run_to_file, tools.dump(snapshot), partial, tools.env())
             await connection.commit()
-            await asyncio.to_thread(_run_to_file, tools.dump(), partial)
         finally:
-            await connection.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": INGEST_LOCK_KEY})
+            await connection.rollback()
+            for key in held:
+                await connection.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": key})
             await connection.commit()
 
     return await asyncio.to_thread(
@@ -205,13 +246,14 @@ async def verify_backup(
         raise BackupError(msg)
 
     scratch = tools.scratch_database
-    await asyncio.to_thread(_run, tools.drop_db(scratch))
-    await asyncio.to_thread(_run, tools.create_db(scratch))
+    env = tools.env()
+    await asyncio.to_thread(_run, tools.drop_db(scratch), env)
+    await asyncio.to_thread(_run, tools.create_db(scratch), env)
     try:
-        await asyncio.to_thread(_run_from_file, tools.restore(scratch), backup.dump)
+        await asyncio.to_thread(_run_from_file, tools.restore(scratch), backup.dump, env)
         restored = await _counts_in(settings, scratch)
     finally:
-        await asyncio.to_thread(_run, tools.drop_db(scratch))
+        await asyncio.to_thread(_run, tools.drop_db(scratch), env)
 
     result = VerifyResult(backup)
     for table, expected in backup.manifest.row_counts.items():
@@ -304,24 +346,28 @@ def _write_private(path: Path, content: str) -> None:
     path.chmod(0o600)
 
 
-def _run(argv: list[str]) -> None:
-    completed = subprocess.run(argv, capture_output=True, check=False)  # noqa: S603  # fixed argv
+def _run(argv: list[str], env: dict[str, str] | None = None) -> None:
+    completed = subprocess.run(argv, capture_output=True, check=False, env=env)  # noqa: S603  # fixed argv
     if completed.returncode != 0:
         raise BackupError(_failure(argv, completed.stderr))
 
 
-def _run_to_file(argv: list[str], destination: Path) -> None:
+def _run_to_file(argv: list[str], destination: Path, env: dict[str, str] | None = None) -> None:
     with destination.open("wb") as out:
         destination.chmod(0o600)
-        completed = subprocess.run(argv, stdout=out, stderr=subprocess.PIPE, check=False)  # noqa: S603  # fixed argv
+        completed = subprocess.run(  # noqa: S603  # fixed argv
+            argv, stdout=out, stderr=subprocess.PIPE, check=False, env=env
+        )
     if completed.returncode != 0:
         destination.unlink(missing_ok=True)
         raise BackupError(_failure(argv, completed.stderr))
 
 
-def _run_from_file(argv: list[str], source: Path) -> None:
+def _run_from_file(argv: list[str], source: Path, env: dict[str, str] | None = None) -> None:
     with source.open("rb") as handle:
-        completed = subprocess.run(argv, stdin=handle, capture_output=True, check=False)  # noqa: S603  # fixed argv
+        completed = subprocess.run(  # noqa: S603  # fixed argv
+            argv, stdin=handle, capture_output=True, check=False, env=env
+        )
     if completed.returncode != 0:
         raise BackupError(_failure(argv, completed.stderr))
 

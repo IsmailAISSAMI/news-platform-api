@@ -31,8 +31,10 @@ uv run pytest -m "not integration"        # fast, no DB
 uv run pytest                             # full suite, needs the db container
 uv run alembic revision --autogenerate -m "..." && uv run alembic upgrade head
 uv run alembic check                      # models and migrations must be in sync
-uv run news ingest [-v] [--since-days N] [--max-pages N] [--no-sitemap]
+uv run news ingest [-v] [--since-days N] [--max-pages N] [--no-sitemap] [--rewalk-days N]
                                           # hits real publishers: only when asked
+                                          # --rewalk-days re-reads a window for bodies;
+                                          # it never moves the checkpoint
 uv run news backup && uv run news restore-test   # dump to ~/Backups/news, then prove it
 uv run news analyze [--limit N] [--concurrency N] [--retry-failed]
                                           # Gemini API, parallel, resumable, within limits
@@ -51,17 +53,31 @@ and new behavior has tests. CI (`.github/workflows/ci.yml`) runs exactly these.
 
 ```
 app/
-  main.py         app factory + lifespan (engine created/disposed here, never at import)
-  api/            health.py (unversioned probes), deps.py, v1/ (all business routes)
-  core/           config (pydantic-settings), JSON logging, request-ID middleware, errors
-  db/             Base with naming convention, async engine/session factories
+  cli.py          the `news` command: ingest, analyze, lab, lab-compare, eval,
+                  gemini-usage, backup, restore-test
+  main.py         app factory + lifespan (engine created/disposed here, never at import;
+                  startup privilege guard); mounts /ui
+  analysis/       Gemini analysis: budget (RequestBudget, CEILINGS), ledger (api_calls),
+                  llm, pipeline, prompt, schema, evidence, cleanup, briefing, lab,
+                  compare, eval
+  api/            health.py (unversioned probes), deps.py, caching.py,
+                  v1/ (catalog.py, analysis.py: all business routes)
+  core/           config (pydantic-settings), JSON logging, request-ID middleware,
+                  error envelope
+  db/             Base with naming convention, async engine/session factories,
+                  assert_least_privilege
+  ingestion/      fetch (polite fetcher), robots, parsers (defusedxml), policy (rights
+                  gate), normalize, sources/wordpress.py, walk, store, readiness, runner
   models/         SQLAlchemy models; import every model module in models/__init__.py
+  ops/            backup.py (news backup, news restore-test)
+  schemas/        Pydantic response schemas (catalog, analysis briefings)
+  web/static/     the /ui briefing screen (HTML, CSS, JavaScript; no build step)
 alembic/          async migrations
+scripts/          db_roles.sql, db_login_passwords.sql, check_repo_hygiene.py
 tests/            unit tests; tests/integration/ needs PostgreSQL (marker: integration)
 ```
 
-Planned (see architecture doc section 10): `app/ingestion/` (rights gate, polite fetcher,
-per-source adapters, checkpoint walk, archive backlog, CLI). Ingestion is a
+The archive backlog (milestone 6) is deferred. Ingestion is a
 **run-to-completion command run by hand**, not a daemon: no launchd, no scheduler, no
 GitHub-hosted or self-hosted runner.
 
@@ -90,6 +106,11 @@ of them requires an explicit decision by the owner, recorded in the architecture
     (503/500/502/504/timeouts: retried with the same model until answered), add billable
     request options, or call the real API from tests, without the owner's explicit
     decision. Check use with `uv run news gemini-usage`.
+  - How the limits are enforced (`app/analysis/budget.py`, `ledger.py`, `llm.py`): the
+    lab ceiling of 3 and the concurrency ceiling of 8 are constants (`CEILINGS`); the
+    per-minute window is shared across processes via `api_calls` (a client seeds it from
+    the last 60 s of rows before its first request); input tokens are estimated as
+    UTF-8 bytes // 3 (+1) before sending.
   - AI outputs meant for publication must be original work: no reproduced or
     closely paraphrased passages.
 - **Geography: use Morocco GeoNames datasets only.** Never mention, link to, or map the
@@ -147,12 +168,19 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - All timestamps are `timestamptz` and stored in UTC.
   - Dedup key per article: `UNIQUE(source_id, external_id)`. For Hespress, `external_id`
     is the WordPress post ID from `<guid>` (`?p=149695`).
-  - Roles (`scripts/db_roles.sql`, re-run after each migration): the `POSTGRES_USER`
-    owns the schema and runs migrations; `news_ingest` reads and writes; `news_api` is
-    SELECT-only.
+  - Roles (`scripts/db_roles.sql`, re-run after each migration and after a restore): the
+    `POSTGRES_USER` owns the schema and runs migrations; `news_ingest` reads and writes;
+    `news_api` is SELECT-only on an explicit allowlist (`articles`, `feeds`, `sources`,
+    the `analysis_briefings` view), never on `article_bodies`, `article_analyses`,
+    `api_calls` or `analysis_runs`. Both are NOLOGIN groups; the login roles are
+    `news_api_login` and `news_ingest_login`, whose passwords are set by
+    `scripts/db_login_passwords.sql` from psql variables (never written in a file).
   - The API's engine is `create_engine(settings, read_only=True)`: its connections set
-    `default_transaction_read_only=on`, and it uses `API_DATABASE_URL` (a `news_api`
-    login) when set. Never give the API a read-write engine.
+    `default_transaction_read_only=on`, and it uses `API_DATABASE_URL` (a
+    `news_api_login` URL) when set. Never give the API a read-write engine.
+  - Startup privilege guard: `assert_least_privilege` (`app/db/session.py`, called from
+    the lifespan) refuses to start in production, and warns elsewhere, if the API's login
+    is a superuser or can SELECT `article_bodies`. Never weaken it.
   - Seed or reference data goes in migrations, written idempotently
     (`ON CONFLICT DO NOTHING`).
 - **API.**

@@ -1,5 +1,6 @@
 """PoliteFetcher against httpx.MockTransport. No live network, no real sleeping."""
 
+import asyncio
 import random
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -9,12 +10,15 @@ import pytest
 
 from app.core.config import Settings
 from app.ingestion.fetch import (
+    MAX_REDIRECTS,
     MAX_RETRY_AFTER_S,
     DisallowedByRobotsError,
     FetcherConfig,
+    FetchError,
     FetchFailedError,
     PoliteFetcher,
     ResponseTooLargeError,
+    TooManyRedirectsError,
     _parse_retry_after,
     create_http_client,
 )
@@ -310,3 +314,120 @@ async def test_streamed_oversize_body_is_aborted_and_not_retried(
 )
 def test_parse_retry_after(value: str | None, expected: float | None) -> None:
     assert _parse_retry_after(value) == expected
+
+
+# --- Total timeout --------------------------------------------------------------------
+
+
+async def test_slow_drip_body_hits_the_total_timeout(server: Server, time_: FakeTime) -> None:
+    async def drip() -> AsyncIterator[bytes]:
+        while True:
+            await asyncio.sleep(0.02)  # each chunk is quick: only a total timeout stops it
+            yield b"x"
+
+    server.scripts["/feed"] = [httpx.Response(200, content=drip()) for _ in range(2)]
+    config = FetcherConfig("news-platform-api", 1024 * 1024, 0.0, 2, total_timeout_s=0.1)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(server.handle)) as client:
+        fetcher = PoliteFetcher(client, config, clock=time_.clock, sleep=time_.sleep)
+        with pytest.raises(FetchFailedError, match="total timeout"):
+            await fetcher.get(f"{HOST}/feed")
+    assert len(server.page_requests()) == 2  # retried on the normal path, then gave up
+
+
+def test_total_timeout_comes_from_settings() -> None:
+    settings = Settings.model_validate(
+        {"database_url": "postgresql+psycopg://u:test-only-password@h/d"}
+    )
+    assert FetcherConfig.from_settings(settings).total_timeout_s == 20.0
+
+
+# --- Redirects ------------------------------------------------------------------------
+
+
+async def test_client_does_not_follow_redirects_itself() -> None:
+    settings = Settings.model_validate(
+        {"database_url": "postgresql+psycopg://u:test-only-password@h/d"}
+    )
+    client = create_http_client(settings)
+    try:
+        assert client.follow_redirects is False
+    finally:
+        await client.aclose()
+
+
+async def test_redirect_is_followed_with_robots_and_spacing_per_hop(
+    server: Server, fetcher: PoliteFetcher, time_: FakeTime
+) -> None:
+    server.scripts["/old"] = [httpx.Response(301, headers={"Location": "/new"})]
+    server.scripts["/new"] = [httpx.Response(200, content=b"ok")]
+
+    result = await fetcher.get(f"{HOST}/old")
+
+    assert result.ok
+    assert result.content == b"ok"
+    assert [r.url.path for r in server.page_requests()] == ["/old", "/new"]
+    assert time_.sleeps == [5.0, 5.0]  # robots, /old, then the Crawl-delay before /new
+
+
+async def test_cross_host_redirect_checks_the_new_hosts_robots(
+    server: Server, fetcher: PoliteFetcher
+) -> None:
+    server.scripts["/old"] = [
+        httpx.Response(302, headers={"Location": "https://other.test/private/x"})
+    ]
+
+    with pytest.raises(DisallowedByRobotsError):
+        await fetcher.get(f"{HOST}/old")
+
+    robots_hosts = [r.url.host for r in server.requests if r.url.path == "/robots.txt"]
+    assert robots_hosts == ["example.test", "other.test"]
+    assert [r.url.path for r in server.page_requests()] == ["/old"]  # never reached
+
+
+async def test_redirect_to_a_disallowed_path_is_refused(
+    server: Server, fetcher: PoliteFetcher
+) -> None:
+    server.scripts["/old"] = [httpx.Response(308, headers={"Location": "/private/page"})]
+
+    with pytest.raises(DisallowedByRobotsError):
+        await fetcher.get(f"{HOST}/old")
+    assert [r.url.path for r in server.page_requests()] == ["/old"]
+
+
+async def test_redirect_loops_are_bounded(server: Server, fetcher: PoliteFetcher) -> None:
+    server.scripts["/loop"] = [httpx.Response(302, headers={"Location": "/loop"})]
+
+    with pytest.raises(TooManyRedirectsError):
+        await fetcher.get(f"{HOST}/loop")
+    assert len(server.page_requests()) == MAX_REDIRECTS + 1
+
+
+async def test_redirect_without_location_fails(server: Server, fetcher: PoliteFetcher) -> None:
+    server.scripts["/old"] = [httpx.Response(301)]
+
+    with pytest.raises(TooManyRedirectsError, match="without Location"):
+        await fetcher.get(f"{HOST}/old")
+
+
+# --- Non-transport request errors -----------------------------------------------------
+
+
+async def test_non_transport_request_error_is_wrapped_and_not_retried(
+    server: Server, fetcher: PoliteFetcher
+) -> None:
+    server.scripts["/feed"] = [httpx.DecodingError("bad gzip")]
+
+    with pytest.raises(FetchError, match="DecodingError") as caught:
+        await fetcher.get(f"{HOST}/feed")
+    assert not isinstance(caught.value, FetchFailedError)
+    assert len(server.page_requests()) == 1
+
+
+async def test_non_transport_robots_error_is_wrapped(
+    server: Server, fetcher: PoliteFetcher
+) -> None:
+    server.robots = httpx.DecodingError("bad gzip")
+
+    with pytest.raises(FetchError, match=r"robots\.txt request error"):
+        await fetcher.get(f"{HOST}/feed")
+    assert server.page_requests() == []

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Identity, Integer, Text, func, text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, Identity, Integer, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -14,6 +14,10 @@ class AnalysisRun(Base):
     """
 
     __tablename__ = "analysis_runs"
+    __table_args__ = tuple(
+        CheckConstraint(f"{c} >= 0", name=f"{c}_non_negative")
+        for c in ("concurrency", "queued", "succeeded", "needs_review", "failed", "skipped")
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

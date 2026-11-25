@@ -1,67 +1,109 @@
-"""Database-level security: which tables the `news_api` role can read.
+"""Database-level security, checked after applying the real scripts/db_roles.sql.
 
-The API role must never read article text or the internal analysis log. These checks run
-against the test database (`news_test`), where the migrations have run. Roles are
-cluster-wide, so `news_api` may or may not exist there; if it does not, it is created
-NOLOGIN inside the rolled-back test transaction. Grants made by a test are rolled back too.
+Runs against the test database (`news_test`). Roles are cluster-wide, but CREATE ROLE,
+GRANT and ALTER DEFAULT PRIVILEGES are transactional in PostgreSQL: everything the script
+does here is rolled back with the test transaction.
 """
+
+import logging
+import re
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+from app.core.config import Settings
+from app.db.session import PrivilegeError, assert_least_privilege
 
 pytestmark = pytest.mark.integration
 
-RESTRICTED_TABLES = ("article_bodies", "article_analyses", "api_calls", "analysis_runs")
-READABLE_TABLES = ("articles", "sources")
+ROLES_SQL = Path(__file__).resolve().parents[2] / "scripts" / "db_roles.sql"
+
+# The ONLY relations news_api may read. Adding one is a deliberate change here and in
+# scripts/db_roles.sql.
+API_SELECT_ALLOWLIST = {"analysis_briefings", "articles", "feeds", "sources"}
 
 
-async def has_privilege(session: AsyncSession, table: str, privilege: str) -> bool:
-    result = await session.execute(
-        text("SELECT has_table_privilege('news_api', :table, :privilege)"),
-        {"table": table, "privilege": privilege},
+async def apply_roles(session: AsyncSession) -> None:
+    connection = await session.connection()
+    await connection.exec_driver_sql(ROLES_SQL.read_text())
+
+
+async def readable_by(session: AsyncSession, role: str, privilege: str) -> set[str]:
+    rows = await session.execute(
+        text(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+            " WHERE n.nspname = 'public' AND c.relkind IN ('r', 'v', 'm', 'p', 'f')"
+            " AND has_table_privilege(:role, c.oid, :privilege)"
+        ),
+        {"role": role, "privilege": privilege},
     )
-    return bool(result.scalar_one())
+    return set(rows.scalars())
 
 
-async def ensure_api_role(session: AsyncSession) -> None:
-    exists = await session.execute(text("SELECT 1 FROM pg_roles WHERE rolname = 'news_api'"))
-    if exists.scalar_one_or_none() is None:
-        await session.execute(text("CREATE ROLE news_api NOLOGIN"))
+async def test_api_role_selects_exactly_the_allowlist(db_session: AsyncSession) -> None:
+    await apply_roles(db_session)
+    for role in ("news_api", "news_api_login"):
+        assert await readable_by(db_session, role, "SELECT") == API_SELECT_ALLOWLIST, role
+        for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+            assert await readable_by(db_session, role, privilege) == set(), (role, privilege)
 
 
-async def test_api_role_cannot_read_restricted_tables(db_session: AsyncSession) -> None:
-    await ensure_api_role(db_session)
-    for table in RESTRICTED_TABLES:
-        for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
-            assert not await has_privilege(db_session, table, privilege), (table, privilege)
+async def test_new_tables_are_not_readable_by_the_api_role(db_session: AsyncSession) -> None:
+    await apply_roles(db_session)
+    await db_session.execute(text("CREATE TABLE zz_future_table (id int)"))
+    assert "zz_future_table" not in await readable_by(db_session, "news_api", "SELECT")
+    assert "zz_future_table" in await readable_by(db_session, "news_ingest", "INSERT")
 
 
-async def test_api_role_can_read_public_tables_only_as_granted(db_session: AsyncSession) -> None:
-    await ensure_api_role(db_session)
-    # Mirrors scripts/db_roles.sql for the read-only API role (rolled back with the test).
-    await db_session.execute(text("GRANT SELECT ON articles, sources TO news_api"))
-    for table in READABLE_TABLES:
-        assert await has_privilege(db_session, table, "SELECT"), table
-        assert not await has_privilege(db_session, table, "INSERT"), table
-        assert not await has_privilege(db_session, table, "UPDATE"), table
+async def test_ingest_role_cannot_write_through_the_briefings_view(
+    db_session: AsyncSession,
+) -> None:
+    await apply_roles(db_session)
+    for privilege in ("INSERT", "UPDATE", "DELETE"):
+        assert "analysis_briefings" not in await readable_by(db_session, "news_ingest", privilege)
+
+
+async def test_login_roles_inherit_groups_and_are_unprivileged(db_session: AsyncSession) -> None:
+    await apply_roles(db_session)
+    rows = await db_session.execute(
+        text(
+            "SELECT rolname, rolcanlogin, rolsuper, rolcreaterole, rolcreatedb, rolbypassrls,"
+            " rolinherit FROM pg_roles WHERE rolname IN ('news_api_login', 'news_ingest_login')"
+        )
+    )
+    roles = {row[0]: row[1:] for row in rows}
+    assert roles == {
+        "news_api_login": (True, False, False, False, False, True),
+        "news_ingest_login": (True, False, False, False, False, True),
+    }
+    assert await db_session.scalar(
+        text("SELECT pg_has_role('news_api_login', 'news_api', 'USAGE')")
+    )
+    assert await db_session.scalar(
+        text("SELECT pg_has_role('news_ingest_login', 'news_ingest', 'USAGE')")
+    )
+    assert not await db_session.scalar(
+        text("SELECT pg_has_role('news_api_login', 'news_ingest', 'USAGE')")
+    )
+
+
+async def test_roles_script_is_idempotent_and_has_no_password(db_session: AsyncSession) -> None:
+    await apply_roles(db_session)
+    await apply_roles(db_session)
+    assert not re.search(r"PASSWORD\s+'", ROLES_SQL.read_text(), re.IGNORECASE)
 
 
 async def test_api_role_reads_briefings_only_through_the_view(db_session: AsyncSession) -> None:
-    await ensure_api_role(db_session)
-    # Mirrors scripts/db_roles.sql (rolled back with the test).
-    await db_session.execute(text("GRANT SELECT ON analysis_briefings TO news_api"))
-    assert await has_privilege(db_session, "analysis_briefings", "SELECT")
-    assert not await has_privilege(db_session, "analysis_briefings", "INSERT")
-    assert not await has_privilege(db_session, "article_analyses", "SELECT")
-
-    # The view runs with its owner's privileges: news_api reads it, not the base table.
-    await db_session.execute(text("SET LOCAL ROLE news_api"))
+    await apply_roles(db_session)
+    await db_session.execute(text("SET LOCAL ROLE news_api_login"))
     await db_session.execute(text("SELECT briefing FROM analysis_briefings LIMIT 1"))
-    with pytest.raises(DBAPIError, match="permission denied"):
-        async with db_session.begin_nested():
-            await db_session.execute(text("SELECT raw_output FROM article_analyses LIMIT 1"))
+    for table in ("article_analyses", "article_bodies", "api_calls", "analysis_runs"):
+        with pytest.raises(DBAPIError, match="permission denied"):
+            async with db_session.begin_nested():
+                await db_session.execute(text(f"SELECT 1 FROM {table} LIMIT 1"))  # noqa: S608  # fixed names
     await db_session.execute(text("RESET ROLE"))
 
 
@@ -79,3 +121,24 @@ async def test_the_view_exposes_no_text_column(db_session: AsyncSession) -> None
         "briefing",
         "updated_at",
     ]
+
+
+# --- startup guard --------------------------------------------------------------------------
+# The test DB login is the schema owner (a superuser in compose and CI): exactly the
+# misconfiguration the guard must catch.
+
+
+async def test_guard_refuses_a_privileged_api_login_in_production(
+    engine: AsyncEngine, settings: Settings
+) -> None:
+    production = settings.model_copy(update={"environment": "production"})
+    with pytest.raises(PrivilegeError, match="API_DATABASE_URL"):
+        await assert_least_privilege(engine, production)
+
+
+async def test_guard_only_warns_outside_production(
+    engine: AsyncEngine, settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="app.db.session"):
+        await assert_least_privilege(engine, settings)
+    assert "Least privilege not met" in caplog.text

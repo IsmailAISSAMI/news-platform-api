@@ -13,7 +13,7 @@ def test_metadata_uses_naming_convention() -> None:
 
 
 def make(**overrides: object) -> Settings:
-    return Settings(_env_file=None, **overrides)  # type: ignore[call-arg,arg-type]
+    return Settings(_env_file=None, **overrides)  # type: ignore[call-arg,arg-type]  # untyped test overrides
 
 
 def test_database_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -25,6 +25,11 @@ def test_database_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_database_url_must_use_psycopg_driver() -> None:
     with pytest.raises(ValidationError):
         make(database_url="postgresql://user:test-only-password@localhost/db")
+
+
+def test_an_empty_api_database_url_means_unset() -> None:
+    """docker compose passes an unset DOCKER_API_DATABASE_URL as an empty string."""
+    assert make(api_database_url="").api_database_url is None
 
 
 def test_database_url_is_not_leaked_in_repr() -> None:

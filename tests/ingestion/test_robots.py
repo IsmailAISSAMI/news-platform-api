@@ -1,6 +1,8 @@
+import logging
+
 import pytest
 
-from app.ingestion.robots import RobotsPolicy, parse_robots
+from app.ingestion.robots import MAX_CRAWL_DELAY_S, RobotsPolicy, normalize_path, parse_robots
 
 AGENT = "news-platform-api"
 
@@ -122,3 +124,35 @@ def test_deny_everything_blocks_all_but_robots_txt() -> None:
 
     assert not policy.can_fetch("/")
     assert not policy.can_fetch("/robots.txt")
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-inf", "-1"])
+def test_crawl_delay_must_be_finite_and_positive(value: str) -> None:
+    assert parse_robots(f"User-agent: *\nCrawl-delay: {value}\n", AGENT).crawl_delay_s is None
+
+
+def test_huge_crawl_delay_is_capped_with_a_warning(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING):
+        policy = parse_robots("User-agent: *\nCrawl-delay: 86400\n", AGENT)
+
+    assert policy.crawl_delay_s == MAX_CRAWL_DELAY_S == 60.0
+    assert "Crawl-delay" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("rule", "path"),
+    [
+        ("/%7Euser/", "/~user/x"),  # unreserved escape decoded
+        ("/~user/", "/%7euser/x"),
+        ("/caf%c3%a9", "/caf%C3%A9/menu"),  # escape case ignored
+        ("/café", "/caf%C3%A9"),  # raw UTF-8 in the rule
+        ("/caf%C3%A9", "/café"),  # raw UTF-8 in the path
+    ],
+)
+def test_matching_normalises_percent_encoding(rule: str, path: str) -> None:
+    assert not parse_robots(f"User-agent: *\nDisallow: {rule}\n", AGENT).can_fetch(path)
+
+
+def test_reserved_escapes_stay_escaped() -> None:
+    assert normalize_path("/a%2fb") == "/a%2Fb"  # %2F is not "/"
+    assert parse_robots("User-agent: *\nDisallow: /a/b\n", AGENT).can_fetch("/a%2Fb")

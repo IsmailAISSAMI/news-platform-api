@@ -34,6 +34,9 @@ services:
     image: news-backend:local
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      # Least-privilege login for the containerised API (host "db", port 5432), e.g.
+      # postgresql+psycopg://news_api_login:change-me@db:5432/news. Empty = owner login.
+      API_DATABASE_URL: ${DOCKER_API_DATABASE_URL:-}
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       # IPs of the reverse proxy allowed to set X-Forwarded-* (read by uvicorn).

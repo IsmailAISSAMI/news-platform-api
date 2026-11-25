@@ -3,8 +3,10 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.analysis.budget import CEILINGS
 
 
 def _package_version() -> str:
@@ -50,12 +52,15 @@ class Settings(BaseSettings):
     gemini_model: str = "gemma-4-31b-it"
     # Our limits keep 1/3 of every Google limit unused. They can only be LOWERED:
     # the code refuses values above the ceilings in app/analysis/budget.py.
-    gemini_max_requests_per_run: int = 3
-    gemini_max_requests_per_day: int = 1000
-    gemini_max_requests_per_minute: int = 20
-    gemini_max_input_tokens_per_minute: int = 10_000
+    # The per-run setting is the `news lab` limit (3 answered requests per test).
+    gemini_max_requests_per_run: int = Field(3, ge=1, le=CEILINGS["lab_per_run"])
+    gemini_max_requests_per_day: int = Field(1000, ge=1, le=CEILINGS["per_day"])
+    gemini_max_requests_per_minute: int = Field(20, ge=1, le=CEILINGS["per_minute"])
+    gemini_max_input_tokens_per_minute: int = Field(
+        10_000, ge=1, le=CEILINGS["input_tokens_per_minute"]
+    )
     # Articles in flight at once in `news analyze` (each answer takes about 3 minutes).
-    gemini_concurrency: int = 8
+    gemini_concurrency: int = Field(8, ge=1, le=CEILINGS["concurrency"])
 
     # Backups (`news backup` / `news restore-test`). Outside the repo and outside iCloud.
     backup_dir: Path = Path.home() / "Backups" / "news"
@@ -64,6 +69,12 @@ class Settings(BaseSettings):
     # How to run pg_dump/pg_restore/createdb/dropdb: inside the compose db container by
     # default, so tool and server versions always match. Use "" for host-installed tools.
     pg_tools_command: str = "docker compose exec -T db"
+
+    @field_validator("api_database_url", mode="before")
+    @classmethod
+    def _empty_api_url_means_unset(cls, value: object) -> object:
+        # docker compose passes an unset variable as "": treat it as not configured.
+        return None if value == "" else value
 
     @field_validator("database_url", "api_database_url")
     @classmethod

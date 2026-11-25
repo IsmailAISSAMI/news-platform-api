@@ -120,8 +120,13 @@ async def seed(sessions: async_sessionmaker[AsyncSession], count: int) -> list[i
         return ids
 
 
-def gemini(tmp_path: Path, chat: Chat, per_day: int = 1000) -> GeminiClient:
-    async def no_sleep(_: float) -> None:
+def gemini(
+    tmp_path: Path, chat: Chat, per_day: int = 1000, per_run: int | None = None
+) -> GeminiClient:
+    clock = [0.0]  # simulated time: a pacing wait passes instantly, but it does pass
+
+    async def no_sleep(seconds: float) -> None:
+        clock[0] += max(seconds, 0.0)
         await asyncio.sleep(0)
 
     return GeminiClient(
@@ -130,10 +135,11 @@ def gemini(tmp_path: Path, chat: Chat, per_day: int = 1000) -> GeminiClient:
         model=MODEL,
         api_key=SecretStr("test-key"),
         budget=RequestBudget(
-            per_run=per_day,
+            per_run=per_run or per_day,
             per_day=per_day,
             per_minute=20,
             input_tokens_per_minute=10_000,
+            monotonic=lambda: clock[0],
         ),
         ledger=FakeLedger(),
         sleep=no_sleep,
@@ -339,7 +345,7 @@ async def test_the_model_is_called_through_one_analysis_function(
         return ok()
 
     async with factory() as session:
-        await lab.run_lab(session, gemini(tmp_path, chat), [article_id])
+        await lab.run_lab(session, gemini(tmp_path, chat, per_run=3), [article_id])
     await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
 
     assert calls == [article_id, article_id]  # lab and analyze: the same function
@@ -357,7 +363,7 @@ async def test_lab_stores_no_analysis_rows(
         return ok()
 
     async with factory() as session:
-        _, results = await lab.run_lab(session, gemini(tmp_path, chat), ids)
+        _, results = await lab.run_lab(session, gemini(tmp_path, chat, per_run=3), ids)
 
     assert all(r.ok for r in results)
     async with factory() as session:
@@ -447,3 +453,133 @@ async def test_every_api_call_of_a_run_points_to_its_run_row(
         async with factory() as session:
             await session.execute(delete(ApiCall).where(ApiCall.run_id == report.run_id))
             await session.commit()
+
+
+async def stored(sessions: async_sessionmaker[AsyncSession], article_id: int) -> ArticleAnalysis:
+    async with sessions() as session:
+        row = await session.scalar(
+            select(ArticleAnalysis).where(ArticleAnalysis.article_id == article_id)
+        )
+        assert row is not None
+        return row
+
+
+def actor(name: str, quote: str) -> dict[str, object]:
+    return {"name_as_written": name, "full_name": name, "type": "government_body",
+            "role": "acted", "involvement": "central",
+            "evidence": {"paragraph": 1, "quote": quote}}  # fmt: skip
+
+
+async def test_no_unverified_item_survives_when_cleanup_drops_an_earlier_item(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    [article_id] = await seed(factory, 1)
+    data = json.loads(VALID)
+    data["who"] = [
+        actor("Hespress English", "announced the alert system on Monday"),  # publisher: dropped
+        actor("ministry", "the ministry closed every school in the city"),  # fabricated
+    ]
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok(json.dumps(data))
+
+    await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    row = await stored(factory, article_id)
+    assert row.status == "needs_review"
+    assert row.unverified_paths == ["$.who[1].evidence"]  # into the model's answer
+    assert row.cleaned is not None
+    assert [a["name_as_written"] for a in row.cleaned["who"]] == ["ministry"]  # now who[0]
+    assert row.evidence is not None
+    assert row.evidence["cleaned:$.who[0].evidence"] == "fabricated"
+    assert row.briefing is not None
+    assert row.briefing["who"] == []  # the fabricated actor is never served
+    assert row.briefing["review_required"] is True
+
+
+async def test_text_copied_from_the_article_is_never_served(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    [article_id] = await seed(factory, 1)
+    data = json.loads(VALID)
+    data["what"] = {
+        "main_event": "The ministry announced the alert system on Monday in Rabat",  # copied
+        "secondary_events": ["An alert system was presented", BODY],
+    }
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok(json.dumps(data))
+
+    await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    briefing = (await stored(factory, article_id)).briefing
+    assert briefing is not None
+    assert briefing["what"] == {
+        "main_event": None,
+        "secondary_events": ["An alert system was presented"],
+    }
+    assert set(briefing["copied_paths"]) == {"$.what.main_event", "$.what.secondary_events[1]"}
+    assert (briefing["removed_items"], briefing["copied_items"]) == (2, 2)
+    assert "$.what.secondary_events" in briefing["unverified_fields"]
+    assert "$.overview.headline" in briefing["unverified_fields"]
+
+
+async def test_every_attempt_is_kept_in_the_history_without_raw_text(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    [article_id] = await seed(factory, 1)
+    answers = [
+        httpx.Response(
+            200, json={"choices": [{"message": {"content": "{"}, "finish_reason": "length"}]}
+        ),
+        ok("not json"),
+        ok(),
+    ]
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return answers.pop(0)
+
+    await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    row = await stored(factory, article_id)
+    assert row.status == "succeeded"
+    history = row.attempt_history
+    assert [(h["attempt"], h["status"], h["finish_reason"]) for h in history] == [
+        (1, "failed", "length"),
+        (2, "failed", "invalid"),
+        (3, "succeeded", "stop"),
+    ]
+    assert history[2]["input_tokens"] == 100
+    assert all(h["at"] for h in history)
+    dumped = json.dumps(history)
+    assert "not json" not in dumped
+    assert "alert system" not in dumped
+
+
+async def test_an_interruption_finishes_the_run_row(
+    factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(factory, 1)
+
+    async def interrupted(*_: Any, **__: Any) -> pipeline.AnalysisOutcome:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(pipeline, "analyse_article", interrupted)
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    async with factory() as session:
+        run = await session.scalar(
+            select(AnalysisRun).where(AnalysisRun.command == "analyze").order_by(
+                AnalysisRun.id.desc()
+            ).limit(1)
+        )  # fmt: skip
+    assert run is not None
+    assert run.finished_at is not None
+    assert run.stop_reason == "interrupted"

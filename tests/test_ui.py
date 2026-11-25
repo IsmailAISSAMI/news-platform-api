@@ -133,3 +133,36 @@ def test_api_data_is_always_revalidated() -> None:
     app_js = (UI_DIR / "app.js").read_text()
 
     assert 'cache: "no-cache"' in app_js
+
+
+def _js(name: str) -> str:
+    return _strip_comments(UI_DIR / name)
+
+
+def test_links_go_through_safe_url() -> None:
+    dom = _js("dom.js")
+    assert "export function safeUrl" in dom
+    assert '"http:"' in dom and '"https:"' in dom
+    # Every external href is built by outLink, which calls safeUrl.
+    assert 'target: "_blank"' not in _js("app.js")
+    assert 'rel: "noopener noreferrer"' in dom
+
+
+def test_cards_list_has_no_aria_live() -> None:
+    assert "aria-live" not in _js("app.js")
+    assert 'role: "status"' in _js("app.js")
+
+
+def test_cards_link_to_the_original_with_attribution() -> None:
+    app_js = _js("app.js")
+    card = app_js[app_js.index("function card(") : app_js.index("function matches(")]
+    assert "outLink(item.canonical_url" in card
+    assert '"original article"' in card
+
+
+def test_event_handlers_are_allowlisted() -> None:
+    assert 'new Set(["onclick", "oninput", "onchange"])' in _js("dom.js")
+
+
+def test_light_theme_exists() -> None:
+    assert "@media (prefers-color-scheme: light)" in _js("style.css")

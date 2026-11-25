@@ -3,15 +3,22 @@
 Feeds fail independently: one broken feed is recorded and the others still run. The run
 row in `ingestion_runs` is finalized even on Ctrl-C (status `interrupted`), and the
 advisory lock is always released.
+
+The lock is session-level, so it lives on one Postgres connection. It is taken and
+released on a dedicated AUTOCOMMIT connection held for the whole run: the ORM session
+returns its connection to the pool on every commit, so locking through it could unlock
+on a different connection (a silent no-op) and leak the lock.
 """
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import case, select, text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from app.ingestion.fetch import FetchError, PoliteFetcher
 from app.ingestion.parsers import FeedParseError
@@ -33,6 +40,52 @@ _KIND_ORDER = case((Feed.kind == FeedKind.RSS, 0), (Feed.kind == FeedKind.NEWS_S
 
 class AlreadyRunningError(Exception):
     """Another `news ingest` holds the lock."""
+
+
+class LockLostError(Exception):
+    """`pg_advisory_unlock` returned false: the lock was not held where we expected."""
+
+
+@asynccontextmanager
+async def ingest_lock(bind: AsyncEngine | AsyncConnection) -> AsyncIterator[AsyncConnection]:
+    """Hold the ingest advisory lock on one connection for the whole block.
+
+    With an engine (production), a dedicated AUTOCOMMIT connection is opened. With a
+    connection (tests bind the session to one), that same connection is used: the lock is
+    session-level, so the session's savepoints and rollbacks do not release it.
+    """
+    if isinstance(bind, AsyncEngine):
+        async with bind.connect() as raw:
+            connection = await raw.execution_options(isolation_level="AUTOCOMMIT")
+            async with _locked(connection) as held:
+                yield held
+    else:
+        async with _locked(bind) as held:
+            yield held
+
+
+@asynccontextmanager
+async def _locked(connection: AsyncConnection) -> AsyncIterator[AsyncConnection]:
+    acquired = await connection.scalar(
+        text("SELECT pg_try_advisory_lock(:key)"), {"key": INGEST_LOCK_KEY}
+    )
+    if not acquired:
+        msg = "another `news ingest` is already running"
+        raise AlreadyRunningError(msg)
+    failed = False
+    try:
+        yield connection
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        released = await connection.scalar(
+            text("SELECT pg_advisory_unlock(:key)"), {"key": INGEST_LOCK_KEY}
+        )
+        if not released:
+            logger.error("pg_advisory_unlock(%d) returned false", INGEST_LOCK_KEY)
+            if not failed:
+                raise LockLostError("the ingest lock was not held at unlock")
 
 
 @dataclass(frozen=True)
@@ -77,18 +130,15 @@ async def run_ingest(
     options: IngestOptions,
     adapters: dict[str, WordPressAdapter] = ADAPTERS,
 ) -> RunReport:
-    acquired = await session.scalar(
-        text("SELECT pg_try_advisory_lock(:key)"), {"key": INGEST_LOCK_KEY}
-    )
-    if not acquired:
-        msg = "another `news ingest` is already running"
-        raise AlreadyRunningError(msg)
-    try:
-        return await _run_locked(session, fetcher, now=now, options=options, adapters=adapters)
-    finally:
-        await session.rollback()  # leave no half-done transaction before unlocking
-        await session.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": INGEST_LOCK_KEY})
-        await session.commit()
+    bind = session.bind
+    if not isinstance(bind, AsyncEngine | AsyncConnection):  # pragma: no cover - misuse
+        msg = "the session must be bound to an engine or a connection"
+        raise TypeError(msg)
+    async with ingest_lock(bind):
+        try:
+            return await _run_locked(session, fetcher, now=now, options=options, adapters=adapters)
+        finally:
+            await session.rollback()  # leave no half-done transaction behind
 
 
 async def _run_locked(

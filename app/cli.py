@@ -24,7 +24,14 @@ import httpx
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.analysis.budget import CEILINGS, GOOGLE_LIMITS, DayUsage, RequestBudget
+from app.analysis.budget import (
+    CEILINGS,
+    GOOGLE_LIMITS,
+    LAB_PER_RUN_CEILING,
+    WINDOW_S,
+    DayUsage,
+    RequestBudget,
+)
 from app.analysis.compare import render as render_comparison
 from app.analysis.compare import score_run
 from app.analysis.eval import consistency, export_gold, score_gold
@@ -119,10 +126,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument(
         "--concurrency",
-        type=_positive_int,
+        type=_concurrency,
         default=None,
         metavar="N",
-        help="Articles in flight at once (default: GEMINI_CONCURRENCY).",
+        help=f"Articles in flight at once, 1..{CEILINGS['concurrency']} "
+        "(default: GEMINI_CONCURRENCY).",
     )
     analyze.add_argument(
         "--retry-failed",
@@ -171,6 +179,14 @@ def _positive_int(value: str) -> int:
     number = int(value)
     if number < 1:
         msg = "must be >= 1"
+        raise argparse.ArgumentTypeError(msg)
+    return number
+
+
+def _concurrency(value: str) -> int:
+    number = _positive_int(value)
+    if number > CEILINGS["concurrency"]:
+        msg = f"must be <= {CEILINGS['concurrency']}"
         raise argparse.ArgumentTypeError(msg)
     return number
 
@@ -282,6 +298,9 @@ async def lab(ids: list[int], label: str) -> int:
         await _check_ready(engine)
         sessions = create_session_factory(engine)
         budget = _budget(settings)
+        if budget.per_run > LAB_PER_RUN_CEILING:  # settings already refuse it; never trust
+            msg = f"lab per-run limit {budget.per_run} is above {LAB_PER_RUN_CEILING}"
+            raise ValueError(msg)
         async with _analysis_lock(engine), httpx.AsyncClient() as client:
             llm = GeminiClient(
                 client,
@@ -316,14 +335,19 @@ async def gemini_usage() -> int:
     settings = get_settings()
     engine = create_engine(settings, read_only=True)
     try:
-        days = await DatabaseLedger(create_session_factory(engine)).totals(settings.gemini_model, 7)
+        ledger = DatabaseLedger(create_session_factory(engine))
+        days = await ledger.totals(settings.gemini_model, 7)
+        recent = await ledger.recent(settings.gemini_model, WINDOW_S)
     finally:
         await engine.dispose()
-    sys.stdout.write(format_usage(days, _budget(settings)))
+    sys.stdout.write(format_usage(days, _budget(settings), recent))
     return EXIT_OK
 
 
-def format_usage(days: list[DayUsage], budget: RequestBudget) -> str:
+def format_usage(
+    days: list[DayUsage], budget: RequestBudget, recent: list[tuple[float, int]] | None = None
+) -> str:
+    recent = recent or []
     lines = [
         "Gemini API usage (quota days, Pacific time; source: database table api_calls)",
         "",
@@ -340,7 +364,9 @@ def format_usage(days: list[DayUsage], budget: RequestBudget) -> str:
         "",
         f"Today: {today.requests}/{budget.per_day} requests "
         f"({budget.per_day - today.requests} left), {today.pending} still in flight here.",
-        f"Our limits:  {budget.per_run} answered/run, {budget.per_day}/day, "
+        f"Last 60 s: {len(recent)} requests, ~{sum(t for _, t in recent)} tokens "
+        f"(limits {budget.per_minute}/min, {budget.input_tokens_per_minute} tokens/min).",
+        f"Our limits:  {budget.per_run} answered/test, {budget.per_day}/day, "
         f"{budget.per_minute}/min, "
         f"{budget.input_tokens_per_minute} input tokens/min (hard ceilings: "
         f"{CEILINGS['per_day']}/day, {CEILINGS['per_minute']}/min, "
@@ -361,8 +387,10 @@ async def analyze(limit: int | None, concurrency: int | None, *, retry_failed: b
     engine = create_engine(settings)
     try:
         await _check_ready(engine)
-        # A bulk run: the per-run cap is the daily cap (tests keep their 3 via `news lab`).
-        budget = _budget(settings, per_run=settings.gemini_max_requests_per_day)
+        # A bulk run: its own per-run cap, the daily cap (tests keep their 3 via `news lab`).
+        budget = _budget(
+            settings, per_run=min(settings.gemini_max_requests_per_day, CEILINGS["per_run"])
+        )
         async with httpx.AsyncClient() as client:
             llm = GeminiClient(
                 client,
@@ -373,7 +401,9 @@ async def analyze(limit: int | None, concurrency: int | None, *, retry_failed: b
                 ledger=DatabaseLedger(create_session_factory(engine)),
             )
             options = AnalyzeOptions(
-                concurrency=concurrency or settings.gemini_concurrency,
+                concurrency=min(
+                    concurrency or settings.gemini_concurrency, CEILINGS["concurrency"]
+                ),
                 limit=limit,
                 retry_failed=retry_failed,
             )

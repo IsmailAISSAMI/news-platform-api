@@ -44,12 +44,27 @@ def reply(content: str) -> httpx.Response:
     )
 
 
+class Mono:
+    """A fake monotonic clock: sleeping moves it forward."""
+
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
 def gemini(
     chat: Callable[[httpx.Request], httpx.Response],
     per_run: int = 3,
     slept: list[float] | None = None,
+    mono: Mono | None = None,
+    ledger: FakeLedger | None = None,
 ) -> GeminiClient:
+    clock = mono or Mono()
+
     async def no_sleep(seconds: float) -> None:
+        clock.t += seconds
         if slept is not None:
             slept.append(seconds)
 
@@ -63,8 +78,9 @@ def gemini(
             per_day=1000,
             per_minute=10,
             input_tokens_per_minute=8000,
+            monotonic=clock,
         ),
-        ledger=FakeLedger(),
+        ledger=ledger or FakeLedger(clock),
         sleep=no_sleep,
     )
 
@@ -75,6 +91,10 @@ def gemini(
         ("http://localhost:1234/v1", MODEL, "only https://generativelanguage"),
         ("http://generativelanguage.googleapis.com/v1beta/openai", MODEL, "only https"),
         ("https://api.example.com/v1", MODEL, "only https"),
+        (GEMINI + "/", MODEL, "only https"),
+        ("https://generativelanguage.googleapis.com/v1/other", MODEL, "only https"),
+        ("https://generativelanguage.googleapis.com:8443/v1beta/openai", MODEL, "only https"),
+        ("https://user@generativelanguage.googleapis.com/v1beta/openai", MODEL, "only https"),
         (GEMINI, "gemini-3.1-pro", "free-tier allowlist"),
     ],
 )
@@ -349,3 +369,150 @@ async def test_a_dropped_connection_is_waited_out_not_a_crash() -> None:
     assert isinstance(llm.ledger, FakeLedger)
     assert (await llm.structured(Tiny, system="s", user="u")).parsed == Tiny(answer="ok")
     assert calls["n"] == 2
+
+
+# --- review fixes (2026-11-25) -----------------------------------------------------------
+
+
+async def test_an_unusable_http_200_answer_still_uses_the_per_run_slot() -> None:
+    """Google answered and counts it: a lab test must not get a 4th request this way."""
+    llm = gemini(lambda _: reply("not json at all"), per_run=1)
+    with pytest.raises(LLMOutputError):
+        await llm.structured(Tiny, system="s", user="u")
+    assert (llm.budget.used_this_run, llm.budget.in_flight_this_run) == (1, 0)
+    assert isinstance(llm.ledger, FakeLedger)
+    assert [r["outcome"] for r in llm.ledger.rows.values()] == ["failed"]
+    with pytest.raises(LLMUnavailableError, match="per-run"):
+        await llm.structured(Tiny, system="s", user="u")
+
+
+async def test_the_estimate_is_stored_at_reservation() -> None:
+    llm = gemini(lambda _: reply('{"answer": "ok"}'))
+    await llm.structured(Tiny, system="s", user="u")
+    assert isinstance(llm.ledger, FakeLedger)
+    [row] = llm.ledger.rows.values()
+    assert row["est"] is not None
+    assert row["est"] > 0
+
+
+async def test_a_second_process_waits_for_the_first_ones_last_minute() -> None:
+    """Two clients (two processes) on one ledger: the second one is paced at once."""
+    mono = Mono()
+    ledger = FakeLedger(mono)
+    first = gemini(lambda _: reply('{"answer": "ok"}'), mono=mono, ledger=ledger)
+    first.budget.per_minute = 2
+    first.budget.per_run = 3
+    for _ in range(2):
+        await first.structured(Tiny, system="s", user="u")
+    slept: list[float] = []
+    second = gemini(lambda _: reply('{"answer": "ok"}'), mono=mono, ledger=ledger, slept=slept)
+    second.budget.per_minute = 2
+    await second.structured(Tiny, system="s", user="u")
+    assert slept == [60.5]  # waited for the first process's oldest request to expire
+
+
+async def test_the_cooldown_is_rechecked_after_a_pacing_wait() -> None:
+    llm = gemini(lambda _: reply('{"answer": "ok"}'))
+    llm.budget.per_minute = 1
+    await llm.structured(Tiny, system="s", user="u")
+    slept: list[float] = []
+    mono = llm.budget.monotonic
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        assert isinstance(mono, Mono)
+        mono.t += seconds
+        if len(slept) == 1:  # a busy answer elsewhere during the pacing wait
+            llm._cooldown_until = mono.t + 30  # simulate another worker
+
+    llm._sleep = sleep  # inject the racing cooldown
+    await llm.structured(Tiny, system="s", user="u")
+    assert slept == [60.5, 30.0]
+
+
+async def test_admission_fails_closed_when_it_never_clears() -> None:
+    llm = gemini(lambda _: reply('{"answer": "ok"}'))
+    llm.budget.per_minute = 1
+    llm.budget.pace(10)  # the minute is full
+
+    async def stuck(_: float) -> None:  # time never moves: the window never clears
+        return
+
+    llm._sleep = stuck  # a clock that is stuck
+    with pytest.raises(LLMUnavailableError, match="still blocked"):
+        await llm.structured(Tiny, system="s", user="u")
+    assert (await llm.ledger.totals(MODEL, 1))[0].requests == 0  # never sent
+
+
+async def test_during_a_busy_streak_only_one_worker_probes() -> None:
+    import asyncio  # noqa: PLC0415  # local to this test
+
+    in_flight = {"now": 0, "max_while_busy": 0}
+    state = {"busy_left": 8, "streak": False}
+
+    class Transport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            in_flight["now"] += 1
+            if state["streak"]:
+                in_flight["max_while_busy"] = max(in_flight["max_while_busy"], in_flight["now"])
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            in_flight["now"] -= 1
+            if state["busy_left"] > 0:
+                state["busy_left"] -= 1
+                state["streak"] = True
+                return httpx.Response(503, json=BUSY)
+            state["streak"] = False
+            return reply('{"answer": "ok"}')
+
+    mono = Mono()
+
+    async def sleep(seconds: float) -> None:
+        mono.t += seconds
+        await asyncio.sleep(0)
+
+    llm = GeminiClient(
+        httpx.AsyncClient(transport=Transport()),
+        base_url=GEMINI,
+        model=MODEL,
+        api_key=SecretStr("k"),
+        budget=RequestBudget(
+            per_run=10, per_day=1000, per_minute=20, input_tokens_per_minute=8000, monotonic=mono
+        ),
+        ledger=FakeLedger(mono),
+        sleep=sleep,
+    )
+    results = await asyncio.gather(*(llm.structured(Tiny, system="s", user="u") for _ in range(4)))
+    assert all(r.parsed == Tiny(answer="ok") for r in results)
+    assert in_flight["max_while_busy"] == 1  # half-open: one probe at a time
+    assert set(llm._retry_pauses) == {10.0, 20.0, 30.0, 60.0}  # unchanged
+
+
+async def test_a_cancelled_request_is_recorded_and_its_slot_released() -> None:
+    import asyncio  # noqa: PLC0415  # local to this test
+
+    started = asyncio.Event()
+
+    class Hang(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError  # pragma: no cover
+
+    ledger = FakeLedger()
+    llm = GeminiClient(
+        httpx.AsyncClient(transport=Hang()),
+        base_url=GEMINI,
+        model=MODEL,
+        api_key=SecretStr("k"),
+        budget=RequestBudget(per_run=3, per_day=1000, per_minute=10, input_tokens_per_minute=8000),
+        ledger=ledger,
+    )
+    task = asyncio.create_task(llm.structured(Tiny, system="s", user="u"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    [row] = ledger.rows.values()
+    assert (row["outcome"], row["error"]) == ("failed", "cancelled")
+    assert (llm.budget.in_flight_this_run, llm.budget.used_this_run) == (0, 0)

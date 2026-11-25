@@ -16,7 +16,8 @@ def cached_json(request: Request, payload: BaseModel) -> Response:
     body = payload.model_dump_json().encode()
     etag = f'W/"{hashlib.sha256(body).hexdigest()[:32]}"'
     headers = {"ETag": etag, "Cache-Control": CACHE_CONTROL}
-    if etag in _parse_if_none_match(request.headers.get("If-None-Match")):
+    tags = _parse_if_none_match(request.headers.get("If-None-Match"))
+    if "*" in tags or etag in tags:  # `*` matches any current representation (RFC 9110)
         return Response(status_code=304, headers=headers)
     return Response(content=body, media_type="application/json", headers=headers)
 

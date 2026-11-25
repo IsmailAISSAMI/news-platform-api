@@ -5,6 +5,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.deps import DbSession
+from app.core.errors import ErrorOut
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ async def live() -> dict[str, str]:
     return {"status": "alive"}
 
 
-@router.get("/ready")
+@router.get("/ready", responses={503: {"model": ErrorOut, "description": "Database down"}})
 async def ready(db: DbSession) -> dict[str, str]:
     """Readiness: the service can reach its database."""
     try:

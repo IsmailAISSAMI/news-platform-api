@@ -26,7 +26,8 @@ Some problems cannot be fixed safely and are FLAGGED for human review instead, n
 rewritten: a claim whose quote speaks of the future while the claim reads as done;
 a name listed both as an actor and as a place (either side may be the error); a claim
 resting on a paragraph that cites anonymous sources ("sources said") but carrying no
-attribution; a cause too short to explain anything or restating the main event.
+attribution; an attribution naming someone the article never names (anonymous-source
+descriptions exempt); a cause too short to explain anything or restating the main event.
 """
 
 import re
@@ -108,10 +109,19 @@ def clean(
             report.flags.append(
                 ReviewFlag(path, claim.text, "claim from an anonymous source has no attribution")
             )
+        if issues.get(path) is Issue.ATTRIBUTION_NOT_IN_ARTICLE:
+            report.flags.append(
+                ReviewFlag(path, str(claim.attributed_to), "attribution not named in the article")
+            )
 
     for index, cause in enumerate(analysis.why):
         if issues.get(f"$.why[{index}]") is Issue.UNINFORMATIVE_CAUSE:
             report.flags.append(ReviewFlag(f"$.why[{index}]", cause.text, "uninformative cause"))
+        path = f"$.why[{index}].attributed_to"
+        if issues.get(path) is Issue.ATTRIBUTION_NOT_IN_ARTICLE:
+            report.flags.append(
+                ReviewFlag(path, str(cause.attributed_to), "attribution not named in the article")
+            )
 
     event_date = analysis.when.event_date
     if issues.get("$.when.event_date") is Issue.EVENT_DATE_WITHOUT_DATE_WORDS:
@@ -174,8 +184,10 @@ def upcoming(analysis: ArticleAnalysis, published: date) -> list[str]:
 
 
 def _is_publisher(name: str, publisher: set[str]) -> bool:
+    """Exact equality after normalization (and without a leading article), never substring:
+    "Hespress" must not remove "Hespress English readers' panel" or a name inside it."""
     normalized = normalize(name)
-    return any(p in normalized or normalized in p for p in publisher)
+    return normalized in publisher or _actor_key(normalized) in publisher
 
 
 _LEADING_ARTICLE = re.compile(r"^(the|a|an)\s+")

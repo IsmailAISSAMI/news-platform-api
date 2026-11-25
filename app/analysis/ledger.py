@@ -75,37 +75,77 @@ class DatabaseLedger:
             await _lock(session)
             return await _count_sent(session, model, quota_day)
 
-    async def reserve(self, model: str, quota_day: date, per_day: int, run_id: int | None) -> int:
+    async def reserve(  # the reservation's fields
+        self,
+        model: str,
+        quota_day: date,
+        per_day: int,
+        run_id: int | None,
+        est_input_tokens: int | None = None,
+    ) -> int:
         async with self._sessions.begin() as session:
             await _lock(session)
             sent = await _count_sent(session, model, quota_day)
             if sent >= per_day:
                 msg = f"daily limit reached ({per_day} requests on {quota_day}, Pacific time)"
                 raise DailyLimitError(msg)
-            row = ApiCall(quota_day=quota_day, model=model, outcome="failed", run_id=run_id)
+            row = ApiCall(
+                quota_day=quota_day,
+                model=model,
+                outcome="failed",
+                run_id=run_id,
+                est_input_tokens=est_input_tokens,
+            )
             session.add(row)
             await session.flush()
             reservation_id = row.id
         self._open[reservation_id] = (model, quota_day)
         return reservation_id
 
-    async def record(
+    async def record(  # the outcome's fields
         self,
         reservation_id: int,
         outcome: Outcome,
         input_tokens: int | None,
         output_tokens: int | None,
+        error: str | None = None,
     ) -> None:
         async with self._sessions.begin() as session:
             result = await session.execute(
                 update(ApiCall)
                 .where(ApiCall.id == reservation_id)
-                .values(outcome=outcome, input_tokens=input_tokens, output_tokens=output_tokens)
+                .values(
+                    outcome=outcome,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    error=error,
+                )
             )
         if cast(Any, result).rowcount != 1:  # CursorResult; the update touches one row
             msg = f"no api_calls row {reservation_id} to record"
             raise LookupError(msg)
         self._open.pop(reservation_id, None)
+
+    async def recent(self, model: str, window_s: float) -> list[tuple[float, int]]:
+        """Requests of the last `window_s` seconds (any process), by database time.
+
+        Ages come from the database clock, so processes never compare their own clocks.
+        """
+        age = func.extract("epoch", func.clock_timestamp() - ApiCall.requested_at)
+        tokens = func.coalesce(func.greatest(ApiCall.input_tokens, ApiCall.est_input_tokens), 0)
+        async with self._sessions() as session:
+            rows = (
+                await session.execute(
+                    select(age, tokens)
+                    .where(
+                        ApiCall.model == model,
+                        ApiCall.outcome.in_(SENT_OUTCOMES),
+                        ApiCall.requested_at > func.clock_timestamp() - timedelta(seconds=window_s),
+                    )
+                    .order_by(ApiCall.requested_at)
+                )
+            ).all()
+        return [(float(a), int(t)) for a, t in rows]
 
     async def totals(self, model: str, days: int) -> list[DayUsage]:
         today = self._today()

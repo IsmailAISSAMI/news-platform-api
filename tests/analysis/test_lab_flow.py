@@ -105,3 +105,10 @@ async def test_lab_files_are_private_and_stop_after_a_hard_error(
     assert record["status"] == "stopped"
     assert (out / "article-21.json").stat().st_mode & 0o777 == 0o600
     assert (out / "summary.md").exists()
+
+
+async def test_the_lab_refuses_a_budget_above_three_answered_requests(tmp_path: Path) -> None:
+    llm = client(tmp_path)
+    llm.budget.per_run = 4  # what a raised setting would give
+    with pytest.raises(ValueError, match=r"lab per-run limit must be 1\.\.3"):
+        await lab.run_lab(cast(AsyncSession, NoDatabase()), llm, [1])

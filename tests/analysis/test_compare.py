@@ -29,7 +29,7 @@ def write(run: Path, name: str, record: dict[str, object]) -> None:
 def test_scores_valid_invalid_and_fabricated(tmp_path: Path) -> None:
     run = tmp_path / "run-a"
     write(run, "article-1.json", {"article_id": 1, "duration_s": 10, "analysis": analysis(QUOTE)})
-    invented = {"paragraph": 1, "quote": "announced a curfew"}
+    invented = {"paragraph": 1, "quote": "the ministry announced a curfew overnight"}
     write(run, "article-2.json", {"article_id": 1, "duration_s": 30,
                                   "analysis": analysis(invented)})  # fmt: skip
     write(run, "article-3.json", {"article_id": 1, "error": "invalid output"})

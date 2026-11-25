@@ -1,5 +1,6 @@
 """Briefing API against the real database (synthetic data only, rolled back per test)."""
 
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +23,7 @@ from tests.integration.test_pipeline import (  # the pipeline test's synthetic p
     ok,
     seed,
 )
+from tests.test_api_contract import check, response_schema
 
 pytestmark = pytest.mark.integration
 __all__ = ["factory"]  # a fixture, re-exported for the pipeline test below
@@ -190,7 +192,12 @@ async def test_needs_review_never_exposes_the_removed_item(
         True,
         2,
     )
-    assert body["source_url"] == article.canonical_url == body["url"]
+    assert body["source_url"] == article.canonical_url
+    assert "url" not in body  # the duplicate of source_url is gone
+    assert body["copied_items"] == 0
+    # Fields with no evidence are listed as unchecked, never the quarantined items.
+    assert all(f.startswith("$.") for f in body["unverified_fields"])
+    assert not any(f.startswith("$.claims") for f in body["unverified_fields"])
     assert body["source"]["name"] == source.name
     listed = (await client.get("/api/v1/briefings", params={"limit": 100})).json()["items"]
     mine = next(i for i in listed if i["article_id"] == article.id)
@@ -235,5 +242,119 @@ async def test_the_pipeline_saves_the_briefing(
     clean, review = briefings[False], briefings[True]
     assert clean["when"]["event_date"] == {"value": "2026-11-23"}
     assert review["when"]["event_date"] == {"value": None}
-    assert review["removed_items"] == 1
+    # Cleanup already nulls the unverified event date, so the quarantine removes nothing more.
+    assert review["removed_items"] == 0
     assert "evidence" not in keys(clean) | keys(review)
+
+
+async def test_every_endpoint_body_matches_its_openapi_schema(
+    app: FastAPI, client: httpx.AsyncClient, db_session: AsyncSession, source: Source
+) -> None:
+    article = await add(db_session, source, 7, "needs_review", ["$.claims[1].evidence"])
+    spec = app.openapi()
+    cases = [
+        ("/api/v1/sources", "/api/v1/sources", 200),
+        ("/api/v1/feeds", "/api/v1/feeds", 200),
+        ("/api/v1/articles?limit=2", "/api/v1/articles", 200),
+        (f"/api/v1/articles/{article.id}", "/api/v1/articles/{article_id}", 200),
+        ("/api/v1/briefings?limit=2", "/api/v1/briefings", 200),
+        (f"/api/v1/articles/{article.id}/briefing", "/api/v1/articles/{article_id}/briefing", 200),
+        ("/api/v1/articles/999999999", "/api/v1/articles/{article_id}", 404),
+        (
+            "/api/v1/articles/999999999/briefing",
+            "/api/v1/articles/{article_id}/briefing",
+            404,
+        ),
+    ]
+    for url, route, status in cases:
+        response = await client.get(url)
+        assert response.status_code == status, url
+        check(spec, response_schema(spec, route, status), response.json(), url)
+
+
+async def test_a_malformed_stored_briefing_is_skipped_and_logged_by_id(
+    client: httpx.AsyncClient,
+    db_session: AsyncSession,
+    source: Source,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    good = await add(db_session, source, 1, "succeeded", [])
+    bad = await add(db_session, source, 2, "succeeded", [])
+    analysis = await db_session.scalar(
+        select(ArticleAnalysis).where(ArticleAnalysis.article_id == bad.id)
+    )
+    assert analysis is not None
+    analysis.briefing = {"overview": "MALFORMED-CONTENT", "review_required": False}
+    await db_session.flush()
+
+    with caplog.at_level(logging.WARNING, logger="app.api.v1.analysis"):
+        listed = await client.get("/api/v1/briefings", params={"limit": 100})
+        detail = await client.get(f"/api/v1/articles/{bad.id}/briefing")
+
+    assert listed.status_code == 200
+    ids = [i["article_id"] for i in listed.json()["items"]]
+    assert good.id in ids
+    assert bad.id not in ids
+    assert detail.status_code == 404
+    records = [r for r in caplog.records if r.name == "app.api.v1.analysis"]
+    assert records
+    assert {getattr(r, "article_id", None) for r in records} == {bad.id}
+    assert all("MALFORMED-CONTENT" not in r.getMessage() for r in records)
+
+
+async def test_new_briefing_keys_are_exposed(
+    client: httpx.AsyncClient, db_session: AsyncSession, source: Source
+) -> None:
+    article = await add(db_session, source, 4, "needs_review", ["$.claims[1].evidence"])
+    analysis = await db_session.scalar(
+        select(ArticleAnalysis).where(ArticleAnalysis.article_id == article.id)
+    )
+    assert analysis is not None and analysis.briefing is not None
+    analysis.briefing = analysis.briefing | {
+        "unverified_fields": ["$.claims[1]"],
+        "copied_items": 2,
+    }
+    await db_session.flush()
+
+    body = (await client.get(f"/api/v1/articles/{article.id}/briefing")).json()
+
+    assert (body["unverified_fields"], body["copied_items"]) == (["$.claims[1]"], 2)
+
+
+async def test_the_latest_analyzer_version_is_served(
+    client: httpx.AsyncClient, db_session: AsyncSession, source: Source
+) -> None:
+    article = await add(db_session, source, 5, "succeeded", [])
+    newer = cleaned(5)
+    newer["overview"]["headline"] = "Newer version"
+    db_session.add(
+        ArticleAnalysis(
+            article_id=article.id,
+            analyzer_version="test|p2|s1",
+            model="test",
+            status="succeeded",
+            raw_output="RAW-SECRET",
+            analysis=newer,
+            cleaned=newer,
+            unverified_paths=[],
+            briefing=make_briefing(newer, []),
+            updated_at=NOW + timedelta(days=1),
+        )
+    )
+    await db_session.flush()
+
+    listed = (await client.get("/api/v1/briefings", params={"limit": 100})).json()["items"]
+    detail = (await client.get(f"/api/v1/articles/{article.id}/briefing")).json()
+
+    assert [i["headline"] for i in listed if i["article_id"] == article.id] == ["Newer version"]
+    assert detail["analyzer_version"] == "test|p2|s1"
+
+
+async def test_if_none_match_star_returns_304(
+    client: httpx.AsyncClient, db_session: AsyncSession, source: Source
+) -> None:
+    await add(db_session, source, 6, "succeeded", [])
+
+    response = await client.get("/api/v1/briefings", headers={"If-None-Match": "*"})
+
+    assert response.status_code == 304

@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.analysis import pipeline
+from app.analysis.budget import LAB_PER_RUN_CEILING
 from app.analysis.cleanup import upcoming
 from app.analysis.evidence import EvidenceReport, EvidenceStatus
 from app.analysis.llm import GeminiClient
@@ -52,7 +53,11 @@ async def run_lab(
     """Analyse each article with the same flow as `news analyze`, storing no rows.
 
     Writes only files under LAB_ROOT. Each article is sent once (no compact retry).
+    Refused if the budget allows more than LAB_PER_RUN_CEILING answered requests.
     """
+    if not 1 <= llm.budget.per_run <= LAB_PER_RUN_CEILING:
+        msg = f"lab per-run limit must be 1..{LAB_PER_RUN_CEILING}, got {llm.budget.per_run}"
+        raise ValueError(msg)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out = LAB_ROOT / f"{stamp}-{llm.model.replace('/', '_')}{('-' + label) if label else ''}"
     out.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -175,7 +180,7 @@ def render_summary(model: str, results: list[LabResult]) -> str:
         lines.append(
             f"| {r.article_id} | {'✓' if r.ok else '✗ ' + (r.error or '')[:40]} "
             f"| {r.duration_s:.0f} | {r.tokens_out or '-'} "
-            f"| {f'{ev.verified_rate:.0%}' if ev else '-'} "
+            f"| {f'{ev.verified_rate:.0%}' if ev and ev.verified_rate is not None else '-'} "
             f"| {ev.count(EvidenceStatus.FABRICATED) if ev else '-'} | {r.issues} "
             f"| {'/'.join(str(r.counts.get(k, '-')) for k in ('who', 'where', 'claims'))} "
             f"| {r.title[:60]} |"

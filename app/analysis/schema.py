@@ -1,7 +1,9 @@
 """Analysis schema v1: the contract between the prompt, the model and the database.
 
-Pydantic is the source of truth. Its JSON Schema is sent to the model in the prompt,
-decoding, and the same model validates the response. Design rules (docs/analysis.md):
+Pydantic is the source of truth. Its JSON Schema is sent to the model inside the user
+message (Gemma on the Gemini API rejects `response_format` schemas, so there is no
+constrained decoding), and the same model validates the response: invalid output is
+rejected, never repaired. Design rules (docs/analysis.md):
 - Every important statement carries `evidence` (paragraph number plus a verbatim quote),
   which code verifies later. The model's own confidence is not trusted.
 - Facts, attributed statements, allegations, opinions, predictions and inferences stay

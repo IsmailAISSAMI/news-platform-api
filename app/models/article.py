@@ -35,6 +35,7 @@ class Article(Base):
         CheckConstraint(check_in("first_seen_via", DiscoveryChannel), name="first_seen_via"),
         Index("ix_articles_published_at_id", text("published_at DESC"), text("id DESC")),
         Index("ix_articles_search_tsv", "search_tsv", postgresql_using="gin"),
+        Index("ix_articles_categories", "categories", postgresql_using="gin"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)

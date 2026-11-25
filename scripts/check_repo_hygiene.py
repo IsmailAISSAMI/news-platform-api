@@ -4,7 +4,12 @@ Standard library only, no network. It lists tracked files with `git ls-files` an
 
 (a) secret patterns (API keys, a real password in a database URL, private key blocks);
 (b) forbidden file names (`.env`, dumps, JSONL exports, news-eval or review outputs);
-(c) article-quote markers (`[P12] "...`) in Markdown, JSON and text files.
+(c) article-quote markers (`[P12] "...`) in Markdown, JSON and text files;
+(d) article-text JSON keys (`"quote"`, `"body_text"`, `"raw_output"`) in non-test JSON files;
+(e) deny-listed geography words, matched by SHA-256 of the lowercased word. The list holds
+    hashes only: the words themselves must never appear in this repo (owner rule).
+
+With `--staged` (the pre-commit hook) it scans the staged content of staged files instead.
 
 Run with `uv run python scripts/check_repo_hygiene.py`. Exit 0 when clean, 1 with one line
 per finding otherwise.
@@ -13,6 +18,7 @@ per finding otherwise.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import re
 import subprocess
 import sys
@@ -44,6 +50,27 @@ ARTICLE_QUOTE_PATTERN = re.compile(r'\[P\d+\]\s*"')
 ARTICLE_QUOTE_SUFFIXES: tuple[str, ...] = (".md", ".json", ".txt")
 # Files where a synthetic article-quote rendering is tested on purpose. Keep this list tiny.
 ARTICLE_QUOTE_ALLOWLIST: frozenset[str] = frozenset({"tests/analysis/test_llm.py"})
+
+
+ARTICLE_TEXT_KEY_PATTERN = re.compile(r'"(quote|body_text|raw_output)"\s*:')
+ARTICLE_TEXT_KEY_SUFFIXES: tuple[str, ...] = (".json", ".jsonl", ".ndjson", ".geojson")
+TEST_PREFIX = "tests/"
+
+# SHA-256 of lowercased words. Never add plaintext here, in comments, or in tests.
+GEO_DENY_HASHES: frozenset[str] = frozenset(
+    {
+        "3b96c2072e1d9bc4819b34fe96a64166c24ee1999465abaeaa05c3e8d5a516ad",
+        "0ffbc80bdfb96784f363ebf4b21df83b5eabe0d33b9d09063964fdb2dba00e05",
+        "931c094cdfcc9be4a37075cbc41ed0c149f4f796089ad242e91409f2e975990b",
+        "8eecc5eb8b58dbdaec6f02bbf7eb8cefed0b584db779e5667d131fb7ca53c0e4",
+        "5d5926835b5c8a0ed836b4291ca6b73ecd621290c501de0ab797a7dd3b09e05d",
+        "c855bc6ba3124c285ee9c7cd1ecb382af9d9ec7181a009a7db9e3bad8aa3f191",
+        "aaff66247abbbfddee6101e7e27ddda8d163431310f529be10bbe7197f762c47",
+        "cc52c1a9e5a3c1edc9d6d84f2d018bd7fc418d5e4528b1a34594b1b547c160ac",
+        "35c1651ce551a282e0b39321e0ef13fb439f01ee283e616ad46c3a8c32124583",
+    }
+)
+WORD_PATTERN = re.compile(r"[^\W\d_]+")
 
 
 @dataclass(frozen=True)
@@ -92,12 +119,43 @@ def find_article_quotes(path: str, text: str) -> list[Finding]:
     return findings
 
 
+def find_article_text_keys(path: str, text: str) -> list[Finding]:
+    if path.startswith(TEST_PREFIX) or not path.endswith(ARTICLE_TEXT_KEY_SUFFIXES):
+        return []
+    findings: list[Finding] = []
+    for match in ARTICLE_TEXT_KEY_PATTERN.finditer(text):
+        line = text.count("\n", 0, match.start()) + 1
+        findings.append(Finding(path, "article text key", f"'{match.group(1)}' at line {line}"))
+    return findings
+
+
+def word_hash(word: str) -> str:
+    return hashlib.sha256(word.lower().encode()).hexdigest()
+
+
+def find_denied_geography(path: str, text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    seen: dict[str, str] = {}
+    for match in WORD_PATTERN.finditer(text):
+        word = match.group(0)
+        digest = seen.get(word)
+        if digest is None:
+            digest = seen[word] = word_hash(word)
+        if digest in GEO_DENY_HASHES:
+            # Never echo the word: only where it was found.
+            line = text.count("\n", 0, match.start()) + 1
+            findings.append(Finding(path, "denied geography", f"deny-listed word at line {line}"))
+    return findings
+
+
 def check_file(path: str, text: str) -> list[Finding]:
     """All checks for one tracked file. `text` is the decoded content (may be empty)."""
     return [
         *find_secrets(path, text),
         *find_forbidden_name(path),
         *find_article_quotes(path, text),
+        *find_article_text_keys(path, text),
+        *find_denied_geography(path, text),
     ]
 
 
@@ -122,8 +180,40 @@ def scan(root: Path, paths: Iterable[str]) -> list[Finding]:
     return findings
 
 
-def main() -> int:
-    findings = scan(REPO_ROOT, tracked_files(REPO_ROOT))
+def _git(root: Path, *args: str) -> bytes:
+    result = subprocess.run(  # noqa: S603  # args are fixed by this script, never user input
+        ["git", *args],  # noqa: S607  # developer's git on PATH, fixed arguments
+        cwd=root,
+        check=True,
+        capture_output=True,
+    )
+    return result.stdout
+
+
+def staged_files(root: Path) -> list[str]:
+    """Added, copied, modified or renamed paths in the index (deletions need no scan)."""
+    out = _git(root, "diff", "--cached", "--name-only", "-z", "--diff-filter=ACMR")
+    return [p for p in out.decode().split("\0") if p]
+
+
+def scan_staged(root: Path) -> list[Finding]:
+    """Scan what will be committed (the index), not the working tree."""
+    findings: list[Finding] = []
+    for rel in staged_files(root):
+        text = _git(root, "show", f":{rel}").decode("utf-8", errors="ignore")
+        findings.extend(check_file(rel, text))
+    return findings
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = argv or []
+    if args == ["--staged"]:
+        findings = scan_staged(REPO_ROOT)
+    elif not args:
+        findings = scan(REPO_ROOT, tracked_files(REPO_ROOT))
+    else:
+        sys.stderr.write("usage: check_repo_hygiene.py [--staged]\n")
+        return 2
     if not findings:
         sys.stdout.write("Repository hygiene: OK\n")
         return 0
@@ -134,4 +224,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 # Items this much older than the checkpoint end the walk even if the checkpoint article
 # itself was deleted by the publisher (so it never shows up).
 CHECKPOINT_MARGIN = timedelta(days=1)
+# The checkpoint article only ends the walk if it still carries (about) the date we stored.
+# A republished article jumps to the top of page 1 with a new date: stopping there would
+# skip the whole gap behind it, so the walk carries on to the date floor instead.
+CHECKPOINT_DATE_TOLERANCE = timedelta(hours=1)
 HTTP_NOT_FOUND = 404
 
 
@@ -49,12 +53,12 @@ class StopReason(StrEnum):
     DATE_FLOOR = "date_floor"  # passed checkpoint date minus margin (checkpoint deleted?)
     BOOTSTRAP_FLOOR = "bootstrap_floor"  # first run: reached the bootstrap window start
     REWALK_FLOOR = "rewalk_floor"  # --rewalk-days: re-read the requested window
-    FEED_END = "feed_end"  # 404 or empty page before the checkpoint: gap beyond the feed
+    FEED_END = "feed_end"  # 404 or empty last page before the checkpoint: gap beyond the feed
     PAGE_LIMIT = "page_limit"  # safety cap hit: walk incomplete
 
 
 class WalkError(Exception):
-    """Unexpected HTTP status while walking (not 200, 304 or 404)."""
+    """Unexpected HTTP status (not 200, 304 or 404), or an unexplained empty page."""
 
 
 @dataclass
@@ -109,10 +113,22 @@ class _WalkState:
     checkpoint_id: str | None
     floor: datetime
     floor_reason: StopReason
+    checkpoint_at: datetime | None = None
+    rewalk: bool = False
+    page_size: int = 0  # items on page 1: a later page with fewer is the last one
+    previous_count: int = 0
     result: WalkResult = field(default_factory=WalkResult)
     newest: FetchedItem | None = None
     oldest_seen: datetime | None = None
     validators: tuple[str | None, str | None] = (None, None)
+
+    def is_checkpoint(self, item: FetchedItem) -> bool:
+        return (
+            self.checkpoint_id is not None
+            and item.external_id == self.checkpoint_id
+            and self.checkpoint_at is not None
+            and item.published_at <= self.checkpoint_at + CHECKPOINT_DATE_TOLERANCE
+        )
 
     def saw(self, item: FetchedItem) -> None:
         if self.newest is None or item.published_at > self.newest.published_at:
@@ -133,17 +149,21 @@ async def walk_rss(
 
     A re-walk ignores the checkpoint and page-1 validators (it must read pages that have
     not changed), so already-stored articles are revisited: used to fill in article text
-    after a source's rights policy started allowing it. It never moves the checkpoint
-    backwards.
+    after a source's rights policy started allowing it. A re-walk never touches the
+    checkpoint, the page-1 validators or the uncovered gap: it may be shallower than the
+    gap since the checkpoint, and moving either past that unwalked gap would lose it.
     """
     ctx.ensure_allowed()
     checkpoint_at = feed.checkpoint_published_at
     if rewalk_since is not None:
-        state = _WalkState(None, rewalk_since, StopReason.REWALK_FLOOR)
+        state = _WalkState(None, rewalk_since, StopReason.REWALK_FLOOR, rewalk=True)
         purpose = "re-walk"
     elif checkpoint_at is not None:
         state = _WalkState(
-            feed.checkpoint_external_id, checkpoint_at - CHECKPOINT_MARGIN, StopReason.DATE_FLOOR
+            feed.checkpoint_external_id,
+            checkpoint_at - CHECKPOINT_MARGIN,
+            StopReason.DATE_FLOOR,
+            checkpoint_at=checkpoint_at,
         )
         purpose = "since the last completed run"
     else:
@@ -207,7 +227,14 @@ async def _process_page(
     entries = parse_rss(fetched.content)
     if page == 1:
         state.validators = (fetched.etag, fetched.last_modified)
+        state.page_size = len(entries)
+    previous, state.previous_count = state.previous_count, len(entries)
     if not entries:
+        if page > 1 and previous >= state.page_size:
+            # WordPress answers 404 past the last page; an empty page right after a full
+            # one is unexplained (a broken page?) and must not end the walk as complete.
+            msg = f"empty page {page} after a full page for {fetched.url}"
+            raise WalkError(msg)
         return StopReason.FEED_END
 
     stop: StopReason | None = None
@@ -216,7 +243,7 @@ async def _process_page(
         if item is None:
             state.result.skip(f"page {page}: entry without id, date or link")
             continue
-        if state.checkpoint_id is not None and item.external_id == state.checkpoint_id:
+        if state.is_checkpoint(item):
             stop = StopReason.CHECKPOINT
         if item.published_at < state.floor:
             stop = stop or state.floor_reason
@@ -228,7 +255,7 @@ async def _process_page(
 
 def _complete_walk(feed: Feed, state: _WalkState, *, now: datetime, floor_bound: datetime) -> None:
     feed.last_success_at = now
-    if state.result.stop_reason is StopReason.NOT_MODIFIED:
+    if state.rewalk or state.result.stop_reason is StopReason.NOT_MODIFIED:
         return
 
     feed.etag, feed.last_modified = state.validators

@@ -23,6 +23,7 @@ class Publisher:
     page_status: dict[int, int] = field(default_factory=dict)
     sitemap_status: int | None = None
     malformed_pages: set[int] = field(default_factory=set)
+    empty_pages: set[int] = field(default_factory=set)  # 200 with an empty channel
     sitemap: list[Post] = field(default_factory=list)
     sitemap_etag: str = 'W/"sitemap-v1"'
     requests: list[str] = field(default_factory=list)
@@ -30,7 +31,7 @@ class Publisher:
     def publish(self, *posts: Post) -> None:
         self.posts = sorted([*self.posts, *posts], key=lambda p: p.published_at, reverse=True)
 
-    def handle(self, request: httpx.Request) -> httpx.Response:  # noqa: PLR0911  # fake routes
+    def handle(self, request: httpx.Request) -> httpx.Response:  # noqa: C901, PLR0911  # fake routes
         self.requests.append(str(request.url))
         if request.url.path == "/robots.txt":
             return httpx.Response(404)
@@ -51,6 +52,8 @@ class Publisher:
             return httpx.Response(500)
         if page in self.malformed_pages:
             return httpx.Response(200, content=b"<rss><channel><item>")
+        if page in self.empty_pages:
+            return httpx.Response(200, content=rss([]))
         if self.max_pages is not None and page > self.max_pages:
             return httpx.Response(404)
         chunk = self.posts[(page - 1) * PAGE_SIZE : page * PAGE_SIZE]

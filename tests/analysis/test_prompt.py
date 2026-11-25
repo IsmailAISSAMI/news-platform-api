@@ -11,10 +11,12 @@ from app.analysis.prompt import PROMPT_VERSION, SYSTEM_PROMPT, prepare
 from app.analysis.schema import ArticleAnalysis
 
 # Fixed part of every request (system prompt + JSON schema): v8/s7 is 12,238 characters,
-# about 3,060 estimated tokens. A compact v9 (~1,830) was measured live on 2026-11-25 and
-# rejected: it made Gemma reason longer (5 of 6 answers cut off at 16,000 output tokens).
+# about 4,080 estimated tokens with the conservative UTF-8 estimate (bytes // 3, adopted
+# 2026-11-25; it was 3,060 with characters // 4). A compact v9 was measured live on
+# 2026-11-25 and rejected: it made Gemma reason longer (5 of 6 answers cut off at 16,000
+# output tokens).
 # The budget stops the fixed part from growing unnoticed.
-FIXED_TOKEN_BUDGET = 3200
+FIXED_TOKEN_BUDGET = 4200
 
 
 def _schema_text() -> str:

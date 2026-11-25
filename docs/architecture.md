@@ -1,8 +1,14 @@
 # Architecture
 
-Status: **approved direction (architecture A, local-first), 2026-11-23.** Ingestion, the
-domain schema and the article API are not built yet. Milestone 0 (docs) is the only one
-done. Every later milestone needs explicit approval before it starts.
+Status: **approved direction (architecture A, local-first), 2026-11-23. Current state as
+of 2026-11-25:**
+- **Built:** the schema and roles, the rights gate, the polite fetcher, the Hespress RSS
+  walk and news sitemap, `news ingest` (including `--rewalk-days`), the read API
+  (`/api/v1`), backups with restore tests, AI analysis on the Gemini API free tier
+  (`news analyze`, `news lab`, `news gemini-usage`, `news eval`), briefings and the `/ui`
+  briefing screen (milestones 0-5 and 7-10, section 10).
+- **Deferred:** the archive backlog (milestone 6).
+- Every new milestone still needs the owner's explicit approval before it starts.
 
 ## 1. Goal and constraints
 
@@ -37,7 +43,7 @@ The first source is Hespress English. More publishers will follow.
                                │                    │                         │
                                │        PostgreSQL 18 (Docker, :5433)          │
                                │                    │                         │
-                               │ news analyze (later, local, permitted text)  │
+                               │ news analyze (Gemini API free tier, 5.5)     │
                                │ FastAPI /api/v1 (SELECT-only role) → web app │
                                │ uv run news backup → ~/Backups (+Time Machine)│
                                └──────────────────────────────────────────────┘
@@ -88,6 +94,10 @@ Re-verify this table when the publisher's behavior looks different, and update t
    Postgres is down, exit non-zero with a clear message. Also refuse to run if the
    database is not at the Alembic head.
 2. **Lock.** Take `pg_try_advisory_lock`. If another run holds it, exit with a message.
+   The lock is session-level, so it is taken and released on a **dedicated AUTOCOMMIT
+   connection** held for the whole run (`app/ingestion/runner.py`). The ORM session
+   returns its connection to the pool on every commit, so locking through it could
+   silently unlock.
    One run at a time needs no job queue: no leases, no `SKIP LOCKED`, no Celery or Redis.
 3. **Per feed,** in order: RSS walk (4.2), news sitemap, archive backlog (4.3).
 4. **Commit after every page,** so an interruption keeps all completed work.
@@ -104,8 +114,11 @@ Re-verify this table when the publisher's behavior looks different, and update t
 - The checkpoint moves forward **only when the walk completes**. An interrupted run
   leaves it unchanged, so the next run re-walks the whole gap. Already-saved items
   upsert as no-ops, so nothing is lost.
-- **First run:** a bounded bootstrap, the last 30 days by default (`--since`), not the
+- **First run:** a bounded bootstrap, the last 30 days by default (`--since-days`), not the
   whole archive.
+- **Re-walk (`--rewalk-days N`):** re-reads the last N days to fill in bodies. It
+  ignores the checkpoint and the page-1 validators, and it **never moves the checkpoint**
+  or saves validators.
 - **Page 1 uses conditional GET.** A 304 means nothing new, and the walk ends at once.
 - **Page-1 validators (ETag, Last-Modified) are saved only when the walk completes,**
   like the checkpoint. Saved early, an interrupted run would make the next run see a 304
@@ -166,11 +179,18 @@ capped run doesn't advance the checkpoint, so the next run simply continues.
     unreachable, nothing on that host is fetched (RFC 9309 §2.3.1).
   - Requests to a host are spaced by max(`HTTP_MIN_DELAY_S`, `Crawl-delay`)
     (Hespress: 5 s).
-- **Limits:** timeouts of 5 s to connect and 20 s total; responses capped at 5 MB.
-- **Retries:** for 429, 5xx and network errors only, with exponential backoff and jitter
+- **Limits:** timeouts of 5 s to connect and 20 s total. The total timeout bounds the
+  whole attempt (connect, headers and the full body), so a slow-drip body cannot hold a
+  run forever. Responses are capped at 5 MB.
+- **Redirects** are followed by `PoliteFetcher` itself, not by httpx
+  (`follow_redirects=False`): at most 5 hops (`MAX_REDIRECTS`), and robots.txt and
+  per-host spacing are re-checked on **every hop**, so a redirect can never reach a
+  disallowed URL.
+- **Retries:** for 429, 5xx, network errors and total timeouts only, with exponential backoff and jitter
   (3 attempts). `Retry-After` is honored.
 - **XML parsing** uses `defusedxml` for RSS and sitemaps (`app/ingestion/parsers.py`). It
-  refuses entity-expansion, external-entity and DTD attacks.
+  refuses entity-expansion, external-entity and DTD attacks, and we also pass
+  `forbid_dtd=True`, so any `<!DOCTYPE>` is rejected.
   - It is strict: a malformed page raises and is recorded instead of being half-ingested.
   - `feedparser` was considered and dropped: it is lenient, untyped and redundant for
     standard WordPress RSS.
@@ -289,7 +309,13 @@ before any public or commercial use. *This document is not legal advice.*
   - 3 answered requests per `news lab` test;
   - concurrency 8 articles in flight by default (`GEMINI_CONCURRENCY`).
   The per-minute and token limits are at least one third below Google's, as the owner
-  requires. Settings can lower these limits; values above the ceilings are refused.
+  requires. Settings can lower these limits; values above the ceilings are refused. The
+  lab limit (3) and the concurrency ceiling (8) are constants in
+  `app/analysis/budget.py` (`CEILINGS`). The per-minute window is shared across
+  processes through `api_calls`: before its first request, a client seeds its window
+  from the last 60 seconds of `api_calls` rows of any process (requests and
+  `est_input_tokens`), so a new run starts where the previous one left off. Input tokens are estimated
+  before sending as UTF-8 bytes // 3 (+1).
 - **Advice given and declined:** keep analysis local, or send only synthetic text and
   metadata.
 - **Safeguards in code** (`app/analysis/budget.py`, `app/analysis/llm.py`,
@@ -375,10 +401,15 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   - the schema owner is the `POSTGRES_USER` (`news`), which runs migrations;
   - `news_ingest` reads and writes data, cannot change the schema, and has no access to
     `alembic_version`;
-  - `news_api` has SELECT only.
+  - `news_api` has SELECT only, on an explicit allowlist: `articles`, `feeds`, `sources`
+    and the `analysis_briefings` view. Nothing else, not even future tables.
 
-  Both are NOLOGIN group roles. Login users with their own passwords are added when a
-  process needs them (the API in milestone 7).
+  Both are NOLOGIN group roles. The login roles `news_api_login` and `news_ingest_login`
+  inherit them; their passwords are set by `scripts/db_login_passwords.sql` from psql
+  variables, never from a file. `API_DATABASE_URL` points the API at `news_api_login`.
+  At startup the API runs `assert_least_privilege` (`app/db/session.py`): if its login is
+  a superuser or can SELECT `article_bodies`, it refuses to start in production and logs
+  a warning elsewhere.
 - **Retention:** articles are kept indefinitely (metadata). `ingestion_runs` for 180 days.
   Resolved `discovered_urls` for 30 days. Bodies only as their license allows.
 - **Deliberately not stored:** raw feed payloads, because they contain full text.
@@ -391,11 +422,44 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   (the full briefing, article metadata and `source_url`; 404 if none). They only read
   stored data; nothing fetches publishers on a request.
 - **Briefings, not analyses:** at save time the pipeline also stores
-  `article_analyses.briefing`, built by `make_briefing(cleaned, unverified_paths)`
-  (`app/analysis/briefing.py`). It is the cleaned analysis with every `evidence` key
-  removed at any depth and every unverified item dropped (an unverified event date
-  becomes null), plus `review_required` and `removed_items`. Only model-written fields
-  remain. Only `succeeded` and `needs_review` rows are served. When an article has several
+  `article_analyses.briefing`, built by
+  `make_briefing(cleaned, unverified_paths, paragraphs=...)` (`app/analysis/briefing.py`),
+  in this order:
+  1. **Quarantine on the cleaned analysis.** The pipeline verifies the cleaned analysis,
+     the same object the briefing is made from, so indexes cannot shift between
+     verification and removal. Every unverified item is dropped (an unverified event
+     date becomes null). A path that does not resolve raises instead of being ignored.
+  2. Every `evidence` key is removed, at any depth.
+  3. **Originality filter.** Any remaining string that shares a run of **8 or more
+     consecutive tokens** (`MIN_COPIED_RUN`, after normalization) with an article
+     paragraph is removed: its enclosing list item is dropped, or a scalar field outside a
+     list is set to null. Proper-name fields (`name_as_written`, `full_name`,
+     `attributed_to`) are exempt.
+
+  Added keys: `review_required`, `removed_items` (by quarantine and originality),
+  `copied_items` (how many removals the originality filter made), `copied_paths`, and
+  `unverified_fields`: served fields that have no evidence at all (headline, main event,
+  how, context, ...), which code cannot verify and readers must treat as unverified.
+  Only model-written fields remain.
+- **Evidence rules:** a quote is `too_short` (never verified) unless it has at least 4
+  tokens or at least 20 characters, and it must match whole words. Attributions are
+  checked too: a claim from an anonymous source without attribution, or an attribution
+  naming someone the article never names, is flagged for review
+  (`app/analysis/cleanup.py`).
+- **Attempt history:** `article_analyses.attempt_history` (JSONB list) gets one entry per
+  attempt. Entries hold no raw answer and no article text.
+- **Migrations of round 3:** `de01c28240f2` (least privilege: the briefings partial
+  index, foreign-key indexes, a GIN index on `articles.categories`, non-negative CHECKs,
+  an identity column); `7c3e9a1f5b20` (`api_calls.est_input_tokens` and `error`, for
+  cross-process pacing); `aa372fadc9eb` (adds `attempt_history`, then recomputes every
+  answered analysis's evidence statuses, `unverified_paths`, `status` and `briefing` with
+  the rules above, using a frozen copy of the transform; an analysis whose article has no
+  body any more gets a NULL briefing, so it is not served).
+- **Effect on the real data (honest note):** on the stored analyses the originality
+  filter removed between 1 and 13 copied items per article: of 83 items removed in total
+  across 10 articles, 74 were copies. Briefings are now much thinner. That is a quality
+  and coverage tradeoff to watch: originality is an owner rule, but the prompt may need
+  to ask for more original wording so that less is dropped. Only `succeeded` and `needs_review` rows are served. When an article has several
   analyzer versions, the most recently updated briefing is served. Quotes, raw output,
   the raw `analysis` and body text are never served. The response schemas
   (`app/schemas/analysis.py`) list the servable fields explicitly and ignore any other key.
@@ -412,7 +476,18 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   called. Its downgrade is a deliberate no-op: reverting would break the CHECK constraint
   `ck_article_analyses_succeeded_fully_verified`.
 - **Pagination:** keyset on `(published_at DESC, id DESC)` with an opaque cursor; `limit`
-  is capped at 100. Never `OFFSET`. `/briefings` uses the same cursor as `/articles`.
+  is capped at 100. Never `OFFSET`. `/briefings` uses the same cursor as `/articles`: it
+  walks articles in keyset order and joins each one with a `LATERAL` subquery to its
+  latest briefing, so a page costs about `limit` index probes instead of sorting every
+  briefing.
+- **Error envelope:** every error (400, 404, 405, 422, 500, 503) has the shape
+  `{"error": {"code", "message", "details"?}, "request_id"}` (`app/core/errors.py`).
+  Validation details carry only the location, message and type, never the rejected
+  input. A statement timeout answers 503 `query_timeout`; a database outage, 503
+  `database_unavailable`.
+- **Input limits:** `cursor` and `q` at most 200 characters, `source` 64, `category` 100,
+  `language` 16, with NUL bytes refused; ids between 1 and the bigint maximum; `limit`
+  1 to 100. API connections set `statement_timeout` to 5 s.
 - **Briefing screen (`/ui`):** static HTML, CSS and JavaScript in `app/web/static/`,
   mounted by `app/main.py`, calling only `/api/v1`. `UICSPMiddleware` adds to every `/ui`
   response a strict Content Security Policy (`default-src 'self'`, no inline script,
@@ -432,8 +507,10 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 - **`uv run news backup`** (`app/ops/backup.py`):
   - It takes the ingest advisory lock, so a dump never captures half a run; it is refused
     while an ingest runs.
-  - It records exact per-table row counts and the Alembic revision, then streams
-    `pg_dump -Fc` **inside the db container**. The tool version always matches the server,
+  - **Snapshot-consistent:** it opens a `REPEATABLE READ, READ ONLY` transaction,
+    exports its snapshot (`pg_export_snapshot()`), records exact per-table row counts and
+    the Alembic revision inside it, then streams `pg_dump -Fc --snapshot=...` **inside
+    the db container**, so the counts and the dump describe the same data. The tool version always matches the server,
     and no password ever appears on a command line.
   - It writes `news-<UTC stamp>.dump.partial` and renames it atomically. A JSON manifest
     holds the size, sha256, revision, counts and `verified_at`.
@@ -450,13 +527,24 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
   `BACKUP_MAX_AGE_DAYS` (7).
 - **Restoring for real** (disaster recovery) is deliberately manual:
   `docker compose exec -T db pg_restore -U news -d news --clean --if-exists < <dump>`,
-  then re-run `scripts/db_roles.sql`.
+  then **re-run `scripts/db_roles.sql`** (and `scripts/db_login_passwords.sql` if the
+  login roles are new): dumps are restored without privileges.
 
 ## 9. CI and GitHub
 
 - `ci.yml` stays CI-only: ruff, mypy, `alembic upgrade head` + `alembic check`, and
   pytest against a throwaway Postgres service. There is no ingestion workflow and no
   self-hosted runner.
+  - The Postgres service image is pinned by digest (`postgres:18-alpine@sha256:...`).
+  - Coverage is measured with branch coverage and must stay at least 95%
+    (`fail_under` in `pyproject.toml`). `pytest-randomly` shuffles test order.
+  - CI runs `pre-commit run --all-files` (ruff, file checks, gitleaks, mypy), so a
+    skipped local hook is still caught.
+  - **Hygiene gate:** `scripts/check_repo_hygiene.py` (standard library, no network)
+    fails on secret patterns, forbidden file names (dumps, `.env`, JSONL exports),
+    article-quote markers, article-text JSON keys (`"quote"`, `"body_text"`,
+    `"raw_output"`) in non-test JSON files, and deny-listed geography words. That list
+    holds SHA-256 hashes only, so the words never appear in the repo.
 - Migrations are applied locally with `uv run alembic upgrade head`. `news ingest`
   refuses to run when the database is behind.
 - No GitHub secrets are needed.
@@ -480,8 +568,8 @@ before it starts.**
 | 6 ⏸ deferred | Archive backlog | `app/ingestion/backlog.py`, `page_metadata.py` | Bounded, checkpointed, idempotent recovery | Long downtime beyond RSS depth; partial recovery across runs; failed/gone rows; body never stored |
 | 7 ✅ | Read API | `app/api/v1/catalog.py`, `app/api/caching.py`, `app/schemas/catalog.py`, `app/db/session.py` | Sources, feeds, articles (keyset, filters, FTS), detail; weak ETag + 304; read-only connections (`default_transaction_read_only`), optional `API_DATABASE_URL` in `news_api` | Every article exactly once across pages; stable under inserts; filters and search; 400/422 validation; no body ever served; 304 revalidation; API engine cannot write |
 | 8 ✅ | Backups | `app/ops/backup.py`, `news backup`, `news restore-test` | Locked, atomic, checksummed dumps; retention; restore into a scratch DB; ingest reminder | Real round trip (local Docker); corrupted dump; row-count mismatch not marked verified; refused during ingest; pruning, partials, freshness, private files |
-| 9 | Analysis framework | `app/analysis/*` | Local analyzers on permitted text, versioned | Idempotent per analyzer version; policy respected |
-| 10 | Frontend | separate | Discovery UI with link-out and attribution | n/a |
+| 9 ✅ | Analysis framework | `app/analysis/*`, `news analyze`, `lab`, `gemini-usage`, `eval` | Gemma 4 31B on the Gemini API free tier (section 5.5): budgeted, resumable, evidence-checked; briefings with quarantine and the originality filter (section 7) | Budget ceilings, ledger reservation, retries, evidence and originality rules; the real API is never called from tests |
+| 10 ✅ | Frontend | `app/web/static/`, mounted at `/ui` | Read-only briefing screen, dark and light themes, link-out and attribution, strict CSP | `tests/test_ui.py` |
 
 ## 11. Risks and open questions
 

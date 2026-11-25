@@ -21,15 +21,16 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, SecretStr, ValidationError
 
 from app.analysis.budget import (
+    WINDOW_S,
     BudgetExceededError,
     Ledger,
     Outcome,
+    PaceHandle,
     RequestBudget,
     RequestTooLargeError,
     estimate_tokens,
@@ -38,6 +39,11 @@ from app.analysis.budget import (
 logger = logging.getLogger(__name__)
 
 GEMINI_HOST = "generativelanguage.googleapis.com"
+# The only endpoint allowed, exactly (no other path, port, user or query).
+GEMINI_BASE_URL = f"https://{GEMINI_HOST}/v1beta/openai"
+# Admission waits (cooldown, then per-minute) are rechecked in a loop until both are
+# clear; past this many rounds something is wrong, so the request is refused, not sent.
+MAX_ADMISSION_ROUNDS = 100
 # Google's "high demand" / temporary server errors: worth waiting for, never a bug of ours.
 TRANSIENT_STATUSES = frozenset({500, 502, 503, 504})
 # Pauses between attempts; the last one repeats until Google answers.
@@ -120,9 +126,8 @@ class GeminiClient:
         retry_pauses_s: tuple[float, ...] = RETRY_PAUSES_S,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        parts = urlsplit(base_url)
-        if parts.scheme != "https" or parts.hostname != GEMINI_HOST:
-            msg = f"refusing endpoint {base_url!r}: only https://{GEMINI_HOST} is allowed"
+        if base_url != GEMINI_BASE_URL:
+            msg = f"refusing endpoint {base_url!r}: only {GEMINI_BASE_URL} is allowed"
             raise ValueError(msg)
         if model not in FREE_MODELS:
             msg = f"refusing model {model!r}: not on the free-tier allowlist {sorted(FREE_MODELS)}"
@@ -142,6 +147,11 @@ class GeminiClient:
         self._admission = asyncio.Lock()
         self._busy_streak = 0
         self._cooldown_until = 0.0
+        # Half-open: during a busy streak only ONE request (the probe) is in flight; the
+        # others wait for its answer. Set when no probe is out.
+        self._probe_done = asyncio.Event()
+        self._probe_done.set()
+        self._seeded = False  # the per-minute window is seeded from the ledger once
 
     async def structured[T: BaseModel](
         self,
@@ -164,6 +174,7 @@ class GeminiClient:
             "temperature": 0.1,
             "max_tokens": max_tokens,
         }
+        # Google answered (HTTP 200): the per-run slot is used whatever the answer is.
         response, duration, reservation = await self._send_with_retries(payload, content)
         try:
             body = response.json()
@@ -175,7 +186,7 @@ class GeminiClient:
                 usage.get("completion_tokens"),
             )
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
-            await self._finish(reservation, "failed", None, None)
+            await self.ledger.record(reservation, "failed", None, None, "unusable answer")
             msg = f"unusable answer shape: {type(exc).__name__}"
             raise LLMOutputError(msg, response.text[:300]) from exc
         try:
@@ -184,13 +195,17 @@ class GeminiClient:
                 raise LLMOutputError(msg, raw)
             parsed = schema.model_validate(json.loads(_extract_json(raw)))
         except LLMOutputError:
-            await self._finish(reservation, "failed", prompt_tokens, completion_tokens)
+            await self.ledger.record(
+                reservation, "failed", prompt_tokens, completion_tokens, "cut off"
+            )
             raise
         except (json.JSONDecodeError, ValidationError) as exc:
-            await self._finish(reservation, "failed", prompt_tokens, completion_tokens)
+            await self.ledger.record(
+                reservation, "failed", prompt_tokens, completion_tokens, "invalid output"
+            )
             msg = f"invalid output: {type(exc).__name__}: {str(exc)[:300]}"
             raise LLMOutputError(msg, raw) from exc
-        await self._finish(reservation, "answered", prompt_tokens, completion_tokens)
+        await self.ledger.record(reservation, "answered", prompt_tokens, completion_tokens)
         return Completion(
             parsed=parsed,
             raw=raw,
@@ -210,39 +225,51 @@ class GeminiClient:
         attempt that was answered; its outcome is recorded by the caller.
         """
         attempt = 0
+        tokens = estimate_tokens(content)
         while True:
             attempt += 1
-            reservation = await self._admit(estimate_tokens(content))
+            reservation, handle, probe = await self._admit(tokens)
             started = time.monotonic()
             try:
-                response: httpx.Response | None = await self._client.post(
-                    f"{self._base}/chat/completions",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
-                    timeout=900,
+                try:
+                    response: httpx.Response | None = await self._client.post(
+                        f"{self._base}/chat/completions",
+                        json=payload,
+                        headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
+                        timeout=900,
+                    )
+                except httpx.TransportError:
+                    # Too slow, offline, or the server dropped the connection mid-answer
+                    # (RemoteProtocolError): all worth waiting for, never a crash of the run.
+                    response = None
+                except asyncio.CancelledError:
+                    # Ctrl-C or a stopped worker: the request may have reached Google.
+                    await self._finish(reservation, "failed", None, None, error="cancelled")
+                    raise
+                duration = time.monotonic() - started
+                if response is not None and response.status_code == httpx.codes.OK:
+                    self._busy_streak = 0
+                    self.budget.settle_run_slot(answered=True)  # any HTTP 200 uses the slot
+                    self.budget.correct(handle, _input_tokens(response))
+                    return response, duration, reservation
+                status = "timeout/offline" if response is None else f"HTTP {response.status_code}"
+                busy = response is None or response.status_code in TRANSIENT_STATUSES
+                await self._finish(
+                    reservation, "refused_busy" if busy else "failed", None, None, error=status
                 )
-            except httpx.TransportError:
-                # Too slow, offline, or the server dropped the connection mid-answer
-                # (RemoteProtocolError): all worth waiting for, never a crash of the run.
-                response = None
-            duration = time.monotonic() - started
-            if response is not None and response.status_code == httpx.codes.OK:
-                self._busy_streak = 0
-                self.budget.correct_last_estimate(_input_tokens(response))
-                return response, duration, reservation
-            status = "timeout/offline" if response is None else f"HTTP {response.status_code}"
-            busy = response is None or response.status_code in TRANSIENT_STATUSES
-            await self._finish(reservation, "refused_busy" if busy else "failed", None, None)
-            if not busy:
-                assert response is not None  # noqa: S101  # busy covers the None case
-                if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
-                    msg = f"{self.model}: Google's quota reached (HTTP 429); stopping"
-                else:  # Google's error text never contains the key; it is cut short anyway
-                    msg = f"{self.model} returned {status}: {response.text[:300]}"
-                raise LLMUnavailableError(msg)
-            self._busy_streak += 1
-            pause = self._retry_pauses[min(self._busy_streak, len(self._retry_pauses)) - 1]
-            self._cooldown_until = max(self._cooldown_until, self.budget.monotonic() + pause)
+                if not busy:
+                    assert response is not None  # noqa: S101  # busy covers the None case
+                    if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
+                        msg = f"{self.model}: Google's quota reached (HTTP 429); stopping"
+                    else:  # Google's error text never contains the key; it is cut short anyway
+                        msg = f"{self.model} returned {status}: {response.text[:300]}"
+                    raise LLMUnavailableError(msg)
+                self._busy_streak += 1
+                pause = self._retry_pauses[min(self._busy_streak, len(self._retry_pauses)) - 1]
+                self._cooldown_until = max(self._cooldown_until, self.budget.monotonic() + pause)
+            finally:
+                if probe:
+                    self._probe_done.set()  # the next waiting worker may probe
             logger.info(
                 "Gemini busy (%s), attempt %d; all requests pause %.0fs · %s",
                 status, attempt, pause, await self.usage_line(),
@@ -256,52 +283,70 @@ class GeminiClient:
             f"{today.pending} pending, {today.requests}/{self.budget.per_day} sent"
         )
 
-    async def _admit(self, tokens: int) -> int:
+    async def _admit(self, tokens: int) -> tuple[int, PaceHandle, bool]:
         """Wait out the cooldown and the per-minute limits, check every limit, reserve.
 
-        Returns the ledger reservation id. Under one lock: admitted one at a time, so two
-        requests can never both take the last slot of a minute, the run or the day.
+        Returns the ledger reservation id, the request's pacing handle, and whether this
+        request is the single probe of a busy streak. Under one lock: admitted one at a
+        time, so two requests can never both take the last slot of a minute, run or day.
         """
         try:
             self.budget.check_size(tokens)  # never sendable: refused before any wait
         except RequestTooLargeError as exc:
             raise LLMRequestTooLargeError(str(exc)) from exc
         async with self._admission:
-            remaining = self._cooldown_until - self.budget.monotonic()
-            if remaining > 0:
-                await self._sleep(remaining)
-            for _ in range(self.budget.per_minute + 1):  # each wait frees the oldest slot
+            if not self._seeded:  # other processes' last minute counts too
+                self.budget.seed(await self.ledger.recent(self.model, WINDOW_S))
+                self._seeded = True
+            served = 0.0  # the cooldown end already waited for (a longer one needs a wait)
+            for _ in range(MAX_ADMISSION_ROUNDS):
+                if self._busy_streak > 0 and not self._probe_done.is_set():
+                    await self._probe_done.wait()  # half-open: one probe at a time
+                    continue
+                remaining = self._cooldown_until - self.budget.monotonic()
+                if remaining > 0 and self._cooldown_until > served:
+                    served = self._cooldown_until
+                    await self._sleep(remaining)
+                    continue
                 wait = self.budget.wait_seconds(tokens)
-                if wait <= 0:
-                    break
-                await self._sleep(wait)
+                if wait > 0:
+                    await self._sleep(wait)
+                    continue  # the cooldown may have been extended meanwhile
+                break
+            else:  # fail closed: never send without both checks clear
+                msg = f"admission still blocked after {MAX_ADMISSION_ROUNDS} waits; not sent"
+                raise LLMUnavailableError(msg)
             try:
                 self.budget.open_run_slot()
             except BudgetExceededError as exc:
                 raise LLMUnavailableError(str(exc)) from exc
             try:
                 reservation = await self.ledger.reserve(
-                    self.model, self.budget.quota_day(), self.budget.per_day, self.run_id
+                    self.model, self.budget.quota_day(), self.budget.per_day, self.run_id, tokens
                 )
             except BudgetExceededError as exc:
                 self.budget.settle_run_slot(answered=False)
                 raise LLMUnavailableError(str(exc)) from exc
-            except Exception:
+            except BaseException:
                 self.budget.settle_run_slot(answered=False)  # nothing was sent
                 raise
-            self.budget.pace(tokens)
-            return reservation
+            probe = self._busy_streak > 0
+            if probe:
+                self._probe_done.clear()
+            return reservation, self.budget.pace(tokens), probe
 
-    async def _finish(
+    async def _finish(  # the outcome's fields
         self,
         reservation: int,
         outcome: Outcome,
         input_tokens: int | None,
         output_tokens: int | None,
+        *,
+        error: str | None = None,
     ) -> None:
-        """Record how a sent request ended, and release its per-run slot."""
-        self.budget.settle_run_slot(answered=outcome == "answered")
-        await self.ledger.record(reservation, outcome, input_tokens, output_tokens)
+        """Record how a request that Google did not answer ended; release its slot."""
+        self.budget.settle_run_slot(answered=False)
+        await self.ledger.record(reservation, outcome, input_tokens, output_tokens, error)
 
 
 def _input_tokens(response: httpx.Response) -> int | None:

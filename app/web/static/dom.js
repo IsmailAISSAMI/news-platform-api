@@ -1,11 +1,35 @@
 // DOM helpers. All data goes in through textContent or attributes: never as HTML.
 
+// Only these event handlers may be attached; any other on* key is refused.
+const EVENTS = new Set(["onclick", "oninput", "onchange"]);
+
+// Only http(s) links are rendered as hrefs; anything else (javascript:, data:) is refused.
+export function safeUrl(value) {
+  try {
+    const url = new URL(String(value), location.href);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+// A link out to the original, or plain text when the URL is not http(s).
+export function outLink(href, text, cls = "") {
+  const url = safeUrl(href);
+  if (!url) return el("span", { class: cls || null }, text);
+  return el("a", { class: cls || null, href: url, target: "_blank", rel: "noopener noreferrer" },
+    text, el("span", { class: "vh" }, " (opens in a new tab)"));
+}
+
+export const hidden = (text) => el("span", { class: "vh" }, text);
+
 export function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
     if (value === null || value === undefined || value === false) continue;
     if (key === "class") node.className = value;
-    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (EVENTS.has(key)) node.addEventListener(key.slice(2), value);
+    else if (/^on/i.test(key)) throw new Error(`Event attribute not allowed: ${key}`);
     else node.setAttribute(key, value === true ? "" : String(value));
   }
   // Flatten fully: panels pass nested arrays (groups of [heading, list]).

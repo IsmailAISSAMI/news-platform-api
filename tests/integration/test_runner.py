@@ -22,7 +22,9 @@ from app.ingestion.runner import (
     INGEST_LOCK_KEY,
     AlreadyRunningError,
     IngestOptions,
+    LockLostError,
     RunReport,
+    ingest_lock,
     run_ingest,
 )
 from app.ingestion.walk import StopReason
@@ -343,4 +345,27 @@ async def test_unexpected_error_is_recorded_and_releases_the_lock(
         "RuntimeError",
         "bug",
     )
+    assert await try_lock_elsewhere(engine)
+
+
+async def test_lock_is_held_on_one_dedicated_connection_for_the_whole_block(
+    engine: AsyncEngine,
+) -> None:
+    async with ingest_lock(engine) as held:
+        pid = await held.scalar(text("SELECT pg_backend_pid()"))
+        assert not await try_lock_elsewhere(engine)
+        async with engine.connect() as other:  # pool churn must not release it
+            await other.execute(text("SELECT 1"))
+        holder = await held.scalar(
+            text("SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND objid = :k AND granted"),
+            {"k": INGEST_LOCK_KEY},
+        )
+        assert holder == pid
+    assert await try_lock_elsewhere(engine)
+
+
+async def test_an_unlock_that_returns_false_is_an_error(engine: AsyncEngine) -> None:
+    with pytest.raises(LockLostError):
+        async with ingest_lock(engine) as held:
+            await held.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": INGEST_LOCK_KEY})
     assert await try_lock_elsewhere(engine)

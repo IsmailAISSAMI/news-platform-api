@@ -11,7 +11,20 @@ class IngestionRun(Base):
     """One execution of `news ingest`: the audit trail and the source of the run report."""
 
     __tablename__ = "ingestion_runs"
-    __table_args__ = (CheckConstraint(check_in("status", RunStatus), name="status"),)
+    __table_args__ = (
+        CheckConstraint(check_in("status", RunStatus), name="status"),
+        *(
+            CheckConstraint(f"{c} >= 0", name=f"{c}_non_negative")
+            for c in (
+                "feeds_processed",
+                "pages_fetched",
+                "items_new",
+                "items_updated",
+                "backlog_resolved",
+                "backlog_remaining",
+            )
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

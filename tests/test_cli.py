@@ -279,8 +279,9 @@ def test_gemini_usage_shows_our_limits_and_googles() -> None:
     budget = RequestBudget(per_run=3, per_day=1000, per_minute=10, input_tokens_per_minute=8000)
     days = [DayUsage("2026-11-24", requests=1, passed=1, input_tokens=4300, output_tokens=2600)]
 
-    text = cli.format_usage(days, budget)
+    text = cli.format_usage(days, budget, [(30.0, 1200), (5.0, 800)])
 
+    assert "Last 60 s: 2 requests, ~2000 tokens" in text
     assert "Today: 1/1000 requests (999 left)," in text
     assert "4300" in text
     assert "Google's free tier: 14400/day, 30/min, 16000 input tokens/min." in text
@@ -307,3 +308,35 @@ def test_format_analyze_report() -> None:
     assert "still pending: 3" in text
     assert "stopped: daily limit reached" in text
     assert "today: 0 passed, 0 failed (0 busy), 0 pending, 0/1000 sent" in text
+
+
+@pytest.mark.parametrize(("value", "ok"), [("8", True), ("9", False), ("0", False)])
+def test_the_concurrency_flag_is_bounded_by_the_ceiling(value: str, *, ok: bool) -> None:
+    argv = ["analyze", "--concurrency", value]
+    if ok:
+        assert cli.build_parser().parse_args(argv).concurrency == 8
+    else:
+        with pytest.raises(SystemExit):
+            cli.build_parser().parse_args(argv)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("gemini_max_requests_per_run", 4),
+        ("gemini_max_requests_per_day", 1001),
+        ("gemini_max_requests_per_minute", 21),
+        ("gemini_max_input_tokens_per_minute", 10_001),
+        ("gemini_concurrency", 9),
+        ("gemini_concurrency", 0),
+    ],
+)
+def test_gemini_settings_above_the_ceilings_are_refused(field: str, value: int) -> None:
+    from pydantic import ValidationError  # noqa: PLC0415  # local to this test
+
+    from app.core.config import Settings  # noqa: PLC0415
+
+    with pytest.raises(ValidationError):
+        Settings.model_validate(
+            {"database_url": "postgresql+psycopg://u:test-only-password@h/d", field: value}
+        )

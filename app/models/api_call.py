@@ -34,7 +34,10 @@ class ApiCall(Base):
             "outcome IN ('answered', 'refused_busy', 'failed', 'no_send')",
             name="outcome_known",
         ),
+        CheckConstraint("input_tokens >= 0", name="input_tokens_non_negative"),
+        CheckConstraint("output_tokens >= 0", name="output_tokens_non_negative"),
         Index("ix_api_calls_quota_day_model", "quota_day", "model"),
+        Index("ix_api_calls_run_id", "run_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
@@ -46,6 +49,10 @@ class ApiCall(Base):
     outcome: Mapped[str] = mapped_column(Text)
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
+    # The estimate made before sending, so the per-minute window survives across processes.
+    est_input_tokens: Mapped[int | None] = mapped_column(Integer)
+    # Why a request did not end as answered (for example "cancelled", "HTTP 503").
+    error: Mapped[str | None] = mapped_column(Text)
     run_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("analysis_runs.id", ondelete="SET NULL")
     )

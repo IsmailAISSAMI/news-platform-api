@@ -116,6 +116,18 @@ uv run news ingest --rewalk-days 90 -v   # re-reads the last 90 days, about 15 m
 
 ---
 
+## Analyse articles with AI (optional)
+
+`uv run news analyze` sends article text to Google's Gemini API (free tier only; see
+[Respecting publishers](#respecting-publishers)). Setup step 2 replaced the
+`GEMINI_API_KEY=change-me` placeholder with a random value, which is **not a key**:
+before running `news analyze` (or `news lab`), put a real key from Google AI Studio in
+`.env` as `GEMINI_API_KEY=...`. Keep billing off on the Google project. The command
+stays within fixed limits (20 requests per minute, 1,000 per day) and can be stopped and
+resumed; `uv run news gemini-usage` shows what was used.
+
+---
+
 ## Browse and search articles
 
 Open **<http://localhost:8000/docs>**. It is an interactive page where you can try every
@@ -142,20 +154,28 @@ The API is **read-only**: nothing you do through it can change or delete data.
 
 ## Briefing screen
 
-A dark, read-only briefing screen ships with the API (plain HTML, CSS and JavaScript in
-`app/web/static/`; nothing is loaded from the internet). Start the API and open the page:
+A read-only briefing screen ships with the API (plain HTML, CSS and JavaScript in
+`app/web/static/`; nothing is loaded from the internet). It has a **dark theme and a
+light theme** and follows your system setting (light when your computer is set to
+light mode, dark otherwise).
+
+If the Docker API is running (setup step 4), the screen is already there: open
+<http://localhost:8000/ui/>. To run the API from your working copy instead, use another
+port so it does not collide with the Docker API on 8000:
 
 ```bash
-uv run uvicorn app.main:app
+uv run uvicorn app.main:app --port 8001
 ```
 
-Then open <http://127.0.0.1:8000/ui/>. The list shows the newest briefings; open one to
+Then open <http://127.0.0.1:8001/ui/>. The list shows the newest briefings; open one to
 see what, when, where and who, the claims, and a link to the original article.
 
 The screen reads `GET /api/v1/briefings` (newest first, paged with `next_cursor`) and
 `GET /api/v1/articles/{id}/briefing`. A briefing never contains article text: evidence
-quotes are removed and unverified items dropped (`review_required` says when that
-happened). The page is served with a strict Content Security Policy and `no-cache`, and
+quotes are removed, unverified items dropped (`review_required` says when that
+happened), and any sentence that copies 8 or more consecutive words from the article is
+removed too. Summary fields that cannot be checked against the article are listed in
+`unverified_fields`. Because of the copy filter, briefings can be short. The page is served with a strict Content Security Policy and `no-cache`, and
 it inserts data as text only, never as HTML.
 
 ## Back up your data
@@ -179,9 +199,68 @@ This **replaces** the current database contents with the backup:
 ```bash
 ls ~/Backups/news/      # pick a .dump file
 docker compose exec -T db pg_restore -U news -d news --clean --if-exists < ~/Backups/news/<file>.dump
+docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 < scripts/db_roles.sql
 ```
 
+The second command restores the database roles' privileges, which a dump does not carry.
+
 </details>
+
+---
+
+## Owner setup after round 3
+
+Round 3 added migrations and separate database logins. Run these steps once, **in this
+order**, from the project folder with the database running.
+
+**1. Bring the database to the latest migration**
+
+```bash
+uv run alembic upgrade head
+```
+
+**2. Create or update the database roles** (also creates the `news_api_login` and
+`news_ingest_login` users, without passwords)
+
+```bash
+docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 < scripts/db_roles.sql
+```
+
+**3. Set the two login passwords.** `read -rs` reads each password without showing it
+or saving it in your shell history (type one, press Enter, type the other, press Enter):
+
+```bash
+read -rs API_PW && read -rs INGEST_PW
+docker compose exec -T db psql -U news -d news -v ON_ERROR_STOP=1 \
+  -v api_password="$API_PW" -v ingest_password="$INGEST_PW" \
+  < scripts/db_login_passwords.sql
+```
+
+Then add this line to `.env`, replacing `change-me` with the `API_PW` password you typed
+(hex passwords from `openssl rand -hex 24` are safe in a URL):
+
+```bash
+API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@localhost:5433/news
+```
+
+and clear the variables: `unset API_PW INGEST_PW`.
+
+**4. Restart the API** so it connects as `news_api_login`:
+
+```bash
+uv run uvicorn app.main:app --port 8001   # stop the old one first (Ctrl-C)
+```
+
+At startup the API checks its own login: if it could read article text (a superuser, or
+any role allowed to read `article_bodies`), it logs a warning, and in production
+(`ENVIRONMENT=production`) it refuses to start.
+
+For the Docker `api` service, the database host is `db` on port 5432, so it reads a
+separate variable. Add it to `.env` too, then run `docker compose up -d api`:
+
+```bash
+DOCKER_API_DATABASE_URL=postgresql+psycopg://news_api_login:change-me@db:5432/news
+```
 
 ---
 
@@ -194,6 +273,9 @@ docker compose exec -T db pg_restore -U news -d news --clean --if-exists < ~/Bac
 | Collect new articles | `uv run news ingest` |
 | Collect with progress details | `uv run news ingest -v` |
 | Back up and verify | `uv run news backup && uv run news restore-test` |
+| Analyse articles with AI (needs a real `GEMINI_API_KEY`) | `uv run news analyze` |
+| Try the analysis on a few articles (max 3 answered requests) | `uv run news lab <ids...>` |
+| See AI API use against the limits | `uv run news gemini-usage` |
 | Export a sample to label (to `~/news-eval/gold`) | `uv run news eval export` |
 | Score the labelled sample | `uv run news eval score ~/news-eval/gold/<dir>/labels.csv` |
 | See all options | `uv run news --help` |

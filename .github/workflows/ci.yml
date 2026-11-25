@@ -21,7 +21,7 @@ jobs:
     # database on the runner, it holds no data and is never exposed. Not a secret.
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres:18-alpine@sha256:1018733457011bf88d81db98cf43aac6d5150afc18787dbe204771fedf80ff95
         env:
           POSTGRES_USER: news
           POSTGRES_PASSWORD: ci-password
@@ -36,6 +36,10 @@ jobs:
 
     env:
       DATABASE_URL: postgresql+psycopg://news:ci-password@localhost:5432/news
+      # Backup/restore tests must run (not skip) in CI: they need pg_dump 18, installed below.
+      REQUIRE_BACKUP_TESTS: "1"
+      # Use the host pg tools (installed below), not `docker compose exec`.
+      PG_TOOLS_COMMAND: ""
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -43,12 +47,22 @@ jobs:
       - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install PostgreSQL 18 client (pg_dump/pg_restore for the backup tests)
+        run: |
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-client-18
+          pg_dump --version
 
       - name: Install dependencies
         run: uv sync --locked
 
       - name: Repository hygiene
         run: uv run python scripts/check_repo_hygiene.py
+
+      - name: pre-commit hooks (ruff, file checks, gitleaks, mypy)
+        run: uvx pre-commit run --all-files --show-diff-on-failure
 
       - name: Lint
         run: |

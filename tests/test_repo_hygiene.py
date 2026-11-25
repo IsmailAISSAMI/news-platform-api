@@ -126,3 +126,70 @@ def test_check_file_combines_all_checks() -> None:
 def test_repository_is_clean() -> None:
     """The real tracked files must pass the gate (exit 0)."""
     assert hygiene.main() == 0
+
+
+TEXT_KEY = '"' + "body_text" + '"'
+
+
+@pytest.mark.parametrize("key", ["quote", "body_text", "raw_output"])
+def test_article_text_keys_are_detected_in_json(key: str) -> None:
+    text = "{\n  " + '"' + key + '"' + ': "synthetic"\n}'
+
+    (finding,) = hygiene.find_article_text_keys("data/export.json", text)
+
+    assert finding.check == "article text key"
+    assert "line 2" in finding.detail
+
+
+@pytest.mark.parametrize("path", ["tests/fixtures/x.json", "app/x.py", "docs/a.md"])
+def test_article_text_keys_ignore_tests_and_non_json(path: str) -> None:
+    assert hygiene.find_article_text_keys(path, "{" + TEXT_KEY + ": 1}") == []
+
+
+def test_geography_deny_list_holds_only_hashes() -> None:
+    assert hygiene.GEO_DENY_HASHES
+    for digest in hygiene.GEO_DENY_HASHES:
+        assert len(digest) == 64
+        assert set(digest) <= set("0123456789abcdef")
+
+
+def test_denied_geography_matches_by_hash_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hygiene, "GEO_DENY_HASHES", frozenset({hygiene.word_hash("zorblax")}))
+
+    findings = hygiene.find_denied_geography("docs/a.md", "Rabat\nnear ZORBLAX and zorblax.")
+
+    assert [f.detail for f in findings] == ["deny-listed word at line 2"] * 2
+    assert all("zorblax" not in str(f).lower() for f in findings)
+
+
+def test_denied_geography_ignores_ordinary_words() -> None:
+    text = "Rabat Casablanca Fes Marrakesh Tangier Agadir Oujda western southern desert"
+    assert hygiene.find_denied_geography("docs/a.md", text) == []
+
+
+def _git(repo: Path, *args: str) -> None:
+    hygiene.subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+
+def test_staged_scan_reads_the_index_not_the_working_tree(tmp_path: Path) -> None:
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "notes.txt").write_text(f"key={GOOGLE_KEY}\n")
+    (tmp_path / "clean.txt").write_text("nothing here\n")
+    _git(tmp_path, "add", "notes.txt", "clean.txt")
+    (tmp_path / "notes.txt").write_text("fixed in the working tree only\n")
+
+    findings = hygiene.scan_staged(tmp_path)
+
+    assert [(f.path, f.check) for f in findings] == [("notes.txt", "secret")]
+
+
+def test_main_rejects_unknown_arguments() -> None:
+    assert hygiene.main(["--bogus"]) == 2
+
+
+def test_main_staged_mode_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(hygiene, "scan_staged", lambda root: [])
+
+    assert hygiene.main(["--staged"]) == 0

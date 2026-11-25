@@ -1,5 +1,7 @@
 """Read-only catalog API against the real database (synthetic data, rolled back per test)."""
 
+import base64
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
@@ -19,6 +21,10 @@ from app.models import Article, ArticleBody, Source
 pytestmark = pytest.mark.integration
 
 NOW = datetime(2026, 11, 23, 12, 0, tzinfo=UTC)
+
+
+def _raw_cursor(data: object) -> str:
+    return base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
 
 
 def article(source: Source, n: int, published_at: datetime, **overrides: object) -> Article:
@@ -153,12 +159,18 @@ async def test_filters(client: httpx.AsyncClient, db_session: AsyncSession, sour
         ({"cursor": "not-a-cursor"}, 400),
         ({"cursor": _encode_cursor(NOW, 1)[:-3] + "!!!"}, 400),
         ({"published_after": "yesterday"}, 422),
+        ({"cursor": _raw_cursor({"p": NOW.isoformat(), "i": True})}, 400),
+        ({"cursor": _raw_cursor({"p": NOW.isoformat(), "i": 1.5})}, 400),
+        ({"cursor": _raw_cursor({"p": NOW.isoformat(), "i": 2**63})}, 400),
+        ({"cursor": _raw_cursor({"p": NOW.isoformat(), "i": 0})}, 400),
+        ({"cursor": _raw_cursor({"p": 5, "i": 1})}, 400),
+        ({"cursor": _raw_cursor([1, 2])}, 400),
     ],
 )
 async def test_invalid_parameters_are_rejected(
     client: httpx.AsyncClient, params: dict[str, object], status: int
 ) -> None:
-    response = await client.get("/api/v1/articles", params=params)  # type: ignore[arg-type]
+    response = await client.get("/api/v1/articles", params=params)  # type: ignore[arg-type]  # params mix int/str
 
     assert response.status_code == status
 

@@ -3,7 +3,18 @@
   --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3;
   --muted: #9da7b3; --accent: #58a6ff; --warn: #f0b72f; --bad: #ff7b72;
   --ok: #56d364; --pred: #d2a8ff; --focus: #ffd33d;
+  --control: #8b949e; --warn-bg: #2a2110; --bad-bg: #2a1414;
   color-scheme: dark;
+}
+/* Light theme: every text colour is at least 4.5:1 on --bg and --panel; borders 3:1. */
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff; --panel: #f6f8fa; --line: #d0d7de; --text: #1f2328;
+    --muted: #57606a; --accent: #0550ae; --warn: #7d4e00; --bad: #a40e26;
+    --ok: #116329; --pred: #6639ba; --focus: #0550ae;
+    --control: #6e7781; --warn-bg: #fff8c5; --bad-bg: #ffebe9;
+    color-scheme: light;
+  }
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--text); }
@@ -24,7 +35,7 @@ h3 { font-size: 14px; margin: 10px 0 4px; }
 ul { margin: 0; padding-left: 20px; }
 .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
 .toolbar input, .toolbar select, button {
-  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  background: var(--panel); color: var(--text); border: 1px solid var(--control);
   border-radius: 6px; padding: 8px 10px; font: inherit; min-height: 40px;
 }
 .toolbar input { flex: 1 1 200px; }
@@ -43,8 +54,8 @@ button:hover { border-color: var(--accent); }
 .chip.opinion { border-color: var(--accent); color: var(--accent); }
 .facts { font-size: 13px; margin-top: 6px; }
 .facts span + span::before { content: " · "; color: var(--muted); }
-.banner { border: 1px solid var(--warn); color: var(--warn); background: #2a2110; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
-.error { border-color: var(--bad); color: var(--bad); background: #2a1414; }
+.banner { border: 1px solid var(--warn); color: var(--warn); background: var(--warn-bg); border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.error { border-color: var(--bad); color: var(--bad); background: var(--bad-bg); }
 .origin { display: inline-block; margin: 8px 0; padding: 8px 12px; border: 1px solid var(--accent); border-radius: 6px; font-weight: 600; }
 .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
@@ -54,13 +65,10 @@ button:hover { border-color: var(--accent); }
 .timeline li::before { content: ""; position: absolute; left: -6px; top: 7px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
 .timeline.expected li::before { background: var(--pred); }
 .when { font-weight: 600; margin-right: 6px; }
-.actor::before { display: inline-block; width: 1.6em; text-align: center; color: var(--muted); margin-right: 4px; font-size: 12px; }
-.actor.t-person::before { content: "[P]"; }
-.actor.t-organization::before, .actor.t-organisation::before { content: "[O]"; }
-.actor.t-government::before, .actor.t-institution::before { content: "[G]"; }
-.actor.t-group::before { content: "[Gr]"; }
-.actor.t-country::before { content: "[C]"; }
-.actor.t-other::before { content: "[?]"; }
+.actor .tag { display: inline-block; min-width: 2em; color: var(--muted); margin-right: 4px; font-size: 12px; }
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.source { margin: 6px 0 0; font-size: 13px; }
+.unverified { color: var(--warn); font-size: 13px; margin: 0 0 6px; }
 .claim { margin-bottom: 8px; padding-left: 8px; border-left: 3px solid transparent; }
 .claim.k-allegation { border-left-color: var(--warn); }
 .attr { color: var(--muted); font-size: 13px; }

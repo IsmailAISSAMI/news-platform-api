@@ -121,11 +121,16 @@ async def test_a_refused_busy_request_does_not_use_the_per_run_limit(
             },
         )
 
-    async def no_sleep(_: float) -> None:
-        return None
+    clock = {"t": 0.0}
+
+    async def no_sleep(seconds: float) -> None:  # time moves on, instantly
+        clock["t"] += seconds
 
     db = DatabaseLedger(create_session_factory(ledger_engine))
-    budget = RequestBudget(per_run=1, per_day=1000, per_minute=10, input_tokens_per_minute=8000)
+    budget = RequestBudget(
+        per_run=1, per_day=1000, per_minute=10, input_tokens_per_minute=8000,
+        monotonic=lambda: clock["t"],
+    )  # fmt: skip
     async with httpx.AsyncClient(transport=httpx.MockTransport(chat)) as http:
         llm = GeminiClient(
             http,
@@ -174,3 +179,31 @@ async def test_the_daily_limit_refuses_before_anything_is_sent(
 
     assert sent == []  # zero calls reached the transport
     assert await db.count_today(MODEL, today) == 2
+
+
+async def test_a_second_process_is_paced_by_the_first_ones_last_minute(
+    ledger_engine: AsyncEngine,
+) -> None:
+    """Two budgets back to back on one database: the window survives the process."""
+    first = ledger(ledger_engine)
+    for _ in range(2):
+        await first.reserve(MODEL, OLD_DAY, per_day=1000, run_id=None, est_input_tokens=400)
+    second = ledger(ledger_engine)  # a new process: nothing in memory
+    recent = await second.recent(MODEL, 60.0)
+    assert [tokens for _, tokens in recent] == [400, 400]
+    assert all(0 <= age < 60 for age, _ in recent)
+
+    budget = RequestBudget(per_run=3, per_day=1000, per_minute=2, input_tokens_per_minute=8000)
+    budget.seed(recent)
+    assert budget.wait_seconds(10) > 50  # both slots of the minute are taken
+
+
+async def test_recent_uses_googles_count_when_it_is_higher(ledger_engine: AsyncEngine) -> None:
+    book = ledger(ledger_engine)
+    rid = await book.reserve(MODEL, OLD_DAY, per_day=1000, run_id=None, est_input_tokens=100)
+    await book.record(rid, "failed", 900, None, "cancelled")
+    assert [t for _, t in await book.recent(MODEL, 60.0)] == [900]
+    async with create_session_factory(ledger_engine)() as session:
+        row = await session.get(ApiCall, rid)
+        assert row is not None
+        assert (row.error, row.est_input_tokens) == ("cancelled", 100)

@@ -104,7 +104,6 @@ class BriefingDetail(_Out):
 
     article_id: int
     title: str
-    url: str = Field(description="Canonical link to the original article.")
     source_url: str = Field(description="Link to the original article (always link out).")
     published_at: datetime
     source: BriefingSource
@@ -113,7 +112,17 @@ class BriefingDetail(_Out):
     review_required: bool = Field(
         description="True when some items could not be verified and were removed."
     )
-    removed_items: int = Field(description="How many unverified items were removed.")
+    removed_items: int = Field(default=0, description="How many unverified items were removed.")
+    copied_items: int = Field(
+        default=0,
+        description="How many items were removed for copying article wording (0 on older "
+        "briefings).",
+    )
+    unverified_fields: list[str] = Field(
+        default=[],
+        description="Paths of fields whose support could not be verified (empty on older "
+        "briefings).",
+    )
     updated_at: datetime
     briefing: BriefingOut
 

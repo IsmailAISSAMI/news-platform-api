@@ -32,6 +32,7 @@ class DiscoveredUrl(Base):
             "source_id",
             postgresql_where=text("status = 'pending'"),
         ),
+        Index("ix_discovered_urls_article_id", "article_id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
