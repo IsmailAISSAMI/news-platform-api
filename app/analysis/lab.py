@@ -1,6 +1,8 @@
 """Prompt/model lab: run the analysis on a few articles and measure it. Not production.
 
-Outputs contain article quotes (private text), so they go OUTSIDE the repository, to
+Uses the same `analyse_article` flow as `news analyze`, so the lab measures what gets
+stored, but it writes NO rows: outputs are files only. Outputs contain article quotes
+(private text), so they go OUTSIDE the repository, to
 `~/news-eval/lab/<UTC stamp>-<model>/`: one JSON per article plus `summary.md`.
 """
 
@@ -11,20 +13,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import Row, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.analysis.cleanup import clean, upcoming
-from app.analysis.evidence import EvidenceReport, EvidenceStatus, semantic_issues, verify
-from app.analysis.llm import (
-    GeminiClient,
-    LLMOutputError,
-    LLMRequestTooLargeError,
-    LLMUnavailableError,
-)
-from app.analysis.prompt import PROMPT_VERSION, SYSTEM_PROMPT, prepare
-from app.analysis.schema import SCHEMA_VERSION, ArticleAnalysis
-from app.models import Article, ArticleBody, Source
+from app.analysis import pipeline
+from app.analysis.cleanup import upcoming
+from app.analysis.evidence import EvidenceReport, EvidenceStatus
+from app.analysis.llm import GeminiClient
+from app.analysis.pipeline import AnalysisOutcome, analyzer_version
+from app.analysis.prompt import PROMPT_VERSION
+from app.analysis.schema import SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +49,14 @@ async def run_lab(
     *,
     label: str = "",
 ) -> tuple[Path, list[LabResult]]:
+    """Analyse each article with the same flow as `news analyze`, storing no rows.
+
+    Writes only files under LAB_ROOT. Each article is sent once (no compact retry).
+    """
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out = LAB_ROOT / f"{stamp}-{llm.model.replace('/', '_')}{('-' + label) if label else ''}"
     out.mkdir(parents=True, exist_ok=True, mode=0o700)
+    version = analyzer_version(llm.model)
     results: list[LabResult] = []
     stopped: str | None = None  # set when a limit or a hard error ends the run
 
@@ -62,84 +64,16 @@ async def run_lab(
         if stopped is not None:
             results.append(LabResult(article_id, "?", ok=False, error=f"not sent: {stopped}"))
             continue
-        row = await _load(session, article_id)
-        if row is None:
-            results.append(LabResult(article_id, "?", ok=False, error="no article with a body"))
-            continue
-        article, body, source = row
-        prepared = prepare(article.title, article.published_at.date(), source.name, body.body_text)
         logger.info(
-            "[%d/%d] Sending #%d (%d paragraphs) to %s",
-            len(results) + 1, len(article_ids), article_id, len(prepared.paragraphs), llm.model,
+            "[%d/%d] Sending #%d to %s",
+            len(results) + 1, len(article_ids), article_id, llm.model,
         )  # fmt: skip
-
-        result = LabResult(article_id, article.title, ok=False)
-        record: dict[str, Any] = {
-            "article_id": article_id,
-            "title": article.title,
-            "url": article.canonical_url,
-            "model": llm.model,
-            "prompt_version": PROMPT_VERSION,
-            "schema_version": SCHEMA_VERSION,
-        }
-        try:
-            completion = await llm.structured(
-                ArticleAnalysis, system=SYSTEM_PROMPT, user=prepared.render()
-            )
-        except LLMRequestTooLargeError as exc:
-            # This article is skipped (too long for the free tier); the run goes on.
-            result.error = str(exc)
-            record["error"] = str(exc)
-        except LLMUnavailableError as exc:
-            # A limit, Google's quota or a hard error: stop sending, but finish the report.
-            stopped = str(exc)
-            result.error = stopped
-            record["error"] = stopped
-        except LLMOutputError as exc:
-            result.error = str(exc)
-            record["error"] = str(exc)
-            record["raw"] = exc.raw  # whole answer: it can be re-parsed offline
-        else:
-            analysis = completion.parsed
-            report = verify(analysis, prepared.paragraphs)
-            issues = semantic_issues(analysis, prepared.paragraphs)
-            cleaned, cleanup = clean(
-                analysis,
-                prepared.paragraphs,
-                publisher_names=(source.name, source.name.split()[0]),
-            )
-            result.issues = len(issues)
-            result.ok = True
-            result.duration_s = completion.duration_s
-            result.tokens_out = completion.completion_tokens
-            result.tokens_per_s = completion.tokens_per_second
-            result.evidence = report
-            result.counts = {
-                "who": len(analysis.who),
-                "where": len(analysis.where),
-                "claims": len(analysis.claims),
-                "timeline": len(analysis.when.timeline),
-                "open_questions": len(analysis.open_questions),
-            }
-            record |= {
-                "duration_s": round(completion.duration_s, 1),
-                "tokens": {"in": completion.prompt_tokens, "out": completion.completion_tokens},
-                "evidence": {k: v.value for k, v in report.statuses.items()},
-                "issues": {k: v.value for k, v in issues.items()},
-                # The model's raw answer is kept unchanged; the cleaned version and every
-                # correction (original, corrected, reason, method) sit beside it.
-                "analysis": analysis.model_dump(),
-                "cleaned_analysis": cleaned.model_dump(),
-                "corrections": [asdict(c) for c in cleanup.items],
-                "review_flags": [asdict(f) for f in cleanup.flags],
-                "upcoming": upcoming(cleaned, article.published_at.date()),
-            }
-        outcome = (
-            f"✓ #{article_id} analysed in {result.duration_s:.0f}s"
-            if result.ok
-            else f"✗ #{article_id}: {result.error}"
-        )
-        logger.info("%s · %s", outcome, await llm.usage_line())
+        outcome = await pipeline.analyse_article(session, llm, article_id, version)
+        if outcome.status == "stopped":
+            stopped = outcome.error
+        result = _result(article_id, outcome)
+        record = _record(article_id, llm.model, outcome)
+        logger.info("%s · %s", outcome.outcome, await llm.usage_line())
         _write_private(
             out / f"article-{article_id}.json",
             json.dumps(record, indent=2, ensure_ascii=False, default=str),
@@ -150,21 +84,65 @@ async def run_lab(
     return out, results
 
 
+def _result(article_id: int, outcome: AnalysisOutcome) -> LabResult:
+    ok = outcome.status in ("succeeded", "needs_review")
+    result = LabResult(article_id, outcome.title, ok=ok, error=None if ok else outcome.error)
+    if ok:
+        analysis = outcome.analysis
+        assert analysis is not None  # noqa: S101  # an answered article always has one
+        result.duration_s = outcome.duration_s
+        result.tokens_out = outcome.output_tokens
+        result.tokens_per_s = outcome.tokens_per_s
+        result.evidence = outcome.evidence
+        result.issues = len(outcome.issues)
+        result.counts = {
+            "who": len(analysis.who),
+            "where": len(analysis.where),
+            "claims": len(analysis.claims),
+            "timeline": len(analysis.when.timeline),
+            "open_questions": len(analysis.open_questions),
+        }
+    return result
+
+
+def _record(article_id: int, model: str, outcome: AnalysisOutcome) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "article_id": article_id,
+        "title": outcome.title,
+        "url": outcome.url,
+        "model": model,
+        "status": outcome.status,
+        "prompt_version": PROMPT_VERSION,
+        "schema_version": SCHEMA_VERSION,
+    }
+    if outcome.error is not None:
+        record["error"] = outcome.error
+    if outcome.raw_output is not None and outcome.analysis is None:
+        record["raw"] = outcome.raw_output  # whole answer: it can be re-parsed offline
+    if outcome.analysis is not None and outcome.cleaned is not None and outcome.cleanup:
+        record |= {
+            "duration_s": round(outcome.duration_s, 1),
+            "tokens": {"in": outcome.input_tokens, "out": outcome.output_tokens},
+            "evidence": {k: v.value for k, v in outcome.evidence.statuses.items()}
+            if outcome.evidence
+            else {},
+            "unverified_paths": outcome.unverified_paths,
+            "issues": {k: v.value for k, v in outcome.issues.items()},
+            # The model's raw answer is kept unchanged; the cleaned version and every
+            # correction (original, corrected, reason, method) sit beside it.
+            "analysis": outcome.analysis.model_dump(),
+            "cleaned_analysis": outcome.cleaned.model_dump(),
+            "corrections": [asdict(c) for c in outcome.cleanup.items],
+            "review_flags": [asdict(f) for f in outcome.cleanup.flags],
+            "upcoming": upcoming(outcome.cleaned, outcome.published) if outcome.published else [],
+        }
+    return record
+
+
 def _write_private(path: Path, text: str) -> None:
     """Lab files contain article quotes: readable by the owner only."""
     path.write_text(text)
     path.chmod(0o600)
-
-
-async def _load(session: AsyncSession, article_id: int) -> Row[Article, ArticleBody, Source] | None:
-    return (
-        await session.execute(
-            select(Article, ArticleBody, Source)
-            .join(ArticleBody, ArticleBody.article_id == Article.id)
-            .join(Source, Source.id == Article.source_id)
-            .where(Article.id == article_id)
-        )
-    ).first()
 
 
 def render_summary(model: str, results: list[LabResult]) -> str:

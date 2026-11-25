@@ -24,7 +24,10 @@ class ArticleAnalysis(Base):
     cannot read this table (scripts/db_roles.sql), exactly like `article_bodies`.
 
     Status:
-    - `succeeded`: `analysis` (the model's answer, unchanged) and `cleaned` are set;
+    - `succeeded`: `analysis` (the model's answer, unchanged) and `cleaned` are set, and no
+      evidence path is unverified (CHECK in the migration);
+    - `needs_review`: answered, but `unverified_paths` lists the JSON paths whose evidence
+      was not found in the article: a person must look before it is trusted;
     - `failed`: the last answer was unusable (cut off, invalid); retried automatically
       until `attempts` reaches the pipeline's maximum, then left for `--retry-failed`;
     - `skipped`: never sendable (too long for the free tier's token limit).
@@ -48,6 +51,10 @@ class ArticleAnalysis(Base):
     corrections: Mapped[list[Any] | None] = mapped_column(JSONB)
     review_flags: Mapped[list[Any] | None] = mapped_column(JSONB)
     evidence: Mapped[dict[str, Any] | None] = mapped_column(JSONB)  # path -> status
+    unverified_paths: Mapped[list[Any] | None] = mapped_column(JSONB)  # JSON paths, no evidence
+    # Servable part (app/analysis/briefing.py): no evidence, no unverified item. Read by the
+    # API only through the `analysis_briefings` view.
+    briefing: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     input_tokens: Mapped[int | None] = mapped_column(Integer)
     output_tokens: Mapped[int | None] = mapped_column(Integer)
     duration_s: Mapped[float | None] = mapped_column(Float)

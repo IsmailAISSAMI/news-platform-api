@@ -140,6 +140,24 @@ The API is **read-only**: nothing you do through it can change or delete data.
 
 ---
 
+## Briefing screen
+
+A dark, read-only briefing screen ships with the API (plain HTML, CSS and JavaScript in
+`app/web/static/`; nothing is loaded from the internet). Start the API and open the page:
+
+```bash
+uv run uvicorn app.main:app
+```
+
+Then open <http://127.0.0.1:8000/ui/>. The list shows the newest briefings; open one to
+see what, when, where and who, the claims, and a link to the original article.
+
+The screen reads `GET /api/v1/briefings` (newest first, paged with `next_cursor`) and
+`GET /api/v1/articles/{id}/briefing`. A briefing never contains article text: evidence
+quotes are removed and unverified items dropped (`review_required` says when that
+happened). The page is served with a strict Content Security Policy and `no-cache`, and
+it inserts data as text only, never as HTML.
+
 ## Back up your data
 
 Do this after your first collection, then about once a week:
@@ -176,6 +194,8 @@ docker compose exec -T db pg_restore -U news -d news --clean --if-exists < ~/Bac
 | Collect new articles | `uv run news ingest` |
 | Collect with progress details | `uv run news ingest -v` |
 | Back up and verify | `uv run news backup && uv run news restore-test` |
+| Export a sample to label (to `~/news-eval/gold`) | `uv run news eval export` |
+| Score the labelled sample | `uv run news eval score ~/news-eval/gold/<dir>/labels.csv` |
 | See all options | `uv run news --help` |
 | Update to the latest version | `git pull && uv sync && docker compose up -d --build` |
 
@@ -200,9 +220,11 @@ docker compose exec -T db pg_restore -U news -d news --clean --if-exists < ~/Bac
 
 This project is designed to be a good citizen:
 
-- **Article text stays private.** For Hespress, article text is stored only on your
-  computer for non-commercial educational analysis: the owner's decision, recorded in the
-  database. It is never shown by the API, exported or published. Hespress's terms reserve
+- **Article text stays private.** For Hespress, full text is stored only on your computer,
+  for non-commercial educational analysis: the owner's decision, recorded in the database.
+  The API never shows it, and nothing is exported or published. The one exception: AI
+  analysis sends article text to Google's Gemini API (free tier); see
+  `docs/architecture.md` section 5.5. Hespress's terms reserve
   copying of its texts, and no permission was obtained, so **if you reuse this project,
   that decision is yours to make again**. To store information only, set the source's
   `rights_policy` to `metadata_only`.
@@ -230,10 +252,12 @@ catch-up and rights handling work, is in
 
 ```
 app/
-  cli.py          the `news` command (ingest, backup, restore-test)
-  main.py         FastAPI app
-  api/            HTTP endpoints (health checks, /api/v1)
+  cli.py          the `news` command (ingest, analyze, lab, eval, gemini-usage, backup, ...)
+  main.py         FastAPI app (and the /ui screen)
+  api/            HTTP endpoints (health checks, /api/v1 catalog and briefings)
+  analysis/       AI analysis: prompt, checks, cleanup, briefings, quota ledger, evaluation
   ingestion/      polite fetching, robots.txt, parsing, rights rules, catch-up walk
+  web/static/     the briefing screen (HTML, CSS, JavaScript)
   ops/            backups and restore verification
   models/         database tables
   schemas/        API response shapes

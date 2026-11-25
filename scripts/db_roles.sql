@@ -39,6 +39,10 @@ REVOKE ALL ON alembic_version FROM news_ingest, news_api;
 -- every new table, so this explicit REVOKE must stay after the grants.)
 REVOKE ALL ON article_bodies FROM news_api;
 REVOKE ALL ON article_analyses FROM news_api;  -- evidence quotes are article text
+REVOKE ALL ON api_calls, analysis_runs FROM news_api;  -- internal call and run log
+-- Briefings (no evidence, no unverified item) reach the API only through this view, which
+-- runs with its owner's privileges: news_api needs no right on article_analyses.
+GRANT SELECT ON analysis_briefings TO news_api;
 
 -- Tables created by future migrations get the same privileges automatically.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO news_api;

@@ -5,20 +5,25 @@ in `news_test` (never the real database) and delete them afterwards. Synthetic t
 """
 
 import asyncio
+import contextlib
 import json
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.analysis import lab, pipeline
 from app.analysis.budget import RequestBudget
 from app.analysis.llm import GeminiClient
 from app.analysis.pipeline import (
+    COMPACT_INSTRUCTION,
     MAX_ATTEMPTS,
     AlreadyAnalyzingError,
     AnalyzeOptions,
@@ -28,6 +33,8 @@ from app.analysis.pipeline import (
 )
 from app.db.session import create_session_factory
 from app.models import Article, ArticleAnalysis, ArticleBody, Source
+from app.models.analysis_run import AnalysisRun
+from tests.analysis.fake_ledger import FakeLedger
 
 pytestmark = pytest.mark.integration
 
@@ -47,7 +54,7 @@ VALID = json.dumps(
         "tone": {"label": "neutral", "explanation": "x"},
     }
 )
-PREFIX = "pipeline-test-"
+PREFIX = f"pipeline-test-{uuid.uuid4().hex[:8]}-"  # unique per process: no clash with other runs
 Chat = Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
 
 
@@ -64,10 +71,26 @@ def ok(content: str = VALID) -> httpx.Response:
 @pytest.fixture
 async def factory(engine: AsyncEngine) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     sessions = create_session_factory(engine)
+    started = datetime.now(UTC)
     yield sessions
     async with sessions() as session:  # remove this test's rows (analyses cascade)
         await session.execute(delete(Article).where(Article.external_id.like(f"{PREFIX}%")))
+        await session.execute(delete(AnalysisRun).where(AnalysisRun.started_at >= started))
         await session.commit()
+
+
+def answer(quote: str) -> str:
+    """The valid answer, with its one evidence quote replaced."""
+    data = json.loads(VALID)
+    data["when"]["event_date"]["evidence"] = {"paragraph": 1, "quote": quote}
+    return json.dumps(data)
+
+
+async def unverified(sessions: async_sessionmaker[AsyncSession], article_id: int) -> object:
+    async with sessions() as session:
+        return await session.scalar(
+            select(ArticleAnalysis.unverified_paths).where(ArticleAnalysis.article_id == article_id)
+        )
 
 
 async def seed(sessions: async_sessionmaker[AsyncSession], count: int) -> list[int]:
@@ -107,12 +130,12 @@ def gemini(tmp_path: Path, chat: Chat, per_day: int = 1000) -> GeminiClient:
         model=MODEL,
         api_key=SecretStr("test-key"),
         budget=RequestBudget(
-            usage_file=tmp_path / "usage.json",
             per_run=per_day,
             per_day=per_day,
             per_minute=20,
             input_tokens_per_minute=10_000,
         ),
+        ledger=FakeLedger(),
         sleep=no_sleep,
     )
 
@@ -135,10 +158,15 @@ async def test_articles_are_analysed_in_parallel_and_never_twice(
     ids = await seed(factory, 6)
     in_flight = {"now": 0, "max": 0}
 
+    three_in_flight = asyncio.Event()
+
     async def chat(_: httpx.Request) -> httpx.Response:
         in_flight["now"] += 1
         in_flight["max"] = max(in_flight["max"], in_flight["now"])
-        await asyncio.sleep(0.01)  # Google "thinking"
+        if in_flight["now"] == 3:
+            three_in_flight.set()
+        with contextlib.suppress(TimeoutError):  # "thinking" until three are in flight
+            await asyncio.wait_for(three_in_flight.wait(), timeout=2)
         in_flight["now"] -= 1
         return ok()
 
@@ -210,8 +238,9 @@ async def test_the_daily_limit_holds_with_many_workers(
     report = await run_analyze(factory, llm, AnalyzeOptions(concurrency=5, limit=5))
 
     assert report.succeeded == 2
-    assert llm.budget.used_today() == 2  # five workers, never a third request
-    assert "daily limit" in (report.stop_reason or "")
+    rows = cast(FakeLedger, llm.ledger).rows.values()
+    assert sum(1 for r in rows if r["outcome"] == "answered") == 2  # five workers, never a third
+    assert "limit" in (report.stop_reason or "")  # the per-run cap equals the day cap here
 
 
 async def test_only_one_run_at_a_time(
@@ -232,3 +261,189 @@ async def test_only_one_run_at_a_time(
         await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
     release.set()
     await first
+
+
+async def test_a_fabricated_quote_is_needs_review_never_succeeded(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    [article_id] = await seed(factory, 1)
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok(answer("a sentence the article never says"))
+
+    report = await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    assert (report.succeeded, report.needs_review) == (0, 1)
+    assert (await statuses(factory, [article_id]))[article_id] == ("needs_review", 1)
+    assert await unverified(factory, article_id) == ["$.when.event_date.evidence"]
+    async with factory() as session:  # a needs_review article is never sent again by itself
+        assert article_id not in await pending_article_ids(
+            session, analyzer_version(MODEL), limit=5
+        )
+
+
+async def test_a_clean_answer_is_succeeded_with_no_unverified_paths(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    [article_id] = await seed(factory, 1)
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok()
+
+    report = await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    assert (report.succeeded, report.needs_review) == (1, 0)
+    assert (await statuses(factory, [article_id]))[article_id] == ("succeeded", 1)
+    assert await unverified(factory, article_id) == []
+
+
+async def test_a_cut_off_answer_is_retried_with_the_compact_instruction(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    [article_id] = await seed(factory, 1)
+    bodies: list[str] = []
+    cut_off = httpx.Response(
+        200, json={"choices": [{"message": {"content": "{"}, "finish_reason": "length"}]}
+    )
+
+    async def chat(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content.decode())
+        return cut_off if len(bodies) == 1 else ok()
+
+    report = await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    assert len(bodies) == 2
+    assert COMPACT_INSTRUCTION not in bodies[0]
+    assert COMPACT_INSTRUCTION in bodies[1]
+    assert (report.retried, report.succeeded) == (1, 1)
+    assert (await statuses(factory, [article_id]))[article_id] == ("succeeded", 2)
+
+
+async def test_the_model_is_called_through_one_analysis_function(
+    factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    [article_id] = await seed(factory, 1)
+    calls: list[int] = []
+    original = pipeline.analyse_article
+
+    async def counting(*args: Any, **kwargs: Any) -> pipeline.AnalysisOutcome:
+        calls.append(args[2])
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "analyse_article", counting)
+    monkeypatch.setattr(lab, "LAB_ROOT", tmp_path / "lab")
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok()
+
+    async with factory() as session:
+        await lab.run_lab(session, gemini(tmp_path, chat), [article_id])
+    await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    assert calls == [article_id, article_id]  # lab and analyze: the same function
+
+
+async def test_lab_stores_no_analysis_rows(
+    factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ids = await seed(factory, 2)
+    monkeypatch.setattr(lab, "LAB_ROOT", tmp_path / "lab")
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok()
+
+    async with factory() as session:
+        _, results = await lab.run_lab(session, gemini(tmp_path, chat), ids)
+
+    assert all(r.ok for r in results)
+    async with factory() as session:
+        rows = await session.scalar(
+            select(func.count())
+            .select_from(ArticleAnalysis)
+            .where(ArticleAnalysis.article_id.in_(ids))
+        )
+    assert rows == 0
+
+
+async def test_a_run_row_is_created_and_finished(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    await seed(factory, 2)
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok()
+
+    report = await run_analyze(
+        factory, gemini(tmp_path, chat), AnalyzeOptions(concurrency=2, limit=2)
+    )
+
+    assert report.run_id is not None
+    async with factory() as session:
+        run = await session.get(AnalysisRun, report.run_id)
+    assert run is not None
+    assert (run.command, run.queued, run.concurrency) == ("analyze", 2, 2)
+    assert run.finished_at is not None
+    assert (run.succeeded, run.needs_review, run.failed) == (2, 0, 0)
+    assert run.stop_reason is None
+
+
+async def test_a_crash_leaves_the_run_unfinished(
+    factory: async_sessionmaker[AsyncSession],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await seed(factory, 1)
+
+    async def boom(*_: Any, **__: Any) -> pipeline.AnalysisOutcome:
+        msg = "simulated crash"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(pipeline, "analyse_article", boom)
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok()
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await run_analyze(factory, gemini(tmp_path, chat), AnalyzeOptions(limit=1))
+
+    async with factory() as session:
+        run = await session.scalar(
+            select(AnalysisRun).where(AnalysisRun.command == "analyze").order_by(
+                AnalysisRun.id.desc()
+            ).limit(1)
+        )  # fmt: skip
+    assert run is not None
+    assert run.finished_at is None
+
+
+async def test_every_api_call_of_a_run_points_to_its_run_row(
+    factory: async_sessionmaker[AsyncSession], tmp_path: Path
+) -> None:
+    """Audit trail: api_calls.run_id links each request to the analysis_runs row."""
+    from app.analysis.ledger import DatabaseLedger  # noqa: PLC0415
+    from app.models import ApiCall  # noqa: PLC0415
+
+    await seed(factory, 1)
+
+    async def chat(_: httpx.Request) -> httpx.Response:
+        return ok()
+
+    llm = gemini(tmp_path, chat)
+    llm.ledger = DatabaseLedger(factory)  # the real ledger; its rows are deleted below
+    report = await run_analyze(factory, llm, AnalyzeOptions(limit=1))
+
+    try:
+        async with factory() as session:
+            run_ids = set(
+                await session.scalars(select(ApiCall.run_id).where(ApiCall.run_id == report.run_id))
+            )
+        assert report.run_id is not None
+        assert run_ids == {report.run_id}
+    finally:
+        async with factory() as session:
+            await session.execute(delete(ApiCall).where(ApiCall.run_id == report.run_id))
+            await session.commit()

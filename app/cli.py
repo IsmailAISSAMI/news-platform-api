@@ -15,19 +15,24 @@ import json
 import logging
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.analysis.budget import CEILINGS, GOOGLE_LIMITS, RequestBudget
+from app.analysis.budget import CEILINGS, GOOGLE_LIMITS, DayUsage, RequestBudget
 from app.analysis.compare import render as render_comparison
 from app.analysis.compare import score_run
+from app.analysis.eval import consistency, export_gold, score_gold
 from app.analysis.lab import run_lab
+from app.analysis.ledger import DatabaseLedger
 from app.analysis.llm import GeminiClient, LLMUnavailableError
 from app.analysis.pipeline import (
+    ANALYZE_LOCK_KEY,
     MAX_ATTEMPTS,
     AlreadyAnalyzingError,
     AnalyzeOptions,
@@ -138,6 +143,22 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "backup", parents=[common], help="Dump the database to the backup directory."
     )
+    evaluate = commands.add_parser(
+        "eval", parents=[common], help="Gold-set evaluation of the stored analyses."
+    )
+    eval_commands = evaluate.add_subparsers(dest="eval_command", required=True)
+    export = eval_commands.add_parser(
+        "export",
+        parents=[common],
+        help="Write a stratified sample for labelling to ~/news-eval/gold (outside the repo).",
+    )
+    export.add_argument("--n", type=_positive_int, default=30, help="Articles (default 30).")
+    score = eval_commands.add_parser(
+        "score",
+        parents=[common],
+        help="Precision per section from a labelled labels.csv, plus code-check consistency.",
+    )
+    score.add_argument("labels", type=Path, help="The labelled labels.csv.")
     commands.add_parser(
         "restore-test",
         parents=[common],
@@ -159,7 +180,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0911  # one retu
     configure_cli_logging(verbose=args.verbose)
     try:
         if args.command == "gemini-usage":
-            return gemini_usage()
+            return asyncio.run(gemini_usage())
         if args.command == "analyze":
             logging.getLogger("app.analysis").setLevel(logging.INFO)  # live progress
             return asyncio.run(
@@ -171,6 +192,8 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: PLR0911  # one retu
             return asyncio.run(lab(args.ids, args.label))
         if args.command == "lab-compare":
             return asyncio.run(lab_compare(args.runs))
+        if args.command == "eval":
+            return asyncio.run(evaluate(args.eval_command, args))
         if args.command == "backup":
             return asyncio.run(backup())
         if args.command == "restore-test":
@@ -220,28 +243,66 @@ async def ingest(options: IngestOptions) -> int:
     return EXIT_OK if report.status is RunStatus.SUCCEEDED else EXIT_FEED_FAILURES
 
 
+@asynccontextmanager
+async def _analysis_lock(engine: AsyncEngine) -> AsyncIterator[None]:
+    """Hold the analysis lock (shared with `news analyze`) for the whole block.
+
+    A second `news analyze` or `news lab` gets AlreadyAnalyzingError at once, so two
+    processes never send requests at the same time (per-minute pacing is per process).
+    """
+    async with engine.connect() as connection:
+        acquired = await connection.scalar(
+            text("SELECT pg_try_advisory_lock(:key)"), {"key": ANALYZE_LOCK_KEY}
+        )
+        if not acquired:
+            msg = "another `news analyze` or `news lab` is already running"
+            raise AlreadyAnalyzingError(msg)
+        try:
+            yield
+        finally:
+            await connection.execute(
+                text("SELECT pg_advisory_unlock(:key)"), {"key": ANALYZE_LOCK_KEY}
+            )
+            await connection.commit()
+
+
+async def _check_ready(engine: AsyncEngine) -> None:
+    await wait_for_database(engine)
+    async with engine.connect() as connection:
+        await ensure_migrated(connection, alembic_head(Path.cwd() / "alembic.ini"))
+
+
 async def lab(ids: list[int], label: str) -> int:
     settings = get_settings()
     if settings.gemini_api_key is None:
         _err("Not ready: GEMINI_API_KEY is not set in .env")
         return EXIT_NOT_READY
-    budget = _budget(settings)
-    sys.stderr.write(
-        f"Gemini budget: at most {budget.per_run} requests this run; "
-        f"{budget.used_today()}/{budget.per_day} used today (Pacific time).\n"
-    )
-    engine = create_engine(settings, read_only=True)
+    engine = create_engine(settings)
     try:
-        async with httpx.AsyncClient() as client:
+        await _check_ready(engine)
+        sessions = create_session_factory(engine)
+        budget = _budget(settings)
+        async with _analysis_lock(engine), httpx.AsyncClient() as client:
             llm = GeminiClient(
                 client,
                 base_url=settings.gemini_base_url,
                 model=settings.gemini_model,
                 api_key=settings.gemini_api_key,
                 budget=budget,
+                ledger=DatabaseLedger(sessions),
             )
-            async with create_session_factory(engine)() as session:
+            sys.stderr.write(
+                f"Gemini budget: at most {budget.per_run} answered requests this run; "
+                f"{await llm.usage_line()} (Pacific time).\n"
+            )
+            async with sessions() as session:
                 out, results = await run_lab(session, llm, ids, label=label)
+    except NotReadyError as exc:
+        _err(f"Not ready: {exc}")
+        return EXIT_NOT_READY
+    except AlreadyAnalyzingError as exc:
+        _err(f"Not started: {exc}.")
+        return EXIT_ALREADY_RUNNING
     except LLMUnavailableError as exc:
         _err(f"Stopped: {exc}")
         return EXIT_NOT_READY
@@ -251,27 +312,34 @@ async def lab(ids: list[int], label: str) -> int:
     return EXIT_OK if all(r.ok for r in results) else EXIT_FEED_FAILURES
 
 
-def gemini_usage() -> int:
-    sys.stdout.write(format_usage(_budget(get_settings())))
+async def gemini_usage() -> int:
+    settings = get_settings()
+    engine = create_engine(settings, read_only=True)
+    try:
+        days = await DatabaseLedger(create_session_factory(engine)).totals(settings.gemini_model, 7)
+    finally:
+        await engine.dispose()
+    sys.stdout.write(format_usage(days, _budget(settings)))
     return EXIT_OK
 
 
-def format_usage(budget: RequestBudget) -> str:
+def format_usage(days: list[DayUsage], budget: RequestBudget) -> str:
     lines = [
-        f"Gemini API usage (quota days, Pacific time; log: {budget.usage_file})",
+        "Gemini API usage (quota days, Pacific time; source: database table api_calls)",
         "",
         f"{'day':<12}{'sent':>6}{'passed':>8}{'failed':>8}{'busy':>6}"
         f"{'tokens in':>12}{'tokens out':>12}",
     ]
     lines += [
-        f"{d.day:<12}{d.requests:>6}{d.requests - d.failed:>8}{d.failed:>8}{d.busy:>6}"
+        f"{d.day:<12}{d.requests:>6}{d.passed:>8}{d.failed:>8}{d.busy:>6}"
         f"{d.input_tokens:>12}{d.output_tokens:>12}"
-        for d in budget.history(7)
+        for d in days
     ]
-    used = budget.used_today()
+    today = days[-1]
     lines += [
         "",
-        f"Today: {used}/{budget.per_day} requests ({budget.per_day - used} left).",
+        f"Today: {today.requests}/{budget.per_day} requests "
+        f"({budget.per_day - today.requests} left), {today.pending} still in flight here.",
         f"Our limits:  {budget.per_run} answered/run, {budget.per_day}/day, "
         f"{budget.per_minute}/min, "
         f"{budget.input_tokens_per_minute} input tokens/min (hard ceilings: "
@@ -292,9 +360,7 @@ async def analyze(limit: int | None, concurrency: int | None, *, retry_failed: b
         return EXIT_NOT_READY
     engine = create_engine(settings)
     try:
-        await wait_for_database(engine)
-        async with engine.connect() as connection:
-            await ensure_migrated(connection, alembic_head(Path.cwd() / "alembic.ini"))
+        await _check_ready(engine)
         # A bulk run: the per-run cap is the daily cap (tests keep their 3 via `news lab`).
         budget = _budget(settings, per_run=settings.gemini_max_requests_per_day)
         async with httpx.AsyncClient() as client:
@@ -304,13 +370,16 @@ async def analyze(limit: int | None, concurrency: int | None, *, retry_failed: b
                 model=settings.gemini_model,
                 api_key=settings.gemini_api_key,
                 budget=budget,
+                ledger=DatabaseLedger(create_session_factory(engine)),
             )
             options = AnalyzeOptions(
                 concurrency=concurrency or settings.gemini_concurrency,
                 limit=limit,
                 retry_failed=retry_failed,
             )
+            # run_analyze takes the same analysis lock as `news lab`: refused if held.
             report = await run_analyze(create_session_factory(engine), llm, options)
+            today_line = await llm.usage_line()
     except NotReadyError as exc:
         _err(f"Not ready: {exc}")
         return EXIT_NOT_READY
@@ -319,11 +388,11 @@ async def analyze(limit: int | None, concurrency: int | None, *, retry_failed: b
         return EXIT_ALREADY_RUNNING
     finally:
         await engine.dispose()
-    sys.stdout.write(format_analyze_report(report, budget))
+    sys.stdout.write(format_analyze_report(report, today_line))
     return EXIT_OK if report.stop_reason is None else EXIT_FEED_FAILURES
 
 
-def format_analyze_report(report: AnalyzeReport, budget: RequestBudget) -> str:
+def format_analyze_report(report: AnalyzeReport, today_line: str) -> str:
     hours, rest = divmod(int(report.elapsed_s), 3600)
     average = (
         f"{sum(report.durations) / len(report.durations):.0f}s per answer"
@@ -332,20 +401,20 @@ def format_analyze_report(report: AnalyzeReport, budget: RequestBudget) -> str:
     )
     lines = [
         f"Analysis run: {report.queued} queued, {hours}h{rest // 60:02d}m, {average}.",
-        f"  succeeded {report.succeeded}, failed {report.failed}, "
+        f"  succeeded {report.succeeded}, needs review {report.needs_review}, "
+        f"failed {report.failed}, "
         f"retried {report.retried}, skipped (too long) {report.skipped}, "
         f"not sent {report.not_sent}",
         f"  still pending: {report.pending_after} (the next run continues from there)",
     ]
     if report.stop_reason:
         lines.append(f"  stopped: {report.stop_reason}")
-    lines.append(f"  Gemini {format_usage(budget).splitlines()[-4]}")
+    lines.append(f"  Gemini {today_line}")
     return "\n".join(lines) + "\n"
 
 
 def _budget(settings: Settings, *, per_run: int | None = None) -> RequestBudget:
     return RequestBudget(
-        usage_file=settings.gemini_usage_file,
         per_run=per_run or settings.gemini_max_requests_per_run,
         per_day=settings.gemini_max_requests_per_day,
         per_minute=settings.gemini_max_requests_per_minute,
@@ -380,6 +449,28 @@ async def lab_compare(runs: list[Path]) -> int:
         await engine.dispose()
     sys.stdout.write(render_comparison([score_run(run, paragraphs) for run in runs]))
     return EXIT_OK
+
+
+async def evaluate(command: str, args: argparse.Namespace) -> int:
+    """`news eval export|score`. Reads bodies, so it uses the owner login, read-only."""
+    if command == "score" and not args.labels.is_file():
+        _err(f"Not a file: {args.labels}")
+        return EXIT_NOT_READY
+    settings = get_settings()
+    engine = create_engine(settings)
+    try:
+        await wait_for_database(engine)
+        async with create_session_factory(engine)() as session:
+            await session.execute(text("SET TRANSACTION READ ONLY"))
+            if command == "export":
+                out = await export_gold(session, args.n)
+                sys.stdout.write(f"Gold set written to {out} (label labels.csv there)\n")
+                return EXIT_OK
+            sys.stdout.write(score_gold(args.labels).render())
+            sys.stdout.write((await consistency(session)).render())
+            return EXIT_OK
+    finally:
+        await engine.dispose()
 
 
 async def backup() -> int:

@@ -188,7 +188,9 @@ async def test_crawl_delay_spaces_requests_to_one_host(
 
 
 async def test_user_agent_identifies_us() -> None:
-    settings = Settings.model_validate({"database_url": "postgresql+psycopg://u:p@h/d"})
+    settings = Settings.model_validate(
+        {"database_url": "postgresql+psycopg://u:test-only-password@h/d"}
+    )
     client = create_http_client(settings)
     try:
         assert client.headers["User-Agent"].startswith("news-platform-api/")

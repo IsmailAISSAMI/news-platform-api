@@ -1,15 +1,20 @@
-"""Gemini client against a simulated API. Never calls the real one."""
+"""Gemini client against a simulated API. Never calls the real one.
+
+The quota ledger is an in-memory fake (tests/analysis/fake_ledger.py); the real one
+(PostgreSQL) is tested in tests/integration/test_ledger.py.
+"""
 
 import json
 from collections.abc import Callable
 from datetime import date
-from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import BaseModel, SecretStr
 
-from app.analysis.budget import RequestBudget
+from app.analysis.budget import (
+    RequestBudget,
+)
 from app.analysis.evidence import EvidenceStatus, verify
 from app.analysis.llm import (
     GeminiClient,
@@ -19,6 +24,7 @@ from app.analysis.llm import (
 )
 from app.analysis.prompt import SYSTEM_PROMPT, prepare
 from app.analysis.schema import ArticleAnalysis, EventDate
+from tests.analysis.fake_ledger import FakeLedger
 
 GEMINI = "https://generativelanguage.googleapis.com/v1beta/openai"
 MODEL = "gemma-4-31b-it"
@@ -38,18 +44,7 @@ def reply(content: str) -> httpx.Response:
     )
 
 
-def budget(tmp_path: Path, per_run: int = 3) -> RequestBudget:
-    return RequestBudget(
-        usage_file=tmp_path / "usage.json",
-        per_run=per_run,
-        per_day=1000,
-        per_minute=10,
-        input_tokens_per_minute=8000,
-    )
-
-
 def gemini(
-    tmp_path: Path,
     chat: Callable[[httpx.Request], httpx.Response],
     per_run: int = 3,
     slept: list[float] | None = None,
@@ -63,7 +58,13 @@ def gemini(
         base_url=GEMINI,
         model=MODEL,
         api_key=SecretStr("test-key"),
-        budget=budget(tmp_path, per_run),
+        budget=RequestBudget(
+            per_run=per_run,
+            per_day=1000,
+            per_minute=10,
+            input_tokens_per_minute=8000,
+        ),
+        ledger=FakeLedger(),
         sleep=no_sleep,
     )
 
@@ -77,20 +78,21 @@ def gemini(
         (GEMINI, "gemini-3.1-pro", "free-tier allowlist"),
     ],
 )
-def test_only_the_free_model_on_google_is_allowed(
-    tmp_path: Path, base_url: str, model: str, error: str
-) -> None:
+def test_only_the_free_model_on_google_is_allowed(base_url: str, model: str, error: str) -> None:
     with pytest.raises(ValueError, match=error):
         GeminiClient(
             httpx.AsyncClient(),
             base_url=base_url,
             model=model,
             api_key=SecretStr("k"),
-            budget=budget(tmp_path),
+            budget=RequestBudget(
+                per_run=3, per_day=1000, per_minute=10, input_tokens_per_minute=8000
+            ),
+            ledger=FakeLedger(),
         )
 
 
-async def test_request_puts_rules_and_schema_in_one_user_message(tmp_path: Path) -> None:
+async def test_request_puts_rules_and_schema_in_one_user_message() -> None:
     seen: list[httpx.Request] = []
 
     def chat(request: httpx.Request) -> httpx.Response:
@@ -98,7 +100,7 @@ async def test_request_puts_rules_and_schema_in_one_user_message(tmp_path: Path)
         thought = "<thought>Plan: {not json} then answer.</thought>\n"
         return reply(thought + 'Here it is:\n```json\n{"answer": "ok"}\n```')
 
-    llm = gemini(tmp_path, chat)
+    llm = gemini(chat)
     completion = await llm.structured(Tiny, system="RULES", user="ARTICLE")
 
     assert completion.parsed == Tiny(answer="ok")  # reasoning and fence are stripped
@@ -110,30 +112,29 @@ async def test_request_puts_rules_and_schema_in_one_user_message(tmp_path: Path)
     assert message["role"] == "user"
     assert "RULES" in message["content"]
     assert '"answer"' in message["content"]  # the JSON schema
-    [today] = llm.budget.history(1)
-    assert (today.requests, today.failed, today.input_tokens, today.output_tokens) == (
-        1, 0, 100, 50,
-    )  # fmt: skip
+    [today] = await llm.ledger.totals(MODEL, 1)
+    assert (today.requests, today.passed, today.failed) == (1, 1, 0)
+    assert (today.input_tokens, today.output_tokens) == (100, 50)
 
 
 @pytest.mark.parametrize("content", ["", "not json", '{"wrong": 1}', '{"answer": 1, "x": 2}'])
-async def test_invalid_output_is_rejected_with_the_raw_text(tmp_path: Path, content: str) -> None:
-    llm = gemini(tmp_path, lambda _: reply(content))
+async def test_invalid_output_is_rejected_with_the_raw_text(content: str) -> None:
+    llm = gemini(lambda _: reply(content))
 
     with pytest.raises(LLMOutputError) as info:
         await llm.structured(Tiny, system="s", user="u")
     assert info.value.raw == content
-    assert llm.budget.history(1)[0].failed == 1
+    assert (await llm.ledger.totals(MODEL, 1))[0].failed == 1
 
 
-async def test_the_budget_stops_requests_before_they_are_sent(tmp_path: Path) -> None:
+async def test_the_budget_stops_requests_before_they_are_sent() -> None:
     sent: list[httpx.Request] = []
 
     def chat(request: httpx.Request) -> httpx.Response:
         sent.append(request)
         return reply('{"answer": "ok"}')
 
-    llm = gemini(tmp_path, chat, per_run=2)
+    llm = gemini(chat, per_run=2)
     await llm.structured(Tiny, system="s", user="u")
     await llm.structured(Tiny, system="s", user="u")
 
@@ -143,20 +144,18 @@ async def test_the_budget_stops_requests_before_they_are_sent(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize(("status", "error"), [(429, "quota reached"), (400, "HTTP 400")])
-async def test_errors_stop_without_retrying_and_are_counted(
-    tmp_path: Path, status: int, error: str
-) -> None:
+async def test_errors_stop_without_retrying_and_are_counted(status: int, error: str) -> None:
     sent: list[httpx.Request] = []
 
     def chat(request: httpx.Request) -> httpx.Response:
         sent.append(request)
         return httpx.Response(status, json={"error": "x"})
 
-    llm = gemini(tmp_path, chat)
+    llm = gemini(chat)
     with pytest.raises(LLMUnavailableError, match=error):
         await llm.structured(Tiny, system="s", user="u")
     assert len(sent) == 1
-    [today] = llm.budget.history(1)
+    [today] = await llm.ledger.totals(MODEL, 1)
     assert (today.requests, today.failed) == (1, 1)
 
 
@@ -238,20 +237,20 @@ def test_precision_is_derived_from_the_value(value: str | None, precision: str) 
     assert EventDate.model_validate({"value": value, "evidence": evidence}).precision == precision
 
 
-async def test_an_article_too_long_for_the_free_tier_is_skipped_unsent(tmp_path: Path) -> None:
+async def test_an_article_too_long_for_the_free_tier_is_skipped_unsent() -> None:
     def chat(_: httpx.Request) -> httpx.Response:
         raise AssertionError("must not be sent")
 
-    llm = gemini(tmp_path, chat)
+    llm = gemini(chat)
     with pytest.raises(LLMRequestTooLargeError, match="too large"):
         await llm.structured(Tiny, system="s", user="x" * 60_000)
-    assert llm.budget.used_today() == 0
+    assert (await llm.ledger.totals(MODEL, 1))[0].requests == 0
 
 
 BUSY = {"error": {"code": 503, "message": "This model is currently experiencing high demand."}}
 
 
-async def test_high_demand_is_waited_out_with_the_same_model(tmp_path: Path) -> None:
+async def test_high_demand_is_waited_out_with_the_same_model() -> None:
     answers = [httpx.Response(503, json=BUSY)] * 5
     slept: list[float] = []
     models: list[str] = []
@@ -260,19 +259,23 @@ async def test_high_demand_is_waited_out_with_the_same_model(tmp_path: Path) -> 
         models.append(json.loads(request.content)["model"])
         return answers.pop(0) if answers else reply('{"answer": "ok"}')
 
-    llm = gemini(tmp_path, chat, per_run=1, slept=slept)
+    llm = gemini(chat, per_run=1, slept=slept)
     completion = await llm.structured(Tiny, system="s", user="u")
 
     assert completion.parsed == Tiny(answer="ok")
     assert [round(x) for x in slept] == [10, 20, 30, 60, 60]  # the last pause repeats
     assert set(models) == {MODEL}  # never another model
-    [today] = llm.budget.history(1)
-    assert (today.requests, today.failed, today.busy) == (6, 5, 5)  # every attempt counted
+    [today] = await llm.ledger.totals(MODEL, 1)
+    assert (today.requests, today.failed, today.busy) == (
+        6,
+        0,
+        5,
+    )  # busy has its own outcome  # every attempt counted
     assert llm.budget.used_this_run == 1  # busy refusals do not use the per-run limit
 
 
 @pytest.mark.parametrize("busy", [503, 500, 502, 504, "timeout", "offline"])
-async def test_every_temporary_failure_is_retried(tmp_path: Path, busy: int | str) -> None:
+async def test_every_temporary_failure_is_retried(busy: int | str) -> None:
     calls = {"n": 0}
 
     def chat(request: httpx.Request) -> httpx.Response:
@@ -285,31 +288,29 @@ async def test_every_temporary_failure_is_retried(tmp_path: Path, busy: int | st
             raise httpx.ConnectError("no network", request=request)
         return httpx.Response(int(busy), json=BUSY)
 
-    llm = gemini(tmp_path, chat)
+    llm = gemini(chat)
     assert (await llm.structured(Tiny, system="s", user="u")).parsed == Tiny(answer="ok")
     assert calls["n"] == 2
 
 
-async def test_the_daily_limit_stops_endless_retries(tmp_path: Path) -> None:
-    llm = gemini(tmp_path, lambda _: httpx.Response(503, json=BUSY))
+async def test_the_daily_limit_stops_endless_retries() -> None:
+    llm = gemini(lambda _: httpx.Response(503, json=BUSY))
     llm.budget.per_day = 5
 
     with pytest.raises(LLMUnavailableError, match="daily limit"):
         await llm.structured(Tiny, system="s", user="u")
-    assert llm.budget.used_today() == 5
+    assert (await llm.ledger.totals(MODEL, 1))[0].requests == 5
 
 
-async def test_the_live_log_shows_attempts_and_counts(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_the_live_log_shows_attempts_and_counts(caplog: pytest.LogCaptureFixture) -> None:
     answers = [httpx.Response(503, json=BUSY)]
-    llm = gemini(tmp_path, lambda _: answers.pop(0) if answers else reply('{"answer": "ok"}'))
+    llm = gemini(lambda _: answers.pop(0) if answers else reply('{"answer": "ok"}'))
 
     with caplog.at_level("INFO", logger="app.analysis"):
         await llm.structured(Tiny, system="s", user="u")
 
     assert "Gemini busy (HTTP 503), attempt 1; all requests pause 10s" in caplog.text
-    assert "today: 0 passed, 1 failed (1 busy), 1/1000 sent" in caplog.text
+    assert "today: 0 passed, 0 failed (1 busy), 0 pending, 1/1000 sent" in caplog.text
 
 
 def test_a_null_event_date_means_no_date() -> None:
@@ -319,7 +320,7 @@ def test_a_null_event_date_means_no_date() -> None:
     assert When.model_validate({"event_date": None}).event_date.precision == "unknown"
 
 
-async def test_an_answer_cut_off_by_the_output_limit_is_reported_as_such(tmp_path: Path) -> None:
+async def test_an_answer_cut_off_by_the_output_limit_is_reported_as_such() -> None:
     def chat(_: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -329,4 +330,22 @@ async def test_an_answer_cut_off_by_the_output_limit_is_reported_as_such(tmp_pat
         )
 
     with pytest.raises(LLMOutputError, match="cut off at the 16000-token output limit"):
-        await gemini(tmp_path, chat).structured(Tiny, system="s", user="u")
+        await gemini(chat).structured(Tiny, system="s", user="u")
+
+
+async def test_a_dropped_connection_is_waited_out_not_a_crash() -> None:
+    """RemoteProtocolError escaped the retry loop and would have stopped every worker."""
+    from tests.analysis.fake_ledger import FakeLedger  # noqa: PLC0415  # local to this test
+
+    calls = {"n": 0}
+
+    def chat(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.RemoteProtocolError("server disconnected", request=request)
+        return reply('{"answer": "ok"}')
+
+    llm = gemini(chat)
+    assert isinstance(llm.ledger, FakeLedger)
+    assert (await llm.structured(Tiny, system="s", user="u")).parsed == Tiny(answer="ok")
+    assert calls["n"] == 2

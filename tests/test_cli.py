@@ -273,48 +273,37 @@ async def test_ingest_reminds_about_stale_backups(
     assert "Reminder: No backup yet." in capsys.readouterr().err
 
 
-def test_gemini_usage_shows_our_limits_and_googles(tmp_path: Path) -> None:
-    from app.analysis.budget import RequestBudget  # noqa: PLC0415  # local to this test
+def test_gemini_usage_shows_our_limits_and_googles() -> None:
+    from app.analysis.budget import DayUsage, RequestBudget  # noqa: PLC0415  # local to this test
 
-    budget = RequestBudget(
-        usage_file=tmp_path / "usage.json",
-        per_run=3,
-        per_day=1000,
-        per_minute=10,
-        input_tokens_per_minute=8000,
-    )
-    budget.reserve(10)
-    budget.record_result(ok=True, input_tokens=4300, output_tokens=2600)
+    budget = RequestBudget(per_run=3, per_day=1000, per_minute=10, input_tokens_per_minute=8000)
+    days = [DayUsage("2026-11-24", requests=1, passed=1, input_tokens=4300, output_tokens=2600)]
 
-    text = cli.format_usage(budget)
+    text = cli.format_usage(days, budget)
 
-    assert "Today: 1/1000 requests (999 left)." in text
+    assert "Today: 1/1000 requests (999 left)," in text
     assert "4300" in text
     assert "Google's free tier: 14400/day, 30/min, 16000 input tokens/min." in text
     assert "NO billing account" in text
 
 
-def test_format_analyze_report(tmp_path: Path) -> None:
-    from app.analysis.budget import RequestBudget  # noqa: PLC0415  # local to this test
+def test_format_analyze_report() -> None:
     from app.analysis.pipeline import AnalyzeReport  # noqa: PLC0415
 
-    budget = RequestBudget(
-        usage_file=tmp_path / "usage.json",
-        per_run=1000,
-        per_day=1000,
-        per_minute=20,
-        input_tokens_per_minute=10_000,
-    )
     report = AnalyzeReport(
         queued=10, succeeded=6, failed=1, retried=2, skipped=1, not_sent=2,
         stop_reason="daily limit reached", elapsed_s=3720, pending_after=3,
         durations=[100.0, 200.0],
     )  # fmt: skip
 
-    text = cli.format_analyze_report(report, budget)
+    text = cli.format_analyze_report(
+        report, "today: 0 passed, 0 failed (0 busy), 0 pending, 0/1000 sent"
+    )
 
     assert "10 queued, 1h02m, 150s per answer" in text
-    assert "succeeded 6, failed 1, retried 2, skipped (too long) 1, not sent 2" in text
+    assert (
+        "succeeded 6, needs review 0, failed 1, retried 2, skipped (too long) 1, not sent 2" in text
+    )
     assert "still pending: 3" in text
     assert "stopped: daily limit reached" in text
-    assert "Today: 0/1000 requests" in text
+    assert "today: 0 passed, 0 failed (0 busy), 0 pending, 0/1000 sent" in text

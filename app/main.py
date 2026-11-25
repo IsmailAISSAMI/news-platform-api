@@ -1,8 +1,12 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.cors import CORSMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.api.router import api_router
 from app.core.config import Settings, get_settings
@@ -49,7 +53,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(RequestIDMiddleware)
     register_exception_handlers(app)
     app.include_router(api_router)
+    app.add_middleware(UICSPMiddleware)
+    app.mount("/ui", StaticFiles(directory=UI_DIR, html=True), name="ui")
     return app
+
+
+UI_DIR = Path(__file__).parent / "web" / "static"
+UI_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
+    "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; "
+    "form-action 'none'; frame-ancestors 'none'"
+)
+
+
+class UICSPMiddleware:
+    """Adds a strict Content Security Policy to every /ui response (pure ASGI)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not (path == "/ui" or path.startswith("/ui/")):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_csp(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Content-Security-Policy"] = UI_CSP
+                headers["X-Content-Type-Options"] = "nosniff"
+                headers["Referrer-Policy"] = "no-referrer"
+                # Revalidate on every load (ETag makes it cheap): an updated UI is never
+                # hidden behind stale cached JS modules.
+                headers["Cache-Control"] = "no-cache"
+            await send(message)
+
+        await self.app(scope, receive, send_with_csp)
 
 
 app = create_app()

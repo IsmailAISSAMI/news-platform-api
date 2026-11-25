@@ -14,6 +14,8 @@ analysis alongside the cleaned one, so nothing is lost.
   "Taourirt, ... provinces") is kept as written ("Taourirt")             [heuristic]
 - the publisher's own name is never an actor or a place                  [heuristic]
 - "publication of the article" entries are dropped from the timeline     [heuristic]
+- a timeline entry dated with the article's publication date whose quote holds no date
+  words is dropped (the model filled the date in from the byline)         [heuristic]
 - an event date whose evidence contains no date words becomes unknown    [heuristic]
 - near-duplicate actors ("the investigating judge" and "investigating judge at the
   Tangier Court of Appeal") are merged, only when unambiguous: a short name contained
@@ -22,7 +24,9 @@ analysis alongside the cleaned one, so nothing is lost.
 
 Some problems cannot be fixed safely and are FLAGGED for human review instead, never
 rewritten: a claim whose quote speaks of the future while the claim reads as done;
-a name listed both as an actor and as a place (either side may be the error).
+a name listed both as an actor and as a place (either side may be the error); a claim
+resting on a paragraph that cites anonymous sources ("sources said") but carrying no
+attribution; a cause too short to explain anything or restating the main event.
 """
 
 import re
@@ -75,10 +79,14 @@ class CleanupReport:
 
 
 def clean(
-    analysis: ArticleAnalysis, paragraphs: list[str], *, publisher_names: tuple[str, ...]
+    analysis: ArticleAnalysis,
+    paragraphs: list[str],
+    *,
+    publisher_names: tuple[str, ...],
+    published: date | None = None,
 ) -> tuple[ArticleAnalysis, CleanupReport]:
     report = CleanupReport()
-    issues = semantic_issues(analysis, paragraphs)
+    issues = semantic_issues(analysis, paragraphs, published)
     publisher = {normalize(name) for name in publisher_names}
 
     where = _clean_places(analysis.where, issues, publisher, report)
@@ -95,6 +103,15 @@ def clean(
                     "reads as done",
                 )
             )
+        path = f"$.claims[{index}].attributed_to"
+        if issues.get(path) is Issue.ANONYMOUS_SOURCE_UNATTRIBUTED:
+            report.flags.append(
+                ReviewFlag(path, claim.text, "claim from an anonymous source has no attribution")
+            )
+
+    for index, cause in enumerate(analysis.why):
+        if issues.get(f"$.why[{index}]") is Issue.UNINFORMATIVE_CAUSE:
+            report.flags.append(ReviewFlag(f"$.why[{index}]", cause.text, "uninformative cause"))
 
     event_date = analysis.when.event_date
     if issues.get("$.when.event_date") is Issue.EVENT_DATE_WITHOUT_DATE_WORDS:
@@ -115,6 +132,15 @@ def clean(
                 entry.event,
                 None,
                 "the article's own publication is not an event",
+                "heuristic",
+            )
+            continue
+        if issues.get(f"$.when.timeline[{index}]") is Issue.TIMELINE_PUBLICATION_DATE:
+            report.add(
+                f"$.when.timeline[{index}]",
+                f"{entry.date}: {entry.event}",
+                None,
+                "dated with the publication date, no date in the quote",
                 "heuristic",
             )
             continue

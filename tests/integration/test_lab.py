@@ -17,6 +17,7 @@ from app.analysis import lab
 from app.analysis.budget import RequestBudget
 from app.analysis.llm import GeminiClient
 from app.models import Article, ArticleBody, Source
+from tests.analysis.fake_ledger import FakeLedger
 
 pytestmark = pytest.mark.integration
 
@@ -60,7 +61,7 @@ async def articles(db_session: AsyncSession, source: Source, count: int) -> list
     return ids
 
 
-def client(tmp_path: Path, chat: Callable[[httpx.Request], httpx.Response]) -> GeminiClient:
+def client(chat: Callable[[httpx.Request], httpx.Response]) -> GeminiClient:
     async def no_sleep(_: float) -> None:
         return None
 
@@ -70,12 +71,12 @@ def client(tmp_path: Path, chat: Callable[[httpx.Request], httpx.Response]) -> G
         model="gemma-4-31b-it",
         api_key=SecretStr("test-key"),
         budget=RequestBudget(
-            usage_file=tmp_path / "usage.json",
             per_run=10,
             per_day=1000,
             per_minute=10,
             input_tokens_per_minute=8000,
         ),
+        ledger=FakeLedger(),
         sleep=no_sleep,
     )
 
@@ -93,7 +94,7 @@ async def test_busy_errors_are_waited_out_and_every_article_is_analysed(
             return BUSY
         return httpx.Response(200, json={"choices": [{"message": {"content": VALID}}]})
 
-    out, results = await lab.run_lab(db_session, client(tmp_path, chat), [first, second])
+    out, results = await lab.run_lab(db_session, client(chat), [first, second])
 
     assert [r.ok for r in results] == [True, True]
     assert calls["n"] == 6
@@ -111,7 +112,7 @@ async def test_a_hard_stop_still_writes_the_report_and_sends_nothing_more(
         sent.append(request)
         return httpx.Response(429, json={"error": "quota"})
 
-    out, results = await lab.run_lab(db_session, client(tmp_path, chat), ids)
+    out, results = await lab.run_lab(db_session, client(chat), ids)
 
     assert len(sent) == 1
     assert "429" in (results[0].error or "")

@@ -293,3 +293,11 @@ def test_cursor_roundtrip_and_naive_timestamps_are_rejected() -> None:
     naive = _encode_cursor(datetime(2026, 1, 1), 1)  # deliberately naive
     with pytest.raises(Exception, match="Invalid cursor"):
         _decode_cursor(naive)
+
+
+async def test_article_page_size_is_bounded(client: httpx.AsyncClient) -> None:
+    too_big = await client.get("/api/v1/articles", params={"limit": 1_000_000})
+    at_cap = await client.get("/api/v1/articles", params={"limit": 100})
+
+    assert too_big.status_code == 422
+    assert at_cap.status_code == 200

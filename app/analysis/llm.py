@@ -2,14 +2,14 @@
 
 Article text is sent to Google. Safeguards, all enforced here:
 - only Google's API host and only models on the free allowlist (`FREE_MODELS`);
-- every request goes through `RequestBudget` (hard limits, usage log), counted before
-  it is sent;
+- every request is reserved in the database ledger (`Ledger`) BEFORE it is sent, and
+  the reservation is finished with the real outcome afterwards (see ledger.py);
 - no tools, grounding, caching or other options that can be billed: the payload is
   built here and nothing can be added to it;
 - HTTP 429 (quota) stops the run, with no retry;
 - "high demand" errors (503, and 500/502/504, timeouts, no network) are EXPECTED on
   the free tier: the same request is tried again after 10, 20, 30, then every 60
-  seconds, until Google answers. Every attempt goes through the budget, so the daily
+  seconds, until Google answers. Every attempt is reserved in the ledger, so the daily
   limit stays the absolute stop. Each attempt is logged with today's counts.
 """
 
@@ -28,6 +28,8 @@ from pydantic import BaseModel, SecretStr, ValidationError
 
 from app.analysis.budget import (
     BudgetExceededError,
+    Ledger,
+    Outcome,
     RequestBudget,
     RequestTooLargeError,
     estimate_tokens,
@@ -105,7 +107,7 @@ class GeminiClient:
     against the Pydantic schema: invalid output is rejected, never repaired.
     """
 
-    def __init__(  # noqa: PLR0913  # endpoint, model, key, budget, retry policy
+    def __init__(  # noqa: PLR0913  # endpoint, model, key, budget, ledger, retry policy
         self,
         client: httpx.AsyncClient,
         *,
@@ -113,6 +115,8 @@ class GeminiClient:
         model: str,
         api_key: SecretStr,
         budget: RequestBudget,
+        ledger: Ledger,
+        run_id: int | None = None,
         retry_pauses_s: tuple[float, ...] = RETRY_PAUSES_S,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -127,7 +131,9 @@ class GeminiClient:
         self._base = base_url.rstrip("/")
         self._api_key = api_key
         self.budget = budget
+        self.ledger = ledger
         self.model = model
+        self.run_id = run_id  # set by `news analyze` once its run row exists
         self._retry_pauses = retry_pauses_s
         self._sleep = sleep
         # Shared by every concurrent request: one lock so admission (pacing + counting)
@@ -158,32 +164,33 @@ class GeminiClient:
             "temperature": 0.1,
             "max_tokens": max_tokens,
         }
-        response, duration = await self._send_with_retries(payload, content)
-        body = response.json()
-        choice = body["choices"][0]
-        raw = choice["message"].get("content") or ""
-        usage = body.get("usage") or {}
-        prompt_tokens, completion_tokens = (
-            usage.get("prompt_tokens"),
-            usage.get("completion_tokens"),
-        )
+        response, duration, reservation = await self._send_with_retries(payload, content)
+        try:
+            body = response.json()
+            choice = body["choices"][0]
+            raw = choice["message"].get("content") or ""
+            usage = body.get("usage") or {}
+            prompt_tokens, completion_tokens = (
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+            )
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+            await self._finish(reservation, "failed", None, None)
+            msg = f"unusable answer shape: {type(exc).__name__}"
+            raise LLMOutputError(msg, response.text[:300]) from exc
         try:
             if choice.get("finish_reason") == "length":
                 msg = f"answer cut off at the {max_tokens}-token output limit"
                 raise LLMOutputError(msg, raw)
             parsed = schema.model_validate(json.loads(_extract_json(raw)))
         except LLMOutputError:
-            await self._record(
-                ok=False, input_tokens=prompt_tokens, output_tokens=completion_tokens
-            )
+            await self._finish(reservation, "failed", prompt_tokens, completion_tokens)
             raise
         except (json.JSONDecodeError, ValidationError) as exc:
-            await self._record(
-                ok=False, input_tokens=prompt_tokens, output_tokens=completion_tokens
-            )
+            await self._finish(reservation, "failed", prompt_tokens, completion_tokens)
             msg = f"invalid output: {type(exc).__name__}: {str(exc)[:300]}"
             raise LLMOutputError(msg, raw) from exc
-        await self._record(ok=True, input_tokens=prompt_tokens, output_tokens=completion_tokens)
+        await self._finish(reservation, "answered", prompt_tokens, completion_tokens)
         return Completion(
             parsed=parsed,
             raw=raw,
@@ -194,17 +201,18 @@ class GeminiClient:
 
     async def _send_with_retries(
         self, payload: dict[str, Any], content: str
-    ) -> tuple[httpx.Response, float]:
+    ) -> tuple[httpx.Response, float, int]:
         """Send until Google answers: busy errors are waited out, never fatal.
 
-        Same model every time. Each attempt goes through the budget, so the daily
+        Same model every time. Each attempt is reserved in the ledger, so the daily
         limit stays the absolute stop. Only errors that waiting cannot fix (429 quota,
-        a bad request, a wrong key) end the run.
+        a bad request, a wrong key) end the run. Returns the reservation id of the
+        attempt that was answered; its outcome is recorded by the caller.
         """
         attempt = 0
         while True:
             attempt += 1
-            await self._take_budget(content)
+            reservation = await self._admit(estimate_tokens(content))
             started = time.monotonic()
             try:
                 response: httpx.Response | None = await self._client.post(
@@ -213,15 +221,18 @@ class GeminiClient:
                     headers={"Authorization": f"Bearer {self._api_key.get_secret_value()}"},
                     timeout=900,
                 )
-            except (httpx.TimeoutException, httpx.NetworkError):
-                response = None  # too slow, or the Mac is offline: worth waiting for
+            except httpx.TransportError:
+                # Too slow, offline, or the server dropped the connection mid-answer
+                # (RemoteProtocolError): all worth waiting for, never a crash of the run.
+                response = None
             duration = time.monotonic() - started
             if response is not None and response.status_code == httpx.codes.OK:
                 self._busy_streak = 0
-                return response, duration
+                self.budget.correct_last_estimate(_input_tokens(response))
+                return response, duration, reservation
             status = "timeout/offline" if response is None else f"HTTP {response.status_code}"
             busy = response is None or response.status_code in TRANSIENT_STATUSES
-            await self._record(ok=False, busy=busy)
+            await self._finish(reservation, "refused_busy" if busy else "failed", None, None)
             if not busy:
                 assert response is not None  # noqa: S101  # busy covers the None case
                 if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
@@ -238,21 +249,23 @@ class GeminiClient:
             )  # fmt: skip
 
     async def usage_line(self) -> str:
-        """Today's counts, for the live terminal log."""
-        [today] = await asyncio.to_thread(self.budget.history, 1)
-        passed = today.requests - today.failed
+        """Today's counts from the database, for the live terminal log."""
+        [today] = await self.ledger.totals(self.model, 1)
         return (
-            f"today: {passed} passed, {today.failed} failed ({today.busy} busy), "
-            f"{today.requests}/{self.budget.per_day} sent"
+            f"today: {today.passed} passed, {today.failed} failed ({today.busy} busy), "
+            f"{today.pending} pending, {today.requests}/{self.budget.per_day} sent"
         )
 
-    async def _take_budget(self, text: str) -> None:
-        """Wait out any shared cooldown and the per-minute limits, then count the request.
+    async def _admit(self, tokens: int) -> int:
+        """Wait out the cooldown and the per-minute limits, check every limit, reserve.
 
-        Under one lock: concurrent requests are admitted one at a time, so two of them
-        can never both take the last slot of a minute or of the day.
+        Returns the ledger reservation id. Under one lock: admitted one at a time, so two
+        requests can never both take the last slot of a minute, the run or the day.
         """
-        tokens = estimate_tokens(text)
+        try:
+            self.budget.check_size(tokens)  # never sendable: refused before any wait
+        except RequestTooLargeError as exc:
+            raise LLMRequestTooLargeError(str(exc)) from exc
         async with self._admission:
             remaining = self._cooldown_until - self.budget.monotonic()
             if remaining > 0:
@@ -262,28 +275,39 @@ class GeminiClient:
                 if wait <= 0:
                     break
                 await self._sleep(wait)
-            await self._reserve(tokens)
+            try:
+                self.budget.open_run_slot()
+            except BudgetExceededError as exc:
+                raise LLMUnavailableError(str(exc)) from exc
+            try:
+                reservation = await self.ledger.reserve(
+                    self.model, self.budget.quota_day(), self.budget.per_day, self.run_id
+                )
+            except BudgetExceededError as exc:
+                self.budget.settle_run_slot(answered=False)
+                raise LLMUnavailableError(str(exc)) from exc
+            except Exception:
+                self.budget.settle_run_slot(answered=False)  # nothing was sent
+                raise
+            self.budget.pace(tokens)
+            return reservation
 
-    async def _reserve(self, tokens: int) -> None:
-        try:
-            await asyncio.to_thread(self.budget.reserve, tokens)
-        except RequestTooLargeError as exc:
-            raise LLMRequestTooLargeError(str(exc)) from exc
-        except BudgetExceededError as exc:
-            raise LLMUnavailableError(str(exc)) from exc
-
-    async def _record(
+    async def _finish(
         self,
-        *,
-        ok: bool,
-        input_tokens: int | None = None,
-        output_tokens: int | None = None,
-        busy: bool = False,
+        reservation: int,
+        outcome: Outcome,
+        input_tokens: int | None,
+        output_tokens: int | None,
     ) -> None:
-        await asyncio.to_thread(
-            self.budget.record_result,
-            ok=ok,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            busy=busy,
-        )
+        """Record how a sent request ended, and release its per-run slot."""
+        self.budget.settle_run_slot(answered=outcome == "answered")
+        await self.ledger.record(reservation, outcome, input_tokens, output_tokens)
+
+
+def _input_tokens(response: httpx.Response) -> int | None:
+    try:
+        usage = response.json().get("usage") or {}
+    except ValueError:
+        return None
+    value = usage.get("prompt_tokens")
+    return value if isinstance(value, int) else None

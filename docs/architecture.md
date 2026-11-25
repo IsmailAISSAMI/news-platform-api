@@ -242,73 +242,99 @@ before any public or commercial use. *This document is not legal advice.*
 
 ### 5.4 Owner decision: private full text for Hespress (2026-11-23)
 
-- **Decision:** the owner chose to store Hespress full text privately, for
-  non-commercial educational AI analysis, without asking Hespress for permission.
+- **Decision:** the owner chose to store Hespress full text privately, for non-commercial
+  educational AI analysis, without asking Hespress for permission.
 - **Recorded:** in `sources.rights_basis` by migration `bb03517b5d1e`.
 - **Advice given and declined:** obtaining a license; relying on a text-and-data-mining
   exception confirmed by a lawyer for the owner's jurisdiction.
 - **Known tension:** Hespress's terms (section 5.1) reserve copying. Educational and
   private-use exceptions differ by country. This is the owner's decision, not a legal
   clearance.
-- **Safeguards:**
-  - text is stored locally only;
-  - the API and the `news_api` role cannot read it;
-  - it is never committed (test fixtures are synthetic), exported or published;
+- **Current rule (since 2026-11-24):**
+  - full text (`article_bodies`) **and every analysis derived from it** (`article_analyses`,
+    `analysis_runs`, claims, quotes, places, entities) are private. They are never shown by
+    the API, exported, published or committed. Analyses are private, not only the bodies;
+  - the `news_api` role cannot read `article_bodies`, `article_analyses`, `api_calls` or
+    `analysis_runs` (enforced by `scripts/db_roles.sql` and tests);
+  - **the one exception:** AI analysis sends article text to Google's Gemini API, free
+    tier. Section 5.5 is the decision that covers it. No other path sends article text
+    off the owner's machine;
+  - text is never committed (test fixtures are synthetic);
   - backups contain it and stay private (mode 600, outside the repo and iCloud);
-  - publishable AI output must be original, with no reproduced passages.
+  - publishable AI output must be original, with no reproduced or closely paraphrased
+    passages.
 - **To reverse:** set the source back to `metadata_only` (collection stops), then
-  `DELETE FROM article_bodies` for that source's articles.
+  `DELETE FROM article_bodies` for that source's articles. Stored analyses are handled as
+  in section 5.5.
 
 ### 5.5 Owner decision: AI analysis on the Gemini API free tier (2026-11-24)
 
-- **Decision:** AI analysis runs on Google's Gemini API, model **Gemma 4 31B, free tier
-  only**. LM Studio and the local models are retired: the owner compared both on the
-  same articles and preferred Gemma 4 31B's answers. Article text is **sent to Google**.
-- **Known consequences, accepted by the owner:**
-  - on the free tier, Google may use prompts and outputs to improve its products, and
-    humans may review them;
-  - this is an exception to "no free tier as a dependency" (section 1): Google can
-    lower or remove free limits at any time (it did in December 2025), and analysis
-    then stops until the owner decides otherwise.
+- **Decision (owner, 2026-11-24):** AI analysis runs on Google's Gemini API, model
+  **Gemma 4 31B (`gemma-4-31b-it`), free tier only**. LM Studio and the local models are
+  retired. The owner compared them on the same articles and preferred Gemma 4 31B.
+- **Data sent:** article text (as numbered paragraphs) and the prompt are sent to Google.
+  This is the only path by which article text leaves the owner's machine.
+- **Free-tier data-use consequence (accepted):** on the free tier, Google may use prompts
+  and outputs to improve its products, and human reviewers may read them.
+- **Platform risk (accepted):** Google can lower or remove free limits at any time (it did
+  so in December 2025). Analysis then stops until the owner decides otherwise.
+- **Billing rule:** the Google Cloud project has **no billing account**. Without one,
+  Google cannot charge: over a limit it refuses (HTTP 429). The code cannot check billing;
+  the owner checks it in the Google Cloud console. Linking a billing account, or using any
+  model or feature outside the free tier, requires a new decision recorded in this section.
+- **Limits** (the same numbers in `CLAUDE.md`, this section and `.env.example`):
+  - 20 requests per minute (Google: 30);
+  - 10,000 input tokens per minute (Google: 16,000);
+  - 1,000 requests per day (Google: 14,400; the owner's stricter rule, about 7%);
+  - 3 answered requests per `news lab` test;
+  - concurrency 8 articles in flight by default (`GEMINI_CONCURRENCY`).
+  The per-minute and token limits are at least one third below Google's, as the owner
+  requires. Settings can lower these limits; values above the ceilings are refused.
 - **Advice given and declined:** keep analysis local, or send only synthetic text and
   metadata.
-- **Never paying, the rule:** the Google project has **no billing account**. Without
-  one, Google cannot charge: over a limit it refuses (HTTP 429). Code cannot check
-  billing, so the owner checks it in the Google Cloud console. Linking a billing
-  account, or using any model or feature outside the free tier, needs a new decision
-  recorded here.
-- **Safeguards in code** (`app/analysis/budget.py`, `app/analysis/llm.py`):
+- **Safeguards in code** (`app/analysis/budget.py`, `app/analysis/llm.py`,
+  `app/analysis/pipeline.py`):
   - only `https://generativelanguage.googleapis.com` and only models on the free
-    allowlist (`gemma-4-31b-it`). The request body is fixed in code: no tools,
-    grounding, caching or other options;
-  - our limits always leave **at least one third of every Google limit unused**
-    (owner rule): **20 requests/min** (Google 30), **10,000 input tokens/min** (Google
-    16,000), and **1,000 requests/day** (Google 14,400; the owner's own, stricter rule).
-    `news lab` stops at 3 answered requests per test. Settings can lower these limits;
-    values above the ceilings are refused;
-  - parallel and resumable (`news analyze`, `app/analysis/pipeline.py`): several
-    articles in flight (`GEMINI_CONCURRENCY`, default 8), admitted one at a time under
-    one lock, so parallelism never passes a limit. A "busy" answer pauses all workers
-    together. Each result is committed at once in `article_analyses` (private: the
-    `news_api` role cannot read it), so a stop loses only the requests in flight, and
-    the next run resumes. Unusable answers (cut off, invalid) are retried up to 3 times
-    per article, each attempt stored with its raw answer;
-  - each request is counted **before** it is sent, so a failure still counts; the day
+    allowlist (`gemma-4-31b-it`). The request body is fixed in code: no tools, grounding,
+    caching or other options;
+  - parallel and resumable: articles are admitted one at a time under one lock, so
+    parallelism never passes a limit. A "busy" answer pauses all workers together. Each
+    result is committed at once in `article_analyses`, so a stop loses only the requests
+    in flight, and the next run resumes. Unusable answers (cut off, invalid) are retried up
+    to 3 times per article, each attempt stored with its raw answer;
+  - each request is counted **before** it is sent, so a failure still counts. The day
     follows Google's reset (midnight Pacific time);
-  - a usage log outside the repo (`~/news-eval/gemini-usage.json`, mode 600, 90 days)
-    keeps requests, failures and the real tokens used, per day. `news gemini-usage`
-    shows it against our limits and Google's;
-  - "high demand" errors (HTTP 503, also 500/502/504, timeouts, no network) are
-    **expected** on the free tier and never break a run (owner decision): the same
-    request, same model, is tried again after 10, 20, 30, then every 60 seconds until
-    Google answers. Every attempt is counted toward the daily limit, which stays the
-    absolute stop; busy refusals do not use the per-run limit (3 **answered** requests
-    per test), since Google does not count them either. Each attempt is shown live in
-    the terminal with today's passed/failed/busy counts. HTTP 429 (quota) or any other
-    error stops sending, and the run still writes its report. An article too long for
-    the token limit (about 0.5% of articles) is skipped without being sent;
-  - the key lives only in `.env`. Nothing else in 5.4 changes: article text is never
-    served, exported, published or committed.
+  - **the quota ledger is the database table `api_calls`** (`DatabaseLedger`,
+    `app/analysis/ledger.py`). Each run writes a row to `analysis_runs`.
+    `news gemini-usage` reads the ledger and shows use against our limits and Google's.
+    The ledger **reserves before it sends**: in one transaction under
+    `pg_advisory_xact_lock`, it counts today's sent requests and, below the daily limit,
+    inserts an `api_calls` row, committed before the request goes out. Two processes can
+    never both take the last slot. The row is inserted as a `'failed'` placeholder (an
+    outcome that counts toward the limit) and updated to the real outcome afterwards. A
+    crash between the two leaves a `'failed'` row: the ledger can over-count, never
+    under-count. While a request is in flight, other processes see it as `'failed'`; only
+    the reserving process reports it as pending. The daily cap is counted **per model**.
+    Only one model is allowed, so this is the project-wide cap; widening the allowlist
+    would first need a global count;
+  - "high demand" errors (HTTP 503, also 500/502/504, timeouts, no network) are expected on
+    the free tier and never break a run (owner decision): the same request, same model, is
+    tried again after 10, 20, 30, then every 60 seconds until Google answers. Every attempt
+    counts toward the daily limit, which stays the absolute stop. Busy refusals do not use
+    the per-test limit (3 answered requests), since Google does not count them either. HTTP
+    429 (quota) or any other error stops sending, and the run still writes its report. An
+    article too long for the token limit (about 0.5% of articles) is skipped without being
+    sent;
+  - the API key lives only in `.env` (see `docs/decisions/security.md`).
+- **Nothing else in 5.4 changes:** article text and analyses are never served, exported,
+  published or committed.
+- **Reversal plan:**
+  1. Stop sending: clear `GEMINI_API_KEY` in `.env`. The client then refuses to run.
+     Record the decision here.
+  2. Return to a local model, or link a billing account: a new owner decision, recorded
+     here first.
+  3. Stored outputs: delete the affected rows from `article_analyses` (and related rows)
+     only when the owner decides.
 
 ## 6. Data model (target, built in milestone 1)
 
@@ -359,11 +385,42 @@ analyses(id, article_id FK, analyzer, analyzer_version, result jsonb, created_at
 
 ## 7. API (milestone 7)
 
-- **Endpoints:** `GET /api/v1/sources`, `/feeds`, `/articles`, `/articles/{id}`; later
-  `/articles/{id}/analysis`. They only read stored data; nothing fetches publishers on a
-  request.
+- **Endpoints:** `GET /api/v1/sources`, `/feeds`, `/articles`, `/articles/{id}`,
+  `/briefings` (keyset-paginated briefing summaries: headline, report type, event status
+  and date, top 3 places and actors, `review_required`) and `/articles/{id}/briefing`
+  (the full briefing, article metadata and `source_url`; 404 if none). They only read
+  stored data; nothing fetches publishers on a request.
+- **Briefings, not analyses:** at save time the pipeline also stores
+  `article_analyses.briefing`, built by `make_briefing(cleaned, unverified_paths)`
+  (`app/analysis/briefing.py`). It is the cleaned analysis with every `evidence` key
+  removed at any depth and every unverified item dropped (an unverified event date
+  becomes null), plus `review_required` and `removed_items`. Only model-written fields
+  remain. Only `succeeded` and `needs_review` rows are served. When an article has several
+  analyzer versions, the most recently updated briefing is served. Quotes, raw output,
+  the raw `analysis` and body text are never served. The response schemas
+  (`app/schemas/analysis.py`) list the servable fields explicitly and ignore any other key.
+- **View-based privileges:** the `analysis_briefings` view
+  (`article_id, analyzer_version, status, briefing, updated_at`; migration
+  `9420376cc156`) is the only analysis object granted to `news_api`. A view runs with its
+  owner's privileges, so `news_api` has `SELECT` on the view and still no right at all
+  on `article_analyses`, `article_bodies`, `api_calls` or `analysis_runs`
+  (tests/integration/test_database_security.py).
+- **Data migration `14389f50095c`:** analyses stored before the quarantine rule were
+  `succeeded` even with unverified quotes. It reclassified those rows (3 articles, 6
+  quotes, 2026-11-24) to `needs_review` from their stored evidence statuses, set
+  `unverified_paths` and rebuilt their briefings. No article text is read and no model is
+  called. Its downgrade is a deliberate no-op: reverting would break the CHECK constraint
+  `ck_article_analyses_succeeded_fully_verified`.
 - **Pagination:** keyset on `(published_at DESC, id DESC)` with an opaque cursor; `limit`
-  is capped at 100. Never `OFFSET`.
+  is capped at 100. Never `OFFSET`. `/briefings` uses the same cursor as `/articles`.
+- **Briefing screen (`/ui`):** static HTML, CSS and JavaScript in `app/web/static/`,
+  mounted by `app/main.py`, calling only `/api/v1`. `UICSPMiddleware` adds to every `/ui`
+  response a strict Content Security Policy (`default-src 'self'`, no inline script,
+  `object-src 'none'`, `base-uri 'none'`, `form-action 'none'`,
+  `frame-ancestors 'none'`), `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: no-referrer` and `Cache-Control: no-cache` (revalidated through the
+  ETag, so an updated UI is never hidden behind cached modules). All data enters the DOM
+  through `textContent` or attributes, never as HTML (`dom.js`).
 - **Filters:** source, category, language, date range, and `q` (Postgres full-text
   search, best effort).
 - **Caching:** `ETag` and `Cache-Control` headers.
@@ -439,3 +496,34 @@ before it starts.**
 | Hostile or malformed XML | `defusedxml`, size caps, malformed-input tests |
 | Public commit history exposes the owner's email | Open, owner's decision |
 | Project scope | Personal and private for now. Re-review the rights model before any public use. |
+
+## 12. Scalability plan
+
+Everything stays on the owner's Mac at $0. Nothing here adds a paid service.
+
+- **Analysis throughput (the real bottleneck).** Our limits are 20 requests per minute,
+  10,000 input tokens per minute and 1,000 requests per day. A request carries about
+  3,600 to 4,600 input tokens (measured, prompt v8 / schema s7), so the token limit, not
+  the request limit, binds: about 2 requests per minute. Each answer also takes about 170
+  to 230 s. For about 1,600 articles that is roughly 13 to 14 hours of sending, and at
+  least 2 quota days (Pacific time). Busy refusals (503) and retries of unusable answers
+  also count toward the daily limit (in one test, 18 of 27 requests were busy refusals),
+  so plan on 3 to 4 days of runs. Runs are resumable, so the Mac being offline only
+  delays the backlog. Once the backlog is done, a day's new articles from one source should fit well inside
+  one day's cap.
+- **What changes beyond one source.** Each source needs its own adapter, rights policy
+  and `rights_basis` (an owner decision per source), robots.txt and Crawl-delay. Fetching
+  stays sequential per host; ingest time grows linearly with sources, which is fine for a
+  manual command. Analysis is shared: the daily cap is per project, so more sources means
+  a longer backlog, not more throughput. If the volume outgrows the free tier, the options
+  (analyse a subset, a local model, or billing) are owner decisions, not code changes.
+- **When Postgres indexes or partitioning matter.** Existing indexes cover the hot paths:
+  `articles(published_at DESC, id DESC)` for keyset pages, GIN on `search_tsv`,
+  `article_analyses(article_id)`, `api_calls(quota_day, model)` and the pending
+  `discovered_urls` partial index. At this scale (thousands to low millions of rows) one
+  PostgreSQL instance needs nothing more. Add an index only when `EXPLAIN ANALYZE` shows a
+  slow query (for example a filter on `source_id` once there are several sources, or on
+  analysis status). Partitioning (by month on `published_at`) only becomes worth
+  considering at tens of millions of articles, which a personal tool is not expected to
+  reach. Retention (section 6) keeps `ingestion_runs` and resolved `discovered_urls`
+  small.

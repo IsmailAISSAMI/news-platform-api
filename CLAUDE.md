@@ -38,6 +38,10 @@ uv run news analyze [--limit N] [--concurrency N] [--retry-failed]
                                           # Gemini API, parallel, resumable, within limits
 uv run news lab <ids...> [--label X]      # Gemini API: max 3 answered requests per test
 uv run news gemini-usage                  # API use vs our limits and Google's
+uv run news lab-compare <run dirs...>     # score lab runs with the current code checks
+uv run news eval export [--n 30]          # gold sample to ~/news-eval/gold (outside repo)
+uv run news eval score <labels.csv>       # precision per section + consistency; no API
+uv run python scripts/check_repo_hygiene.py   # secrets, data files, article quotes
 ```
 
 **Definition of done:** ruff, mypy and the full pytest suite pass, `alembic check` is clean,
@@ -77,15 +81,21 @@ of them requires an explicit decision by the owner, recorded in the architecture
   - **AI analysis runs on Gemma 4 31B via the Gemini API, free tier only (owner
     decision, 2026-11-24; architecture section 5.5)**: article text is sent to Google.
     LM Studio is retired. Billing stays off on the Google project.
-  - Every request goes through `RequestBudget` (always 1/3 below Google's limits: 20 per minute,
-    10,000 input tokens per minute; 1,000 per day; 3 answered per `news lab` test; settings can only
-    lower them). Never raise the
-    ceilings, widen the model allowlist, retry anything but Google's temporary
-    overloads (503/500/502/504/timeouts: retried with the same model until answered), add billable
+  - Every request goes through `RequestBudget`. Limits (the same numbers in
+    `docs/architecture.md` 5.5 and `.env.example`): 20 requests per minute; 10,000 input
+    tokens per minute; 1,000 requests per day; 3 answered requests per `news lab` test;
+    concurrency default 8. The per-minute and token limits are at least one third below
+    Google's; the daily limit is stricter. Settings can only lower them. Never raise the
+    ceilings, widen the model allowlist, retry anything but Google's temporary overloads
+    (503/500/502/504/timeouts: retried with the same model until answered), add billable
     request options, or call the real API from tests, without the owner's explicit
     decision. Check use with `uv run news gemini-usage`.
   - AI outputs meant for publication must be original work: no reproduced or
     closely paraphrased passages.
+- **Geography: use Morocco GeoNames datasets only.** Never mention, link to, or map the
+  disputed southern territories or the places governed under them, in product code,
+  documentation, tests, UI or commit messages. Do not write the disputed territory's name
+  anywhere in the repo, not even to describe this rule. This is an owner rule (2026-11-24).
 - Bodies leave the rights gate only under `restricted` (with a non-empty
   `rights_basis`) or `licensed_full_text` (valid license). Anything doubtful falls back
   to `metadata_only`. Don't change a source's policy without the owner's explicit

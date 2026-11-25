@@ -280,3 +280,58 @@ def test_weak_modals_do_not_raise_tense_flags() -> None:
     )
 
     assert report.flags == []
+
+
+# --- O1, O2, O3: flagged or removed, always recorded ---------------------------------------
+
+
+def test_anonymous_source_claim_without_attribution_is_flagged_not_changed() -> None:
+    paragraphs = ["Sources said Martin visited Agadir on Monday.", PARAGRAPHS[1]]
+    quote = {"paragraph": 1, "quote": "Martin visited Agadir on Monday"}
+    claims = [
+        {"text": "Martin visited", "kind": "fact", "attributed_to": None, "evidence": quote},
+        {"text": "Martin visited", "kind": "fact", "attributed_to": "sources", "evidence": quote},
+    ]
+    original = analysis(claims=claims, who=[], where=[],
+                        when={"event_date": {"value": None, "evidence": None}})  # fmt: skip
+
+    cleaned, report = clean(original, paragraphs, publisher_names=("Hespress",))
+
+    assert cleaned == original
+    assert [(f.path, f.reason) for f in report.flags] == [
+        ("$.claims[0].attributed_to", "claim from an anonymous source has no attribution")
+    ]
+
+
+def test_timeline_entry_with_the_publication_date_is_dropped_only_when_told_the_date() -> None:
+    timeline = [
+        {"date": "2026-11-23", "event": "Visit", "evidence": Q2},  # no date words
+        {"date": "2026-11-23", "event": "Visit", "evidence": Q1},  # "on Monday"
+    ]
+    original = analysis(when={"event_date": {"value": "2026-11-23", "evidence": Q1},
+                              "timeline": timeline})  # fmt: skip
+
+    unchanged, _ = clean(original, PARAGRAPHS, publisher_names=("Hespress",))
+    cleaned, report = clean(
+        original, PARAGRAPHS, publisher_names=("Hespress",), published=date(2026, 11, 23)
+    )
+
+    assert unchanged == original  # default: behaviour as before
+    assert len(cleaned.when.timeline) == 1
+    assert cleaned.when.timeline[0].evidence.quote == Q1["quote"]
+    assert [(c.path, c.corrected, c.reason, c.method) for c in report.items] == [
+        ("$.when.timeline[0]", None, "dated with the publication date, no date in the quote",
+         "heuristic")
+    ]  # fmt: skip
+
+
+def test_uninformative_causes_are_flagged() -> None:
+    why = [
+        {"text": "visit", "kind": "stated", "attributed_to": None, "evidence": Q1},
+        {"text": "Four decades of cooperation between both sides", "kind": "stated",
+         "attributed_to": None, "evidence": Q2},
+    ]  # fmt: skip
+    cleaned, report = clean(analysis(why=why), PARAGRAPHS, publisher_names=("Hespress",))
+
+    assert len(cleaned.why) == 2  # never removed
+    assert [(f.path, f.reason) for f in report.flags] == [("$.why[0]", "uninformative cause")]

@@ -111,19 +111,23 @@ def settings_with(url: str, tools: str = "docker compose exec -T db") -> Setting
 
 def test_pg_tools_run_inside_the_container_by_default() -> None:
     tools = PgTools.from_settings(
-        settings_with("postgresql+psycopg://news:secret@localhost:5433/news")
+        settings_with("postgresql+psycopg://news:test-only-password@localhost:5433/news")
     )
 
     assert tools.dump() == [
         "docker", "compose", "exec", "-T", "db", "pg_dump", "-U", "news", "-d", "news", "-Fc"
     ]  # fmt: skip
     assert tools.scratch_database == "news_restore_check"
-    assert "secret" not in " ".join(tools.dump() + tools.restore("x") + tools.create_db("x"))
+    assert "test-only-password" not in " ".join(
+        tools.dump() + tools.restore("x") + tools.create_db("x")
+    )
     assert "--no-privileges" in tools.restore("x")
 
 
 def test_pg_tools_can_run_on_the_host() -> None:
-    tools = PgTools.from_settings(settings_with("postgresql+psycopg://u:p@h/db", tools=""))
+    tools = PgTools.from_settings(
+        settings_with("postgresql+psycopg://u:test-only-password@h/db", tools="")
+    )
 
     assert tools.drop_db("db_x") == ["dropdb", "-U", "u", "--if-exists", "db_x"]
 

@@ -16,6 +16,12 @@ repos:
       - id: detect-private-key
   - repo: local
     hooks:
+      - id: repo-hygiene
+        name: repository hygiene
+        entry: uv run python scripts/check_repo_hygiene.py
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: mypy
         name: mypy
         entry: uv run mypy app tests alembic

@@ -284,7 +284,7 @@ async def test_interrupted_run_is_recorded_and_releases_the_lock(
 
 
 async def test_unreachable_database_fails_fast_with_guidance() -> None:
-    engine = create_async_engine("postgresql+psycopg://u:p@127.0.0.1:1/none")
+    engine = create_async_engine("postgresql+psycopg://u:test-only-password@127.0.0.1:1/none")
     ticks = iter(range(100))
 
     async def no_sleep(_: float) -> None:

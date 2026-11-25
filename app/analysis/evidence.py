@@ -9,12 +9,13 @@ counted as `misplaced` (still real text, wrong pointer). Quotes found nowhere ar
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from datetime import date
 from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel
 
-from app.analysis.schema import ArticleAnalysis, Evidence
+from app.analysis.schema import ArticleAnalysis, Claim, Evidence
 
 # Typographic characters folded to ASCII before comparing (written as escapes on purpose).
 _QUOTES = str.maketrans(
@@ -26,6 +27,18 @@ _QUOTES = str.maketrans(
         "\u2013": "-",  # en dash
         "\u2014": "-",  # em dash
         "\u00a0": " ",  # no-break space
+        "\u2010": "-",  # hyphen (NFKC maps the non-breaking hyphen to it)
+        "\u2012": "-",  # figure dash
+        "\u2015": "-",  # horizontal bar
+        "\u2212": "-",  # minus sign
+        # Invisible characters CMS editors leave in text: removed, or a real quote
+        # would not match the paragraph it was copied from.
+        "\u00ad": None,  # soft hyphen
+        "\u200b": None,  # zero-width space
+        "\u200c": None,  # zero-width non-joiner
+        "\u200d": None,  # zero-width joiner
+        "\u2060": None,  # word joiner
+        "\ufeff": None,  # zero-width no-break space (BOM)
     }
 )
 _SPACE = re.compile(r"\s+")
@@ -138,9 +151,42 @@ _GENERIC_PLACE_WORDS = re.compile(
 )
 
 
+_NOT_A_NAME = re.compile(r"^(the|a|an|this|that|its|their)?$", re.IGNORECASE)
+
+
 def core_place_name(name: str) -> str:
-    """'Taourirt province' -> 'Taourirt'. Names without a generic suffix are unchanged."""
-    return _GENERIC_PLACE_WORDS.sub("", name.strip())
+    """'Taourirt province' -> 'Taourirt'. Names without a generic suffix are unchanged.
+
+    A description is not a name: "the region" stays "the region" (stripping would leave
+    "the", which is in every article and would pass as a place).
+    """
+    name = name.strip()
+    core = _GENERIC_PLACE_WORDS.sub("", name)
+    return name if _NOT_A_NAME.match(core.strip()) else core
+
+
+def mentions(article: str, name: str) -> bool:
+    """Whether the normalized `article` contains the name as whole words.
+
+    Plain substring tests let "Sale" pass inside "wholesale" and an empty name pass
+    everywhere. A trailing "s" is allowed: normalize() drops apostrophes, so the
+    article's "Morocco's" becomes "moroccos".
+    """
+    needle = normalize(name)
+    if not needle:
+        return False
+    return re.search(rf"(?<!\w){re.escape(needle)}s?(?!\w)", article) is not None
+
+
+# Markers of an anonymous source in the article. A claim resting on such a paragraph
+# should carry the attribution ("sources close to the ministry"), never read as a fact.
+_ANONYMOUS_SOURCE = re.compile(
+    r"\b(sources?\s+(said|say|says|told|tell|reported|indicated|revealed|confirmed)|"
+    r"according\s+to\s+(\w+\s+){0,3}sources?|a\s+source\s+(said|told)|"
+    r"sources\s+close\s+to)\b",
+    re.IGNORECASE,
+)
+MIN_CAUSE_LENGTH = 25
 
 
 class Issue(StrEnum):
@@ -150,21 +196,32 @@ class Issue(StrEnum):
     PLACE_NAME_WITH_ADDED_SUFFIX = "place_name_with_added_suffix"  # core name is in article
     # The quote speaks of the future ("will be signed") but the claim reads as done.
     POSSIBLE_TENSE_MISMATCH = "possible_tense_mismatch"
+    # The evidence paragraph cites anonymous sources but the claim has no attribution.
+    ANONYMOUS_SOURCE_UNATTRIBUTED = "anonymous_source_unattributed"
+    # Dated with the article's publication date while the quote holds no date words.
+    TIMELINE_PUBLICATION_DATE = "timeline_publication_date"
+    UNINFORMATIVE_CAUSE = "uninformative_cause"  # too short, or restates the main event
 
 
-def semantic_issues(analysis: ArticleAnalysis, paragraphs: list[str]) -> dict[str, Issue]:
-    """Problems the JSON schema cannot catch, found by checking against the article."""
+def semantic_issues(  # noqa: PLR0912  # one branch per check, kept side by side
+    analysis: ArticleAnalysis, paragraphs: list[str], published: date | None = None
+) -> dict[str, Issue]:
+    """Problems the JSON schema cannot catch, found by checking against the article.
+
+    `published` (the article's publication date) enables the publication-date timeline
+    check; without it that check is skipped.
+    """
     article = normalize(" ".join(paragraphs))
     issues: dict[str, Issue] = {}
     for index, actor in enumerate(analysis.who):
         for field_name in ("name_as_written", "full_name"):
-            if normalize(getattr(actor, field_name)) not in article:
+            if not mentions(article, getattr(actor, field_name)):
                 issues[f"$.who[{index}].{field_name}"] = Issue.NAME_NOT_IN_ARTICLE
     for index, place in enumerate(analysis.where):
-        name = normalize(place.name_as_written)
-        if name not in article and normalize(core_place_name(place.name_as_written)) in article:
+        written = place.name_as_written
+        if not mentions(article, written) and mentions(article, core_place_name(written)):
             issues[f"$.where[{index}].name_as_written"] = Issue.PLACE_NAME_WITH_ADDED_SUFFIX
-        elif name not in article:
+        elif not mentions(article, written):
             issues[f"$.where[{index}].name_as_written"] = Issue.NAME_NOT_IN_ARTICLE
     event_date = analysis.when.event_date
     quote = event_date.evidence.quote if event_date.evidence else ""
@@ -173,7 +230,31 @@ def semantic_issues(analysis: ArticleAnalysis, paragraphs: list[str]) -> dict[st
     for index, claim in enumerate(analysis.claims):
         if _FUTURE.search(claim.evidence.quote) and not _FUTURE.search(claim.text):
             issues[f"$.claims[{index}]"] = Issue.POSSIBLE_TENSE_MISMATCH
+        if _anonymous_unattributed(claim, paragraphs):
+            issues[f"$.claims[{index}].attributed_to"] = Issue.ANONYMOUS_SOURCE_UNATTRIBUTED
     for index, entry in enumerate(analysis.when.timeline):
         if _PUBLICATION.search(entry.event):
             issues[f"$.when.timeline[{index}]"] = Issue.TIMELINE_PUBLICATION_ENTRY
+        elif (
+            published is not None
+            and entry.date == published.isoformat()
+            and not _DATE_WORDS.search(entry.evidence.quote)
+        ):
+            issues[f"$.when.timeline[{index}]"] = Issue.TIMELINE_PUBLICATION_DATE
+    main_event = normalize(analysis.what.main_event)
+    for index, cause in enumerate(analysis.why):
+        text = normalize(cause.text)
+        restates = bool(main_event) and (text in main_event or main_event in text)
+        if len(text) < MIN_CAUSE_LENGTH or restates:
+            issues[f"$.why[{index}]"] = Issue.UNINFORMATIVE_CAUSE
     return issues
+
+
+def _anonymous_unattributed(claim: Claim, paragraphs: list[str]) -> bool:
+    """Only the claim's OWN evidence paragraph counts, and any attribution clears it."""
+    if claim.attributed_to is not None and claim.attributed_to.strip():
+        return False
+    if not 1 <= claim.evidence.paragraph <= len(paragraphs):
+        return False
+    paragraph = unicodedata.normalize("NFKC", paragraphs[claim.evidence.paragraph - 1])
+    return _ANONYMOUS_SOURCE.search(paragraph.translate(_QUOTES)) is not None

@@ -1,5 +1,7 @@
 """The quote checker: the guard against invented quotes. Synthetic text only."""
 
+from datetime import date
+
 import pytest
 
 from app.analysis.evidence import (
@@ -7,6 +9,7 @@ from app.analysis.evidence import (
     Issue,
     check,
     core_place_name,
+    mentions,
     normalize,
     semantic_issues,
 )
@@ -158,3 +161,136 @@ def test_event_date_quotes_need_real_date_words(quote: str, dated: bool) -> None
 )  # fmt: skip
 def test_core_place_name(name: str, core: str) -> None:
     assert core_place_name(name) == core
+
+
+# --- Precision of the name checks (part C) ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "found"),
+    [
+        ("Sale", False),  # only inside "wholesale": a substring, not the name
+        ("Rabat", True),
+        ("Morocco", True),  # the article writes "Morocco's" (apostrophe dropped)
+        ("", False),  # an empty name is in no article
+        ("  ", False),
+        ("Hassan II", True),
+    ],
+)
+def test_mentions_matches_whole_words(name: str, found: bool) -> None:
+    article = normalize("Wholesale prices rose in Rabat, Morocco\u2019s capital, under Hassan II.")
+    assert mentions(article, name) is found
+
+
+def test_normalize_drops_invisible_characters_and_folds_dashes() -> None:
+    assert normalize("Sidi\u200b Ifni\u00ad \u2010 \u2212 x\ufeff") == normalize("Sidi Ifni - - x")
+
+
+def test_a_quote_with_a_soft_hyphen_in_the_article_verifies() -> None:
+    assert check(ev(1, "the budget vote"), ["Then the bud\u00adget vote passed."]) is (
+        EvidenceStatus.VERIFIED
+    )
+
+
+@pytest.mark.parametrize("name", ["the region", "The province", "a city", "region"])
+def test_core_place_name_keeps_descriptions(name: str) -> None:
+    assert core_place_name(name) == name
+
+
+# --- O1, O2, O3 -----------------------------------------------------------------------------
+
+
+def base(**overrides: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        "overview": {"headline": "h", "report_type": "update", "event_status": "ongoing"},
+        "what": {"main_event": "The council approved the new water plan"},
+        "who": [], "where": [], "claims": [], "how": None, "topics": [],
+        "when": {"event_date": {"value": None, "evidence": None}},
+        "tone": {"label": "neutral", "explanation": "x"},
+    }  # fmt: skip
+    data.update(overrides)
+    return data
+
+
+def claim(paragraph: int, attributed_to: str | None) -> dict[str, object]:
+    return {"text": "The plan costs more", "kind": "fact", "attributed_to": attributed_to,
+            "evidence": {"paragraph": paragraph, "quote": "the plan"}}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("paragraph", "attributed_to", "flagged"),
+    [
+        ("Sources said the plan would cost more.", None, True),
+        ("The plan, sources told Hespress, costs more.", None, True),
+        ("According to Hespress sources, the plan costs more.", None, True),
+        ("According to informed sources, the plan costs more.", None, True),
+        ("A source said the plan costs more.", None, True),
+        ("Sources close to the council say the plan costs more.", None, True),
+        ("Sources said the plan would cost more.", "sources close to the council", False),
+        ("Sources said the plan would cost more.", "  ", True),  # blank is no attribution
+        ("The council said the plan costs more.", None, False),  # named, no marker
+        ("Water resources said to be scarce; the plan costs more.", None, False),
+        ("According to the minister, the plan costs more.", None, False),
+    ],
+)
+def test_anonymous_source_claims_need_attribution(
+    paragraph: str, attributed_to: str | None, flagged: bool
+) -> None:
+    data = base(claims=[claim(1, attributed_to)])
+    issues = semantic_issues(ArticleAnalysis.model_validate(data), [paragraph])
+
+    assert (issues.get("$.claims[0].attributed_to") is Issue.ANONYMOUS_SOURCE_UNATTRIBUTED) is (
+        flagged
+    )
+
+
+def test_only_the_claims_own_paragraph_counts_for_anonymous_sources() -> None:
+    paragraphs = ["The council said the plan costs more.", "Sources said talks stalled."]
+    data = base(claims=[claim(1, None), claim(9, None)])  # 9: a bad pointer is not flagged
+
+    assert semantic_issues(ArticleAnalysis.model_validate(data), paragraphs) == {}
+
+
+def entry(day: str, quote: str) -> dict[str, object]:
+    return {"date": day, "event": "Council vote", "evidence": {"paragraph": 1, "quote": quote}}
+
+
+@pytest.mark.parametrize(
+    ("day", "quote", "published", "flagged"),
+    [
+        ("2026-11-23", "the council voted the plan", date(2026, 11, 23), True),
+        ("2026-11-23", "the council voted on Monday", date(2026, 11, 23), False),  # dated
+        ("2026-11-20", "the council voted the plan", date(2026, 11, 23), False),  # other day
+        ("2026-11", "the council voted the plan", date(2026, 11, 23), False),  # month only
+        ("2026-11-23", "the council voted the plan", None, False),  # no date given
+    ],
+)
+def test_timeline_entries_dated_with_the_publication_date(
+    day: str, quote: str, published: date | None, flagged: bool
+) -> None:
+    data = base(when={"event_date": {"value": None, "evidence": None},
+                      "timeline": [entry(day, quote)]})  # fmt: skip
+    issues = semantic_issues(ArticleAnalysis.model_validate(data), [quote], published)
+
+    assert (issues.get("$.when.timeline[0]") is Issue.TIMELINE_PUBLICATION_DATE) is flagged
+
+
+def cause(text: str) -> dict[str, object]:
+    return {"text": text, "kind": "stated", "attributed_to": None,
+            "evidence": {"paragraph": 1, "quote": "x"}}  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("text", "flagged"),
+    [
+        ("Drought", True),  # too short
+        ("the council approved the new water plan", True),  # restates the main event
+        ("approved the new water plan", True),  # contained in the main event
+        ("The council approved the new water plan after the drought", True),  # contains it
+        ("Three dry years emptied the Al Massira reservoir", False),
+    ],
+)
+def test_uninformative_causes(text: str, flagged: bool) -> None:
+    issues = semantic_issues(ArticleAnalysis.model_validate(base(why=[cause(text)])), ["x"])
+
+    assert (issues.get("$.why[0]") is Issue.UNINFORMATIVE_CAUSE) is flagged

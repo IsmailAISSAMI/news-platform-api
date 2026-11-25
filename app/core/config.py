@@ -56,7 +56,6 @@ class Settings(BaseSettings):
     gemini_max_input_tokens_per_minute: int = 10_000
     # Articles in flight at once in `news analyze` (each answer takes about 3 minutes).
     gemini_concurrency: int = 8
-    gemini_usage_file: Path = Path.home() / "news-eval" / "gemini-usage.json"
 
     # Backups (`news backup` / `news restore-test`). Outside the repo and outside iCloud.
     backup_dir: Path = Path.home() / "Backups" / "news"
@@ -74,7 +73,7 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return value
 
-    @field_validator("backup_dir", "gemini_usage_file")
+    @field_validator("backup_dir")
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
         # "~/Backups/news" from .env must not become a literal "~" folder in the repo.

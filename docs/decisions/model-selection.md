@@ -16,7 +16,7 @@ Studio on the owner's Mac (Apple M2 Pro, 16 GB).
 
 - **Articles:** the same 10 real articles, chosen by rule to cover Politics, Economy,
   International, Society and Sports, a regional story, a court case with allegations,
-  relative dates, a southern-provinces city and a long article.
+  relative dates, a geography-coverage case and a long article.
 - **Prompt and schema:** both at version 3, with `reasoning_effort: none`, temperature
   0.1 and JSON-schema output.
 - **Checks in code:** every evidence quote found in its cited paragraph; every person and

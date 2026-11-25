@@ -24,18 +24,18 @@ def test_database_url_is_required(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_database_url_must_use_psycopg_driver() -> None:
     with pytest.raises(ValidationError):
-        make(database_url="postgresql://user:pw@localhost/db")
+        make(database_url="postgresql://user:test-only-password@localhost/db")
 
 
 def test_database_url_is_not_leaked_in_repr() -> None:
-    settings = make(database_url="postgresql+psycopg://user:s3cret@localhost/db")
+    settings = make(database_url="postgresql+psycopg://user:test-only-password@localhost/db")
 
     assert "s3cret" not in repr(settings)
     assert settings.database_url.get_secret_value().endswith("@localhost/db")
 
 
 def test_defaults() -> None:
-    settings = make(database_url="postgresql+psycopg://user:pw@localhost/db")
+    settings = make(database_url="postgresql+psycopg://user:test-only-password@localhost/db")
 
     assert settings.environment == "development"
     assert not settings.is_production
@@ -43,6 +43,8 @@ def test_defaults() -> None:
 
 
 def test_backup_dir_expands_the_home_directory() -> None:
-    settings = make(database_url="postgresql+psycopg://u:p@h/d", backup_dir="~/Backups/news")
+    settings = make(
+        database_url="postgresql+psycopg://u:test-only-password@h/d", backup_dir="~/Backups/news"
+    )
 
     assert settings.backup_dir == Path.home() / "Backups" / "news"

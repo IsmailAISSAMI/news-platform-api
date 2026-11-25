@@ -76,3 +76,39 @@ def test_cors_is_only_enabled_for_configured_origins(settings: Settings) -> None
 
     assert allowed.headers["access-control-allow-origin"] == "https://example.com"
     assert "access-control-allow-origin" not in denied.headers
+
+
+FORBIDDEN_EXPOSURE_NAMES = frozenset({"body_text", "body", "evidence", "raw_output", "raw"})
+HTTP_METHODS = frozenset({"get", "put", "post", "delete", "patch", "options", "head", "trace"})
+
+
+def _property_names(node: object) -> set[str]:
+    """Every property name found anywhere in a JSON schema fragment (including $defs)."""
+    names: set[str] = set()
+    if isinstance(node, dict):
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            names.update(properties.keys())
+        for value in node.values():
+            names.update(_property_names(value))
+    elif isinstance(node, list):
+        for item in node:
+            names.update(_property_names(item))
+    return names
+
+
+def test_v1_routes_are_get_only_and_never_expose_article_text(settings: Settings) -> None:
+    # FastAPI wraps included routers, so the OpenAPI document is the complete, flattened
+    # view of every route and the response schemas it declares.
+    spec = create_app(settings).openapi()
+    v1_paths = {path: item for path, item in spec["paths"].items() if path.startswith("/api/v1")}
+
+    assert v1_paths, "expected business routes under /api/v1"
+    for path, item in v1_paths.items():
+        methods = {m for m in item if m in HTTP_METHODS}
+        assert methods == {"get"}, f"{path} allows {sorted(methods)}"
+        path_params = {p.strip("{}") for p in path.split("/") if p.startswith("{")}
+        assert not path_params & FORBIDDEN_EXPOSURE_NAMES, path
+
+    leaked = _property_names(spec["components"]["schemas"]) & FORBIDDEN_EXPOSURE_NAMES
+    assert not leaked, f"/api/v1 response schemas expose {sorted(leaked)}"
